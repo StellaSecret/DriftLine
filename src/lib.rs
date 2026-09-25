@@ -1,0 +1,16 @@
+//! Vector-field puzzle game core. Nothing in this crate touches rendering or UI,
+//! so every module (and every gameplay mode) can be tested headlessly.
+pub mod catalog;
+pub mod field;
+pub mod level;
+pub mod levels;
+pub mod modes;
+pub mod save;
+pub mod sim;
+pub mod validate;
+pub mod validate_steer;
+pub mod validate_survey;
+
+pub use field::{v2, Field, Layer, SourceKind, Term, V2};
+pub use level::{Chapter, Challenge, GustDirs, Level, Reveal, Rules, Slot, SurveyGoal, Zone};
+pub use sim::{simulate, Outcome, Rect, Region, RegionKind, SimConfig, Trajectory};

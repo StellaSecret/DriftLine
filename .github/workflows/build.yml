@@ -1,0 +1,231 @@
+name: CI/CD Vector Field
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  security-events: write
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── SECURITY SCAN ─────────────────────────────────────
+  scan-secrets:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # Pinned to 3.88.0 (no v prefix: GHCR tag), same pin as the VectorField pipeline.
+          version: 3.88.0
+          path: ./
+          base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+          head: ${{ github.sha }}
+          extra_args: --only-verified
+
+  # ── SUPPLY CHAIN SCAN ─────────────────────────────────
+  # Advisories (known CVEs / yanked crates), license compliance and
+  # dependency-source checks against deny.toml, before anything ships
+  # in the WASM or desktop builds.
+  supply-chain:
+    name: Supply Chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # ── RUST CORE ─────────────────────────────────────────
+  # Simulation engine, level data and the four gameplay modes are windowless,
+  # so the whole "are the mechanics really different?" suite runs here.
+  rust-core:
+    name: Rust Core (test + validation + WASM check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace --release --locked
+      - name: Mechanic validation report
+        run: cargo run --release --locked --bin report | tee validation-report.txt
+      - name: Steer validation report
+        run: cargo run --release --locked --bin report -- --steer | tee steer-validation.md
+      - name: Survey validation report
+        run: cargo run --release --locked --bin report -- --survey | tee survey-validation.md
+      - name: Upload validation report
+        uses: actions/upload-artifact@v7
+        with:
+          name: validation-report
+          path: |
+            validation-report.txt
+            steer-validation.md
+            survey-validation.md
+          retention-days: 7
+      - name: Check WASM build
+        run: cargo check --locked --target wasm32-unknown-unknown --bin vfield
+
+  # ── WEB (WASM) BUILD ──────────────────────────────────
+  web-build:
+    name: Build WASM
+    needs: [rust-core, supply-chain]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build WASM
+        run: cargo build --release --locked --target wasm32-unknown-unknown --bin vfield
+      - name: Assemble web bundle
+        run: |
+          mkdir -p public
+          cp target/wasm32-unknown-unknown/release/vfield.wasm public/
+          cp web/index.html public/
+          # JS loader from the exact miniquad version pinned in Cargo.lock (no external download).
+          MANIFEST=$(cargo metadata --format-version 1 --locked \
+            | python3 -c "import json,sys; print(next(p['manifest_path'] for p in json.load(sys.stdin)['packages'] if p['name']=='miniquad'))")
+          cp "$(dirname "$MANIFEST")/js/gl.js" public/gl.js
+          ls -la public/
+      - name: Upload WASM build
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-public
+          path: public/
+          retention-days: 1
+
+  # ── DESKTOP BUILDS ────────────────────────────────────
+  build-desktop:
+    name: Build ${{ matrix.name }}
+    if: github.ref == 'refs/heads/main'
+    needs: [scan-secrets, rust-core, supply-chain]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: vfield
+            asset: vectorfield-linux-x86_64.tar.gz
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: vfield.exe
+            asset: vectorfield-windows-x86_64.zip
+          - name: macOS arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: vfield
+            asset: vectorfield-macos-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin vfield
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.asset }}" -C "target/${{ matrix.target }}/release" "${{ matrix.bin }}"
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}" -DestinationPath "dist/${{ matrix.asset }}"
+      - name: Upload desktop build
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/
+          retention-days: 7
+
+  # ── DEPLOY WEB TO GITHUB PAGES ────────────────────────
+  deploy-web:
+    name: Deploy to GitHub Pages
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [web-build]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download WASM build
+        uses: actions/download-artifact@v8
+        with:
+          name: wasm-public
+          path: ./public/
+      - name: Setup Pages
+        uses: actions/configure-pages@v6
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: public/
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  # ── RELEASE (Desktop + Web bundle) ────────────────────
+  release:
+    name: Create Release
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [web-build, build-desktop]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Download desktop builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: dist/
+      - name: Download web bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: wasm-public
+          path: web-bundle/
+      - name: Package web bundle
+        run: cd web-bundle && zip -r ../dist/vectorfield-web.zip .
+      - name: List release files
+        run: ls -la dist/
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Vector Field build #${{ github.run_number }}"
+          body: "Build #${{ github.run_number }}: Rust / macroquad. Desktop (Linux, Windows, macOS) and a self-contained web bundle."
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,57 @@
+# Vector Field
+
+A 2D puzzle game about steering a probe through a vector field, written in Rust
+([macroquad](https://github.com/not-fl3/macroquad)). It is built around six *different* kinds of reasoning (Survey is a prototype, see below):
+
+| Mechanic | Question | What you decide | Skill |
+|---|---|---|---|
+| **Position** | Where should I start? | the release point(s) | spatial reasoning about initial conditions |
+| **Predict** | Where will it go? | a committed forecast of the exit | mentally extrapolating flow |
+| **Tempo** | When should I launch? | the launch phase of a changing field | reasoning about time-dependent geometry |
+| **Experiment** | How does the system behave? | a parameter, then a *conclusion* | discovering a rule by controlled tests |
+| **Steer** | What should I do next? | a gust (or nothing) every beat, with feedback | closed-loop control: planning from observed state |
+| **Survey** *(prototype)* | Where is the hidden source? | where to release a few scouts, then one estimate | choosing what to observe to infer a hidden structure |
+
+25 fundamental levels (5 for each of the first five mechanics), five Survey prototype levels and 6 combination levels. Survey's evidence so far is an ideal-solver validation, not playtests (see `docs/09-survey.md`). See [DESIGN.md](DESIGN.md) for the per-mechanic
+design, and how the "these are really different" requirement is checked by automated tests.
+
+## Run
+
+```bash
+cargo run --release            # desktop game
+cargo test --release           # simulation, level and mechanic validation
+cargo run --release --bin report [-- --detail]   # per-level validation numbers
+cargo run --release --bin report -- --steer      # Steer validation report (see STEER_VALIDATION.md)
+cargo run --release --bin report -- --survey     # Survey validation report (see SURVEY_VALIDATION.md)
+```
+
+Controls: mouse; Space/Enter launch or confirm; in Steer, Q W E / A S D / Z X C pick a gust direction (S = wait) or use the arrow keys; arrow keys nudge; in Survey, `S` scout / `M` marker (or `Tab`), click or Space to place, `C` commit; `H` hint; `R` retry/reset; `V` replay;
+`G` arrow-grid density; `K` high-contrast arrows; `U` unlock all levels; `Esc` back.
+Progress is saved to `vfield_progress.txt` (desktop only).
+
+
+## Saving
+
+Finished levels and the display settings (`G` arrow density, `K` high contrast) are saved automatically, so a player does not replay levels after closing the game. The desktop build writes `vfield_save.txt` in the per-user data folder (`~/.local/share/vfield` on Linux, `~/Library/Application Support/vfield` on macOS, `%APPDATA%\vfield` on Windows; `VFIELD_SAVE_DIR` overrides it). The web build uses the browser's `localStorage` (key `vfield-save`), so progress is per browser and is lost if site data is cleared. If saving fails, the menu says so. The unlock-all switch (`U`) is for one session and is not saved. A `vfield_progress.txt` from an earlier build in the working directory is read once, as the starting point of the new save. To start over, delete the file (or clear the site's data). Format and tests: `src/save.rs`, `tests/save.rs`.
+
+## Documentation
+
+[`docs/`](docs/README.md) is a precise, code-derived reference for each mechanic (Position, Predict, Tempo, Experiment, Steer, Survey): information, controls, state machine, exact rules, feedback, level properties, known weaknesses and the tests that pin them. `docs/LEVEL_CATALOG.md` is generated from the level data (`cargo run --release --bin catalog > docs/LEVEL_CATALOG.md`) and a test fails if it is stale.
+
+## Layout
+
+```
+src/field.rs        field model v(x, y, t; theta)      src/sim.rs      RK4 engine, regions, outcomes
+src/level.rs        level data types                   src/levels.rs   all content, as data
+src/modes/          the six gameplay modes (no UI)    src/validate.rs automated mechanic checks
+src/app.rs, render.rs, ui.rs, main.rs  macroquad front end        tests/mechanics.rs  validation suite
+```
+
+## CI/CD (`.github/workflows/build.yml`)
+
+Secret scan (TruffleHog) and supply-chain scan (cargo-deny, config in `deny.toml`) gate everything.
+`rust-core` runs the tests, the validation report and a `wasm32` check. `web-build` produces the WASM bundle
+that `deploy-web` publishes to GitHub Pages. On `main`, `build-desktop` builds Linux, Windows and macOS
+binaries and `release` publishes them plus the web bundle as `build-N`.
+
+One-time setup: enable **Settings -> Pages -> Source: GitHub Actions**, and create a `release` environment.
