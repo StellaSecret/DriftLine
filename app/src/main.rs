@@ -1,7 +1,10 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use dioxus::prelude::*;
 use peoplemodeler_core::{
-    integrate_with_mode, levels, Level, Outcome, SimResult, SimulationMode, Vector2, WIN_R, XMAX,
-    XMIN, YMAX, YMIN,
+    generate_levels, integrate_with_mode, Level, Outcome, SimResult, SimulationMode, Vector2,
+    DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX, YMIN,
 };
 
 const W: f64 = 640.0;
@@ -63,7 +66,7 @@ fn path_to_svg(points: &[(f64, f64)]) -> String {
 }
 
 fn vector_endpoints(level: &Level, x: f64, y: f64, k: f64) -> Option<(f64, f64, f64, f64)> {
-    let Vector2 { x: vx, y: vy } = (level.field)(x, y, k);
+    let Vector2 { x: vx, y: vy } = level.flow_at(x, y, k);
     let length = Vector2 { x: vx, y: vy }.length();
     if length <= f64::EPSILON {
         return None;
@@ -107,6 +110,76 @@ fn normalize_intensity(value: f64, min: f64, max: f64, step: f64) -> f64 {
     } else {
         bounded
     }
+}
+
+#[derive(Clone, Copy)]
+struct LevelSignals {
+    level_idx: Signal<usize>,
+    k: Signal<f64>,
+    step_idx: Signal<usize>,
+    history: Signal<Vec<Attempt>>,
+    active_attempt: Signal<Option<Attempt>>,
+    animation_visible: Signal<bool>,
+}
+
+fn replace_levels(
+    mut all_levels: Signal<Vec<Level>>,
+    mut signals: LevelSignals,
+    next_levels: Vec<Level>,
+) {
+    let first_level = next_levels.first().cloned();
+    all_levels.set(next_levels);
+    signals.level_idx.set(0);
+    if let Some(level) = first_level {
+        signals.k.set(level.k_def);
+        signals.step_idx.set(step_index(level.recommended_step));
+    }
+    signals.history.set(Vec::new());
+    signals.active_attempt.set(None);
+    signals.animation_visible.set(false);
+}
+
+fn format_seed(seed: u64) -> String {
+    format!("{seed:016x}")
+}
+
+fn parse_seed(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty() || digits.len() > 16 {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
+}
+
+async fn entropy_seed() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        dioxus::document::eval("Math.floor(Math.random() * 4294967296)")
+            .await
+            .ok()
+            .and_then(|value| value.as_u64())
+            .filter(|seed| *seed != 0)
+            .unwrap_or(1)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(DEFAULT_SEED)
+            .max(1)
+    }
+}
+
+fn copy_seed(seed: u64) {
+    spawn(async move {
+        let script = format!("navigator.clipboard?.writeText('{}')", format_seed(seed));
+        let _ = dioxus::document::eval(&script).await;
+    });
 }
 
 fn history_limit(mode: SimulationMode) -> usize {
@@ -203,15 +276,30 @@ fn closest_message(result: &SimResult) -> String {
 
 #[component]
 fn App() -> Element {
-    let all_levels = use_hook(levels);
+    let all_levels = use_signal(|| generate_levels(DEFAULT_SEED));
+    let initial_k = all_levels()[0].k_def;
+    let initial_step = all_levels()[0].recommended_step;
     let mut level_idx = use_signal(|| 0usize);
     let mut mode = use_signal(|| SimulationMode::Mission);
-    let mut k = use_signal(|| all_levels[0].k_def);
-    let mut step_idx = use_signal(|| step_index(all_levels[0].recommended_step));
+    let mut k = use_signal(|| initial_k);
+    let mut step_idx = use_signal(|| step_index(initial_step));
     let mut history: Signal<Vec<Attempt>> = use_signal(Vec::new);
     let mut active_attempt: Signal<Option<Attempt>> = use_signal(|| None);
     let mut animation_id = use_signal(|| 0usize);
     let mut animation_visible = use_signal(|| false);
+    let mut seed_input = use_signal(|| format_seed(DEFAULT_SEED));
+    let mut active_seed = use_signal(|| DEFAULT_SEED);
+    let mut seed_error = use_signal(String::new);
+    let mut copy_status = use_signal(String::new);
+    let mut entropy_loaded = use_signal(|| false);
+    let level_signals = LevelSignals {
+        level_idx,
+        k,
+        step_idx,
+        history,
+        active_attempt,
+        animation_visible,
+    };
 
     use_effect(move || {
         let should_animate = animation_id() > 0 && active_attempt().is_some();
@@ -220,8 +308,25 @@ fn App() -> Element {
         }
     });
 
-    let current = all_levels[level_idx()];
-    let launch_level = current;
+    use_effect(move || {
+        if entropy_loaded() {
+            return;
+        }
+        entropy_loaded.set(true);
+        spawn(async move {
+            let next_seed = entropy_seed().await;
+            let next_levels = generate_levels(next_seed);
+            active_seed.set(next_seed);
+            seed_input.set(format_seed(next_seed));
+            seed_error.set(String::new());
+            copy_status.set(String::new());
+            replace_levels(all_levels, level_signals, next_levels);
+        });
+    });
+
+    let levels_snapshot = all_levels();
+    let current = levels_snapshot[level_idx()].clone();
+    let launch_level = current.clone();
     let current_mode = mode();
     let current_step = STEPS[step_idx()];
     let preview = integrate_with_mode(&current, k(), current_mode);
@@ -278,7 +383,7 @@ fn App() -> Element {
     } else {
         "collision-point"
     };
-    let has_next_level = level_idx() + 1 < all_levels.len();
+    let has_next_level = level_idx() + 1 < levels_snapshot.len();
     let mode_value = if current_mode == SimulationMode::Exploration {
         "exploration"
     } else {
@@ -301,12 +406,12 @@ fn App() -> Element {
             h1 { "DriftLine" }
             p { class: "sub",
                 "Une sonde est larguée dans une zone traversée par des courants invisibles. "
-                "Une fois lâchée, elle suit le courant sans jamais dévier. Règle l'intensité "
-                "avant de la larguer pour qu'elle atteigne la balise, sans percuter les astéroïdes."
+                "Une fois lâchée, elle suit le courant sans jamais dévier. En Mission, règle l'intensité "
+                "avant de la larguer pour atteindre la balise sans percuter les obstacles."
             }
             div { class: "panel",
                 div { class: "levels",
-                    for (index, level) in all_levels.iter().copied().enumerate() {
+                    for (index, level) in levels_snapshot.iter().cloned().enumerate() {
                         button {
                             key: "{index}",
                             class: if index == level_idx() { "active" } else { "" },
@@ -340,6 +445,68 @@ fn App() -> Element {
                         option { value: "exploration", "Exploration libre" }
                     }
                     span { class: "mode-hint", "{mode_hint}" }
+                }
+                div { class: "seed-row",
+                    label { "Graine" }
+                    input {
+                        class: "seed-input",
+                        value: "{seed_input()}",
+                        placeholder: "graine hexadécimale",
+                        oninput: move |event| {
+                            seed_input.set(event.value());
+                            seed_error.set(String::new());
+                        },
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost small-button",
+                        onclick: move |_| {
+                            let Some(next_seed) = parse_seed(&seed_input()) else {
+                                seed_error.set("Graine hexadécimale invalide.".to_string());
+                                return;
+                            };
+                            let next_levels = generate_levels(next_seed);
+                            active_seed.set(next_seed);
+                            seed_input.set(format_seed(next_seed));
+                            seed_error.set(String::new());
+                            copy_status.set(String::new());
+                            replace_levels(all_levels, level_signals, next_levels);
+                        },
+                        "Appliquer"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost small-button",
+                        onclick: move |_| {
+                            copy_status.set("Graine copiée.".to_string());
+                            copy_seed(active_seed());
+                        },
+                        "Copier"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "action small-button",
+                        onclick: move |_| {
+                            spawn(async move {
+                                let mut next_seed = entropy_seed().await;
+                                if next_seed == active_seed() {
+                                    next_seed = next_seed.wrapping_add(1);
+                                }
+                                let next_levels = generate_levels(next_seed);
+                                active_seed.set(next_seed);
+                                seed_input.set(format_seed(next_seed));
+                                seed_error.set(String::new());
+                                copy_status.set(String::new());
+                                replace_levels(all_levels, level_signals, next_levels);
+                            });
+                        },
+                        "Nouvelle zone"
+                    }
+                    if !seed_error().is_empty() {
+                        span { class: "seed-error", "{seed_error()}" }
+                    } else if !copy_status().is_empty() {
+                        span { class: "seed-status", "{copy_status()}" }
+                    }
                 }
                 div { class: "desc", "{current.title} — {description}" }
 
@@ -573,10 +740,11 @@ fn App() -> Element {
                         button {
                             class: "action next",
                             onclick: move |_| {
-                                let next = (level_idx() + 1).min(all_levels.len() - 1);
+                                let next = (level_idx() + 1).min(levels_snapshot.len() - 1);
+                                let next_level = levels_snapshot[next].clone();
                                 level_idx.set(next);
-                                k.set(all_levels[next].k_def);
-                                step_idx.set(step_index(all_levels[next].recommended_step));
+                                k.set(next_level.k_def);
+                                step_idx.set(step_index(next_level.recommended_step));
                                 history.set(Vec::new());
                                 active_attempt.set(None);
                             },
@@ -650,6 +818,13 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .mode-row label{font-size:.85rem;color:var(--sub)}
 .mode-select{height:32px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);padding:0 8px}
 .mode-hint{font-size:.78rem;color:var(--sub)}
+.seed-row{display:flex;align-items:center;gap:7px;margin-bottom:10px;flex-wrap:wrap}
+.seed-row label{font-size:.85rem;color:var(--sub)}
+.seed-input{width:145px;height:32px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);padding:0 8px;font:inherit}
+.seed-input:focus{outline:2px solid var(--accent);outline-offset:-2px}
+.small-button{padding:7px 10px;font-size:.78rem}
+.seed-error{font-size:.76rem;color:var(--danger)}
+.seed-status{font-size:.76rem;color:var(--accent)}
 .desc{font-size:.85rem;color:var(--sub);margin-bottom:10px;line-height:1.5}
 .field-svg{width:100%;height:auto;background:var(--bg);border:1px solid var(--line);border-radius:10px}
 .arrow{stroke:var(--field);stroke-width:1.2}
@@ -747,5 +922,21 @@ mod tests {
             );
         }
         assert_eq!(history.len(), 5);
+    }
+
+    #[test]
+    fn seed_round_trip_and_prefixes() {
+        let seed = 0x1234_5678_9ABC_DEF0;
+        let formatted = format_seed(seed);
+        assert_eq!(parse_seed(&formatted), Some(seed));
+        assert_eq!(parse_seed("0x1234"), Some(0x1234));
+        assert_eq!(parse_seed("0X1234"), Some(0x1234));
+    }
+
+    #[test]
+    fn invalid_seeds_are_rejected() {
+        assert_eq!(parse_seed(""), None);
+        assert_eq!(parse_seed("xyz"), None);
+        assert_eq!(parse_seed("00000000000000000"), None);
     }
 }

@@ -17,8 +17,6 @@ pub enum SimulationMode {
     Exploration,
 }
 
-pub type FieldFn = fn(f64, f64, f64) -> Vector2;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vector2 {
     pub x: f64,
@@ -31,90 +29,247 @@ impl Vector2 {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Obstacle {
     pub x: f64,
     pub y: f64,
     pub r: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FlowField {
+    Calm {
+        drift_x: f64,
+        baseline_y: f64,
+        gain_y: f64,
+    },
+    Retention {
+        drift_x: f64,
+        center_y: f64,
+        restoring: f64,
+        gain_y: f64,
+    },
+    Waves {
+        drift_x: f64,
+        amplitude: f64,
+        frequency: f64,
+        phase: f64,
+        gain_y: f64,
+    },
+    Vortex {
+        center_x: f64,
+        center_y: f64,
+        drift_x: f64,
+        gain_x: f64,
+        rotation: f64,
+        radial: f64,
+    },
+}
+
+impl FlowField {
+    pub fn evaluate(&self, x: f64, y: f64, k: f64) -> Vector2 {
+        match self {
+            Self::Calm {
+                drift_x,
+                baseline_y,
+                gain_y,
+            } => Vector2 {
+                x: *drift_x,
+                y: baseline_y + gain_y * k,
+            },
+            Self::Retention {
+                drift_x,
+                center_y,
+                restoring,
+                gain_y,
+            } => Vector2 {
+                x: *drift_x,
+                y: gain_y * k + restoring * (center_y - y),
+            },
+            Self::Waves {
+                drift_x,
+                amplitude,
+                frequency,
+                phase,
+                gain_y,
+            } => Vector2 {
+                x: *drift_x,
+                y: amplitude * (frequency * x + phase).sin() + gain_y * k,
+            },
+            Self::Vortex {
+                center_x,
+                center_y,
+                drift_x,
+                gain_x,
+                rotation,
+                radial,
+            } => Vector2 {
+                x: drift_x + gain_x * k - radial * (y - center_y),
+                y: rotation * (x - center_x),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Level {
     pub title: &'static str,
     pub desc: &'static str,
-    pub field: FieldFn,
+    pub field: FlowField,
     pub k_min: f64,
     pub k_max: f64,
     pub k_def: f64,
     pub recommended_step: f64,
     pub a: Point,
     pub b: Point,
-    pub obstacles: &'static [Obstacle],
+    pub obstacles: Vec<Obstacle>,
 }
 
-fn field1(_x: f64, _y: f64, k: f64) -> Vector2 {
-    Vector2 { x: 1.0, y: k }
-}
-
-fn field2(_x: f64, y: f64, k: f64) -> Vector2 {
-    Vector2 { x: 1.0, y: k - y }
-}
-
-fn field3(x: f64, _y: f64, k: f64) -> Vector2 {
-    Vector2 {
-        x: 1.0,
-        y: x.sin() + k * 0.5,
+impl Level {
+    pub fn flow_at(&self, x: f64, y: f64, k: f64) -> Vector2 {
+        self.field.evaluate(x, y, k)
     }
 }
 
-fn field4_vortex(x: f64, y: f64, k: f64) -> Vector2 {
-    Vector2 {
-        x: 1.0 + k * 0.12 - y * 0.18,
-        y: x * 0.18,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemeKind {
+    Calm,
+    Retention,
+    Waves,
+    Vortex,
+}
+
+#[derive(Clone, Copy)]
+struct ThemeSpec {
+    kind: ThemeKind,
+    title: &'static str,
+    desc: &'static str,
+    k_min: f64,
+    k_max: f64,
+    recommended_step: f64,
+    obstacle_count: usize,
+}
+
+const THEMES: [ThemeSpec; 4] = [
+    ThemeSpec {
+        kind: ThemeKind::Calm,
+        title: "Courant calme",
+        desc: "Un courant régulier traverse la zone. Règle son intensité pour que la sonde dérive jusqu'à la balise.",
+        k_min: -1.0,
+        k_max: 1.0,
+        recommended_step: 0.05,
+        obstacle_count: 0,
+    },
+    ThemeSpec {
+        kind: ThemeKind::Retention,
+        title: "Zone de retenue",
+        desc: "Le courant ramène toujours la sonde vers une hauteur d'équilibre. Contourne les obstacles.",
+        k_min: -3.0,
+        k_max: 3.0,
+        recommended_step: 0.05,
+        obstacle_count: 1,
+    },
+    ThemeSpec {
+        kind: ThemeKind::Waves,
+        title: "Houle",
+        desc: "Le courant ondule sur toute la zone. Slalome entre les obstacles.",
+        k_min: -3.0,
+        k_max: 3.0,
+        recommended_step: 0.05,
+        obstacle_count: 2,
+    },
+    ThemeSpec {
+        kind: ThemeKind::Vortex,
+        title: "Tourbillon",
+        desc: "Un courant tourbillonne autour de son axe. Vise juste, car de petites réglages changent beaucoup la trajectoire.",
+        k_min: -3.0,
+        k_max: 3.0,
+        recommended_step: 0.01,
+        obstacle_count: 2,
+    },
+];
+
+pub const DEFAULT_SEED: u64 = 0xD1F7_1A2B_3C4D_5E6F;
+const GENERATION_ATTEMPTS: usize = 96;
+const GOLDEN_RATIO: u64 = 0x9E37_79B9_7F4A_7C15;
+const FIELD_MARGIN: f64 = 0.35;
+const ANCHOR_MARGIN: f64 = 0.35;
+const OBSTACLE_MARGIN: f64 = 0.12;
+const MIN_ANCHOR_DISTANCE: f64 = 4.5;
+
+struct SeededRng {
+    state: u64,
+}
+
+impl SeededRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(GOLDEN_RATIO);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn range(&mut self, min: f64, max: f64) -> f64 {
+        min + (max - min) * self.unit()
     }
 }
 
-pub fn levels() -> Vec<Level> {
-    vec![
-        Level {
-            title: "Courant calme",
-            desc: "Un courant régulier traverse la zone. Règle son intensité pour que la sonde dérive jusqu'à la balise.",
-            field: field1,
-            k_min: -1.0,
-            k_max: 1.0,
-            k_def: 0.0,
-            recommended_step: 0.05,
-            a: (-5.0, 0.0),
-            b: (4.0, 1.0),
-            obstacles: &[],
+fn canonical_field(kind: ThemeKind) -> FlowField {
+    match kind {
+        ThemeKind::Calm => FlowField::Calm {
+            drift_x: 1.0,
+            baseline_y: 0.0,
+            gain_y: 1.0,
         },
-        Level {
-            title: "Zone de retenue",
-            desc: "Le courant ramène toujours la sonde vers une hauteur d'équilibre. Contourne l'astéroïde central.",
-            field: field2,
-            k_min: -3.0,
-            k_max: 3.0,
-            k_def: 0.0,
-            recommended_step: 0.05,
-            a: (-5.0, 0.0),
-            b: (4.0, 1.0),
-            obstacles: &[Obstacle {
+        ThemeKind::Retention => FlowField::Retention {
+            drift_x: 1.0,
+            center_y: 0.0,
+            restoring: 1.0,
+            gain_y: 1.0,
+        },
+        ThemeKind::Waves => FlowField::Waves {
+            drift_x: 1.0,
+            amplitude: 1.0,
+            frequency: 1.0,
+            phase: 0.0,
+            gain_y: 0.5,
+        },
+        ThemeKind::Vortex => FlowField::Vortex {
+            center_x: 0.0,
+            center_y: 0.0,
+            drift_x: 1.0,
+            gain_x: 0.12,
+            rotation: 0.18,
+            radial: 0.18,
+        },
+    }
+}
+
+fn canonical_level(theme: ThemeSpec) -> Level {
+    let (a, b, obstacles) = match theme.kind {
+        ThemeKind::Calm => ((-5.0, 0.0), (4.0, 1.0), Vec::new()),
+        ThemeKind::Retention => (
+            (-5.0, 0.0),
+            (4.0, 1.0),
+            vec![Obstacle {
                 x: 0.0,
                 y: 2.5,
                 r: 0.9,
             }],
-        },
-        Level {
-            title: "Houle",
-            desc: "Le courant ondule sur toute la zone. Slalome entre les deux astéroïdes.",
-            field: field3,
-            k_min: -3.0,
-            k_max: 3.0,
-            k_def: 0.0,
-            recommended_step: 0.05,
-            a: (-5.0, 0.0),
-            b: (5.0, 1.0),
-            obstacles: &[
+        ),
+        ThemeKind::Waves => (
+            (-5.0, 0.0),
+            (5.0, 1.0),
+            vec![
                 Obstacle {
                     x: -1.0,
                     y: 2.2,
@@ -126,18 +281,11 @@ pub fn levels() -> Vec<Level> {
                     r: 0.7,
                 },
             ],
-        },
-        Level {
-            title: "Tourbillon",
-            desc: "Un courant tourbillonne autour de son axe. Vise juste, car de petites réglages changent beaucoup la trajectoire.",
-            field: field4_vortex,
-            k_min: -3.0,
-            k_max: 3.0,
-            k_def: 0.0,
-            recommended_step: 0.01,
-            a: (-5.0, 3.0),
-            b: (-1.25, 0.7),
-            obstacles: &[
+        ),
+        ThemeKind::Vortex => (
+            (-5.0, 3.0),
+            (-1.25, 0.7),
+            vec![
                 Obstacle {
                     x: 0.0,
                     y: 0.0,
@@ -149,8 +297,221 @@ pub fn levels() -> Vec<Level> {
                     r: 0.6,
                 },
             ],
+        ),
+    };
+
+    Level {
+        title: theme.title,
+        desc: theme.desc,
+        field: canonical_field(theme.kind),
+        k_min: theme.k_min,
+        k_max: theme.k_max,
+        k_def: 0.0,
+        recommended_step: theme.recommended_step,
+        a,
+        b,
+        obstacles,
+    }
+}
+
+fn theme_seed(seed: u64, index: usize) -> u64 {
+    seed ^ (index as u64 + 1).wrapping_mul(GOLDEN_RATIO)
+}
+
+fn random_field(kind: ThemeKind, rng: &mut SeededRng) -> FlowField {
+    match kind {
+        ThemeKind::Calm => FlowField::Calm {
+            drift_x: rng.range(0.78, 1.18),
+            baseline_y: rng.range(-0.25, 0.25),
+            gain_y: rng.range(0.75, 1.25),
         },
-    ]
+        ThemeKind::Retention => FlowField::Retention {
+            drift_x: rng.range(0.82, 1.15),
+            center_y: rng.range(-0.9, 0.9),
+            restoring: rng.range(0.7, 1.2),
+            gain_y: rng.range(0.75, 1.2),
+        },
+        ThemeKind::Waves => FlowField::Waves {
+            drift_x: rng.range(0.8, 1.18),
+            amplitude: rng.range(0.5, 1.0),
+            frequency: rng.range(0.7, 1.35),
+            phase: rng.range(0.0, std::f64::consts::TAU),
+            gain_y: rng.range(0.35, 0.75),
+        },
+        ThemeKind::Vortex => FlowField::Vortex {
+            center_x: rng.range(-1.1, 1.1),
+            center_y: rng.range(-0.9, 0.9),
+            drift_x: rng.range(0.8, 1.15),
+            gain_x: rng.range(0.08, 0.16),
+            rotation: rng.range(0.13, 0.23),
+            radial: rng.range(0.1, 0.22),
+        },
+    }
+}
+
+fn random_obstacles(
+    theme: ThemeSpec,
+    a: Point,
+    b: Point,
+    rng: &mut SeededRng,
+) -> Option<Vec<Obstacle>> {
+    let (min_radius, max_radius) = match theme.kind {
+        ThemeKind::Calm => return Some(Vec::new()),
+        ThemeKind::Retention => (0.65, 0.95),
+        ThemeKind::Waves => (0.45, 0.75),
+        ThemeKind::Vortex => (0.45, 0.85),
+    };
+    let mut obstacles = Vec::with_capacity(theme.obstacle_count);
+
+    for _ in 0..theme.obstacle_count {
+        let mut placed = None;
+        for _ in 0..96 {
+            let radius = rng.range(min_radius, max_radius);
+            let x = rng.range(
+                XMIN + radius + OBJ_R + OBSTACLE_MARGIN,
+                XMAX - radius - OBJ_R - OBSTACLE_MARGIN,
+            );
+            let y = rng.range(
+                YMIN + radius + OBJ_R + OBSTACLE_MARGIN,
+                YMAX - radius - OBJ_R - OBSTACLE_MARGIN,
+            );
+            let obstacle = Obstacle { x, y, r: radius };
+            let separated_from_anchors = point_distance((x, y), a) > radius + OBJ_R + FIELD_MARGIN
+                && point_distance((x, y), b) > radius + OBJ_R + WIN_R + FIELD_MARGIN;
+            let separated_from_obstacles = obstacles.iter().all(|other: &Obstacle| {
+                point_distance((x, y), (other.x, other.y)) > radius + other.r + FIELD_MARGIN
+            });
+            if separated_from_anchors && separated_from_obstacles {
+                placed = Some(obstacle);
+                break;
+            }
+        }
+        obstacles.push(placed?);
+    }
+
+    Some(obstacles)
+}
+
+fn point_distance(first: Point, second: Point) -> f64 {
+    (first.0 - second.0).hypot(first.1 - second.1)
+}
+
+fn random_level(theme: ThemeSpec, rng: &mut SeededRng) -> Option<Level> {
+    let a = match theme.kind {
+        ThemeKind::Vortex => (rng.range(-5.2, -3.6), rng.range(-2.8, 2.8)),
+        _ => (rng.range(-5.2, -3.6), rng.range(-2.8, 2.8)),
+    };
+    let b = match theme.kind {
+        ThemeKind::Vortex => (rng.range(0.8, 4.8), rng.range(-2.8, 2.8)),
+        _ => (rng.range(2.4, 5.2), rng.range(-2.8, 2.8)),
+    };
+    if point_distance(a, b) < MIN_ANCHOR_DISTANCE {
+        return None;
+    }
+    let field = random_field(theme.kind, rng);
+    let obstacles = random_obstacles(theme, a, b, rng)?;
+    let level = Level {
+        title: theme.title,
+        desc: theme.desc,
+        field,
+        k_min: theme.k_min,
+        k_max: theme.k_max,
+        k_def: 0.0,
+        recommended_step: theme.recommended_step,
+        a,
+        b,
+        obstacles,
+    };
+    valid_geometry(&level).then_some(level)
+}
+
+fn valid_geometry(level: &Level) -> bool {
+    if !point_in_field(level.a, ANCHOR_MARGIN)
+        || !point_in_field(level.b, ANCHOR_MARGIN + WIN_R)
+        || point_distance(level.a, level.b) < MIN_ANCHOR_DISTANCE
+    {
+        return false;
+    }
+
+    for obstacle in &level.obstacles {
+        if !obstacle.r.is_finite()
+            || obstacle.r <= 0.0
+            || obstacle.x - obstacle.r - OBJ_R < XMIN
+            || obstacle.x + obstacle.r + OBJ_R > XMAX
+            || obstacle.y - obstacle.r - OBJ_R < YMIN
+            || obstacle.y + obstacle.r + OBJ_R > YMAX
+            || point_distance(level.a, (obstacle.x, obstacle.y))
+                <= obstacle.r + OBJ_R + FIELD_MARGIN
+            || point_distance(level.b, (obstacle.x, obstacle.y))
+                <= obstacle.r + OBJ_R + WIN_R + FIELD_MARGIN
+        {
+            return false;
+        }
+    }
+
+    level.obstacles.iter().enumerate().all(|(index, obstacle)| {
+        level.obstacles[index + 1..].iter().all(|other| {
+            point_distance((obstacle.x, obstacle.y), (other.x, other.y))
+                > obstacle.r + other.r + FIELD_MARGIN
+        })
+    })
+}
+
+fn point_in_field(point: Point, margin: f64) -> bool {
+    point.0.is_finite()
+        && point.1.is_finite()
+        && point.0 >= XMIN + margin
+        && point.0 <= XMAX - margin
+        && point.1 >= YMIN + margin
+        && point.1 <= YMAX - margin
+}
+
+fn valid_field(level: &Level) -> bool {
+    let x_samples = [XMIN, -3.0, 0.0, 3.0, XMAX];
+    let y_samples = [YMIN, -1.5, 0.0, 1.5, YMAX];
+    let k_samples = [level.k_min, 0.0, level.k_max];
+    x_samples.iter().all(|x| {
+        y_samples.iter().all(|y| {
+            k_samples.iter().all(|k| {
+                let vector = level.flow_at(*x, *y, *k);
+                vector.x.is_finite() && vector.y.is_finite()
+            })
+        })
+    })
+}
+
+fn is_winnable(level: &Level) -> bool {
+    let step = level.recommended_step;
+    let count = ((level.k_max - level.k_min) / step).round() as usize;
+    (0..=count).any(|index| {
+        let k = level.k_min + index as f64 * step;
+        integrate_with_mode(level, k, SimulationMode::Mission).reached()
+    })
+}
+
+fn generate_level(theme: ThemeSpec, seed: u64) -> Level {
+    for attempt in 0..GENERATION_ATTEMPTS {
+        let mut rng =
+            SeededRng::new(seed.wrapping_add((attempt as u64).wrapping_mul(GOLDEN_RATIO)));
+        if let Some(level) = random_level(theme, &mut rng) {
+            if valid_field(&level) && is_winnable(&level) {
+                return level;
+            }
+        }
+    }
+    canonical_level(theme)
+}
+
+pub fn generate_levels(seed: u64) -> Vec<Level> {
+    THEMES
+        .iter()
+        .enumerate()
+        .map(|(index, theme)| generate_level(*theme, theme_seed(seed, index)))
+        .collect()
+}
+
+pub fn levels() -> Vec<Level> {
+    generate_levels(DEFAULT_SEED)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -187,10 +548,10 @@ impl SimResult {
 
 fn rk4(level: &Level, point: Point, k: f64, dt: f64) -> Point {
     let (x, y) = point;
-    let k1 = (level.field)(x, y, k);
-    let k2 = (level.field)(x + dt * 0.5, y + dt * 0.5 * k1.y, k);
-    let k3 = (level.field)(x + dt * 0.5, y + dt * 0.5 * k2.y, k);
-    let k4 = (level.field)(x + dt, y + dt * k3.y, k);
+    let k1 = level.flow_at(x, y, k);
+    let k2 = level.flow_at(x + dt * 0.5, y + dt * 0.5 * k1.y, k);
+    let k3 = level.flow_at(x + dt * 0.5, y + dt * 0.5 * k2.y, k);
+    let k4 = level.flow_at(x + dt, y + dt * k3.y, k);
     (
         x + dt * (k1.x + 2.0 * k2.x + 2.0 * k3.x + k4.x) / 6.0,
         y + dt * (k1.y + 2.0 * k2.y + 2.0 * k3.y + k4.y) / 6.0,
@@ -384,6 +745,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_levels_are_reproducible() {
+        assert_eq!(generate_levels(42), generate_levels(42));
+    }
+
+    #[test]
+    fn different_seeds_change_the_variation() {
+        assert_ne!(generate_levels(42), generate_levels(43));
+    }
+
+    #[test]
+    fn generated_levels_stay_bounded_and_winnable() {
+        for seed in 0..16 {
+            for level in generate_levels(seed) {
+                assert!(
+                    valid_geometry(&level),
+                    "géométrie invalide: {}",
+                    level.title
+                );
+                assert!(valid_field(&level), "champ invalide: {}", level.title);
+                assert!(is_winnable(&level), "niveau impossible: {}", level.title);
+            }
+        }
+    }
+
+    #[test]
     fn same_field_gives_same_path() {
         let level = &levels()[2];
         assert_eq!(integrate(level, 0.2), integrate(level, 0.2));
@@ -394,14 +780,18 @@ mod tests {
         let level = Level {
             title: "Test",
             desc: "",
-            field: field1,
+            field: FlowField::Calm {
+                drift_x: 1.0,
+                baseline_y: 0.0,
+                gain_y: 1.0,
+            },
             k_min: -1.0,
             k_max: 1.0,
             k_def: 0.0,
             recommended_step: 0.01,
             a: (0.0, 0.0),
             b: (5.0, 5.0),
-            obstacles: &[Obstacle {
+            obstacles: vec![Obstacle {
                 x: 0.01,
                 y: 0.0,
                 r: 0.1,
@@ -419,14 +809,18 @@ mod tests {
         let level = Level {
             title: "Exploration",
             desc: "",
-            field: field1,
+            field: FlowField::Calm {
+                drift_x: 1.0,
+                baseline_y: 0.0,
+                gain_y: 1.0,
+            },
             k_min: -1.0,
             k_max: 1.0,
             k_def: 0.0,
             recommended_step: 0.01,
             a: (0.0, 0.0),
             b: (5.0, 5.0),
-            obstacles: &[Obstacle {
+            obstacles: vec![Obstacle {
                 x: 0.01,
                 y: 0.0,
                 r: 0.1,
@@ -456,8 +850,8 @@ mod tests {
 
     #[test]
     fn rk4_preserves_a_constant_field() {
-        let level = &levels()[0];
-        let point = rk4(level, (0.0, 0.0), 0.5, 0.1);
+        let level = canonical_level(THEMES[0]);
+        let point = rk4(&level, (0.0, 0.0), 0.5, 0.1);
         assert!((point.0 - 0.1).abs() < 1e-12);
         assert!((point.1 - 0.05).abs() < 1e-12);
     }
