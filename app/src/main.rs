@@ -13,6 +13,7 @@ const X_SCALE: f64 = W / (XMAX - XMIN);
 const Y_SCALE: f64 = H / (YMAX - YMIN);
 const STEPS: [f64; 6] = [1.0, 0.5, 0.1, 0.05, 0.01, 0.001];
 const HISTORY_LIMIT: usize = 3;
+const TUTORIAL_LEVEL_COUNT: usize = 4;
 
 #[derive(Clone, Debug)]
 struct Attempt {
@@ -184,9 +185,13 @@ fn copy_seed(seed: u64) {
 
 fn history_limit(mode: SimulationMode) -> usize {
     match mode {
-        SimulationMode::Mission => HISTORY_LIMIT,
+        SimulationMode::Laboratory => HISTORY_LIMIT,
         SimulationMode::Exploration => usize::MAX,
     }
+}
+
+fn should_show_vectors(mode: SimulationMode, level_idx: usize) -> bool {
+    mode == SimulationMode::Laboratory || level_idx < TUTORIAL_LEVEL_COUNT
 }
 
 fn push_attempt(history: &mut Vec<Attempt>, attempt: Attempt, limit: usize) {
@@ -221,7 +226,7 @@ fn result_message(result: &SimResult, mode: SimulationMode) -> (String, bool) {
                 false,
             ),
         },
-        SimulationMode::Mission => match result.outcome {
+        SimulationMode::Laboratory => match result.outcome {
             Outcome::Reached => ("La sonde a atteint la balise.".to_string(), true),
             Outcome::Collision { obstacle, .. } => (
                 format!(
@@ -252,7 +257,7 @@ fn result_message(result: &SimResult, mode: SimulationMode) -> (String, bool) {
 fn attempt_status(mode: SimulationMode, won: bool) -> &'static str {
     match mode {
         SimulationMode::Exploration => "terminé",
-        SimulationMode::Mission => {
+        SimulationMode::Laboratory => {
             if won {
                 "succès"
             } else {
@@ -280,7 +285,7 @@ fn App() -> Element {
     let initial_k = all_levels()[0].k_def;
     let initial_step = all_levels()[0].recommended_step;
     let mut level_idx = use_signal(|| 0usize);
-    let mut mode = use_signal(|| SimulationMode::Mission);
+    let mut mode = use_signal(|| SimulationMode::Laboratory);
     let mut k = use_signal(|| initial_k);
     let mut step_idx = use_signal(|| step_index(initial_step));
     let mut history: Signal<Vec<Attempt>> = use_signal(Vec::new);
@@ -366,7 +371,7 @@ fn App() -> Element {
     let active_message = active_result
         .as_ref()
         .map(|result| result_message(result, current_mode));
-    let active_won = current_mode == SimulationMode::Mission
+    let active_won = current_mode == SimulationMode::Laboratory
         && active_result.as_ref().is_some_and(SimResult::reached);
     let path_class = if animation_visible() && active_result.is_some() {
         "path active-path"
@@ -387,12 +392,12 @@ fn App() -> Element {
     let mode_value = if current_mode == SimulationMode::Exploration {
         "exploration"
     } else {
-        "mission"
+        "laboratory"
     };
-    let mode_hint = if current_mode == SimulationMode::Exploration {
-        "Sans objectif ni collision"
-    } else {
-        "Atteindre la balise"
+    let mode_hint = match (current_mode, level_idx() < TUTORIAL_LEVEL_COUNT) {
+        (SimulationMode::Laboratory, _) => "Atteindre la balise · vecteurs actifs",
+        (SimulationMode::Exploration, true) => "Sans objectif · vecteurs tutoriel",
+        (SimulationMode::Exploration, false) => "Sans objectif · vecteurs masqués",
     };
     let history_title = if current_mode == SimulationMode::Exploration {
         "Historique d'exploration"
@@ -406,7 +411,7 @@ fn App() -> Element {
             h1 { "DriftLine" }
             p { class: "sub",
                 "Une sonde est larguée dans une zone traversée par des courants invisibles. "
-                "Une fois lâchée, elle suit le courant sans jamais dévier. En Mission, règle l'intensité "
+                "Une fois lâchée, elle suit le courant sans jamais dévier. En Laboratoire, règle l'intensité "
                 "avant de la larguer pour atteindre la balise sans percuter les obstacles."
             }
             div { class: "panel",
@@ -434,15 +439,15 @@ fn App() -> Element {
                         onchange: move |event| {
                             let next_mode = match event.value().as_str() {
                                 "exploration" => SimulationMode::Exploration,
-                                _ => SimulationMode::Mission,
+                                _ => SimulationMode::Laboratory,
                             };
                             mode.set(next_mode);
                             history.set(Vec::new());
                             active_attempt.set(None);
                             animation_visible.set(false);
                         },
-                        option { value: "mission", "Mission" }
-                        option { value: "exploration", "Exploration libre" }
+                        option { value: "laboratory", "Laboratoire" }
+                        option { value: "exploration", "Exploration" }
                     }
                     span { class: "mode-hint", "{mode_hint}" }
                 }
@@ -523,20 +528,24 @@ fn App() -> Element {
                             path { d: "M 0 0 L 10 5 L 0 10 z", class: "arrow-head" }
                         }
                     }
-                    for gx in field_grid_x() {
-                        for gy in field_grid_y() {
-                            if let Some((x1, y1, x2, y2)) = vector_endpoints(&current, gx, gy, k()) {
-                                line {
-                                    key: "{gx}-{gy}",
-                                    x1: "{x1:.2}", y1: "{y1:.2}",
-                                    x2: "{x2:.2}", y2: "{y2:.2}",
-                                    class: "arrow",
-                                    marker_end: "url(#flow-arrow)",
+                    if should_show_vectors(current_mode, level_idx()) {
+                        for gx in field_grid_x() {
+                            for gy in field_grid_y() {
+                                if let Some((x1, y1, x2, y2)) =
+                                    vector_endpoints(&current, gx, gy, k())
+                                {
+                                    line {
+                                        key: "{gx}-{gy}",
+                                        x1: "{x1:.2}", y1: "{y1:.2}",
+                                        x2: "{x2:.2}", y2: "{y2:.2}",
+                                        class: "arrow",
+                                        marker_end: "url(#flow-arrow)",
+                                    }
                                 }
                             }
                         }
                     }
-                    if current_mode == SimulationMode::Mission {
+                    if current_mode == SimulationMode::Laboratory {
                         for (index, obstacle) in current.obstacles.iter().enumerate() {
                             ellipse {
                                 key: "{index}",
@@ -553,7 +562,7 @@ fn App() -> Element {
                     ellipse {
                         cx: "{map_x(current.b.0):.2}", cy: "{map_y(current.b.1):.2}",
                         rx: "{(WIN_R * X_SCALE):.2}", ry: "{(WIN_R * Y_SCALE):.2}",
-                        class: if current_mode == SimulationMode::Mission {
+                        class: if current_mode == SimulationMode::Laboratory {
                             "point-b"
                         } else {
                             "point-b reference-point"
@@ -772,7 +781,7 @@ fn App() -> Element {
                         for (index, (_, label, won)) in history_paths.iter().enumerate() {
                             span {
                                 key: "history-label-{index}",
-                                class: if current_mode == SimulationMode::Mission && *won {
+                                class: if current_mode == SimulationMode::Laboratory && *won {
                                     "history-entry success"
                                 } else {
                                     "history-entry"
@@ -786,7 +795,7 @@ fn App() -> Element {
                 div { class: "legend",
                     span { span { class: "dot dot-a" } " Largage" }
                     span { span { class: "dot dot-b" } " Balise" }
-                    if current_mode == SimulationMode::Mission {
+                    if current_mode == SimulationMode::Laboratory {
                         span { span { class: "dot dot-o" } " Astéroïde" }
                     } else {
                         span { span { class: "dot dot-b" } " Référence" }
@@ -903,7 +912,7 @@ mod tests {
             push_attempt(
                 &mut history,
                 attempt(k as f64),
-                history_limit(SimulationMode::Mission),
+                history_limit(SimulationMode::Laboratory),
             );
         }
         assert_eq!(history.len(), HISTORY_LIMIT);
@@ -922,6 +931,14 @@ mod tests {
             );
         }
         assert_eq!(history.len(), 5);
+    }
+
+    #[test]
+    fn exploration_hides_vectors_after_the_tutorial_levels() {
+        assert!(should_show_vectors(SimulationMode::Exploration, 0));
+        assert!(should_show_vectors(SimulationMode::Exploration, 3));
+        assert!(!should_show_vectors(SimulationMode::Exploration, 4));
+        assert!(should_show_vectors(SimulationMode::Laboratory, 4));
     }
 
     #[test]

@@ -18,12 +18,12 @@ dx build --package peoplemodeler-app --platform android  # APK/AAB (job build-an
 ```
 
 ## Ce qui diffère de la version JS
-- Moteur de champs vectoriels 2D : les quatre niveaux utilisent des vitesses `(vx, vy)` et une intégration RK4 temporelle.
+- Moteur de champs vectoriels 2D : les cinq niveaux utilisent des vitesses `(vx, vy)` et une intégration RK4 temporelle; le cinquième introduit deux zones de courants opposés.
 - Chaque session génère une variation de chaque thème : sonde, balise, obstacles et paramètres du courant restent dans les bornes du terrain.
-- Le générateur rejette les candidates invalides ou sans réglage gagnant, avec un niveau de repli déterministe; aucune variation mission n'est livrée sans solution.
+- Le générateur rejette les candidates invalides ou sans réglage gagnant, avec un niveau de repli déterministe; aucune variation jouable n'est livrée sans solution.
 - La graine hexadécimale est visible, copiable et réapplicable pour retrouver exactement le même set de niveaux.
 - Le réglage propose des pas précis, les trois dernières trajectoires restent visibles et les échecs indiquent le passage le plus proche ou le point d'impact.
-- Le mode Mission conserve les objectifs et collisions; le mode Exploration libre désactive les collisions, conserve toutes les trajectoires et affiche la référence de la balise.
+- Le mode Laboratoire conserve les objectifs, collisions et vecteurs du champ; le mode Exploration les désactive, conserve toutes les trajectoires et affiche la référence de la balise. Les quatre premières zones gardent les vecteurs comme tutoriel, puis l'Exploration les masque.
 - Au largage, la trajectoire se dessine progressivement en SVG; les points de
   proximité et d'impact apparaissent à la fin du tracé.
 - Le champ est dessiné en SVG plutôt qu'en `<canvas>`, pour que le même code
