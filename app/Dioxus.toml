@@ -1,0 +1,11 @@
+[application]
+name = "peoplemodeler-app"
+default_platform = "web"
+out_dir = "dist"
+
+[web.app]
+title = "DriftLine"
+
+[bundle]
+identifier = "com.peoplemodeler.app"
+publisher = "PeopleModeler"
