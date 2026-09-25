@@ -70,8 +70,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test
-        working-directory: core
+        run: cargo test --workspace
       - name: Check WASM build
         run: cargo check --target wasm32-unknown-unknown -p peoplemodeler-app
 
