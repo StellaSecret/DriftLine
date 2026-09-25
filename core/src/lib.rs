@@ -13,7 +13,7 @@ pub type Point = (f64, f64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimulationMode {
-    Mission,
+    Laboratory,
     Exploration,
 }
 
@@ -64,6 +64,14 @@ pub enum FlowField {
         rotation: f64,
         radial: f64,
     },
+    Opposed {
+        split_y: f64,
+        drift_x: f64,
+        vertical_push: f64,
+        center_y: f64,
+        restoring: f64,
+        gain_y: f64,
+    },
 }
 
 impl FlowField {
@@ -107,6 +115,20 @@ impl FlowField {
                 x: drift_x + gain_x * k - radial * (y - center_y),
                 y: rotation * (x - center_x),
             },
+            Self::Opposed {
+                split_y,
+                drift_x,
+                vertical_push,
+                center_y,
+                restoring,
+                gain_y,
+            } => {
+                let direction = if y < *split_y { -1.0 } else { 1.0 };
+                Vector2 {
+                    x: *drift_x,
+                    y: direction * *vertical_push + gain_y * k + restoring * (center_y - y),
+                }
+            }
         }
     }
 }
@@ -120,6 +142,7 @@ pub struct Level {
     pub k_max: f64,
     pub k_def: f64,
     pub recommended_step: f64,
+    pub exploration_attempts: usize,
     pub a: Point,
     pub b: Point,
     pub obstacles: Vec<Obstacle>,
@@ -137,6 +160,7 @@ enum ThemeKind {
     Retention,
     Waves,
     Vortex,
+    Opposed,
 }
 
 #[derive(Clone, Copy)]
@@ -147,10 +171,11 @@ struct ThemeSpec {
     k_min: f64,
     k_max: f64,
     recommended_step: f64,
+    exploration_attempts: usize,
     obstacle_count: usize,
 }
 
-const THEMES: [ThemeSpec; 4] = [
+const THEMES: [ThemeSpec; 5] = [
     ThemeSpec {
         kind: ThemeKind::Calm,
         title: "Courant calme",
@@ -158,6 +183,7 @@ const THEMES: [ThemeSpec; 4] = [
         k_min: -1.0,
         k_max: 1.0,
         recommended_step: 0.05,
+        exploration_attempts: 3,
         obstacle_count: 0,
     },
     ThemeSpec {
@@ -167,6 +193,7 @@ const THEMES: [ThemeSpec; 4] = [
         k_min: -3.0,
         k_max: 3.0,
         recommended_step: 0.05,
+        exploration_attempts: 4,
         obstacle_count: 1,
     },
     ThemeSpec {
@@ -176,6 +203,7 @@ const THEMES: [ThemeSpec; 4] = [
         k_min: -3.0,
         k_max: 3.0,
         recommended_step: 0.05,
+        exploration_attempts: 4,
         obstacle_count: 2,
     },
     ThemeSpec {
@@ -185,6 +213,17 @@ const THEMES: [ThemeSpec; 4] = [
         k_min: -3.0,
         k_max: 3.0,
         recommended_step: 0.01,
+        exploration_attempts: 5,
+        obstacle_count: 2,
+    },
+    ThemeSpec {
+        kind: ThemeKind::Opposed,
+        title: "Courants opposés",
+        desc: "Deux zones de courant tirent vers des directions opposées. Ajuste l'intensité pour franchir la séparation.",
+        k_min: -3.0,
+        k_max: 3.0,
+        recommended_step: 0.05,
+        exploration_attempts: 5,
         obstacle_count: 2,
     },
 ];
@@ -251,6 +290,14 @@ fn canonical_field(kind: ThemeKind) -> FlowField {
             rotation: 0.18,
             radial: 0.18,
         },
+        ThemeKind::Opposed => FlowField::Opposed {
+            split_y: 0.0,
+            drift_x: 1.0,
+            vertical_push: 0.55,
+            center_y: 0.0,
+            restoring: 0.8,
+            gain_y: 0.8,
+        },
     }
 }
 
@@ -298,6 +345,22 @@ fn canonical_level(theme: ThemeSpec) -> Level {
                 },
             ],
         ),
+        ThemeKind::Opposed => (
+            (-5.0, 0.0),
+            (5.0, 0.0),
+            vec![
+                Obstacle {
+                    x: -1.5,
+                    y: 2.0,
+                    r: 0.65,
+                },
+                Obstacle {
+                    x: 2.2,
+                    y: -2.0,
+                    r: 0.7,
+                },
+            ],
+        ),
     };
 
     Level {
@@ -308,6 +371,7 @@ fn canonical_level(theme: ThemeSpec) -> Level {
         k_max: theme.k_max,
         k_def: 0.0,
         recommended_step: theme.recommended_step,
+        exploration_attempts: theme.exploration_attempts,
         a,
         b,
         obstacles,
@@ -346,6 +410,14 @@ fn random_field(kind: ThemeKind, rng: &mut SeededRng) -> FlowField {
             rotation: rng.range(0.13, 0.23),
             radial: rng.range(0.1, 0.22),
         },
+        ThemeKind::Opposed => FlowField::Opposed {
+            split_y: rng.range(-1.2, 1.2),
+            drift_x: rng.range(0.82, 1.15),
+            vertical_push: rng.range(0.45, 0.9),
+            center_y: rng.range(-0.7, 0.7),
+            restoring: rng.range(0.6, 1.0),
+            gain_y: rng.range(0.65, 1.05),
+        },
     }
 }
 
@@ -360,6 +432,7 @@ fn random_obstacles(
         ThemeKind::Retention => (0.65, 0.95),
         ThemeKind::Waves => (0.45, 0.75),
         ThemeKind::Vortex => (0.45, 0.85),
+        ThemeKind::Opposed => (0.5, 0.8),
     };
     let mut obstacles = Vec::with_capacity(theme.obstacle_count);
 
@@ -397,10 +470,7 @@ fn point_distance(first: Point, second: Point) -> f64 {
 }
 
 fn random_level(theme: ThemeSpec, rng: &mut SeededRng) -> Option<Level> {
-    let a = match theme.kind {
-        ThemeKind::Vortex => (rng.range(-5.2, -3.6), rng.range(-2.8, 2.8)),
-        _ => (rng.range(-5.2, -3.6), rng.range(-2.8, 2.8)),
-    };
+    let a = (rng.range(-5.2, -3.6), rng.range(-2.8, 2.8));
     let b = match theme.kind {
         ThemeKind::Vortex => (rng.range(0.8, 4.8), rng.range(-2.8, 2.8)),
         _ => (rng.range(2.4, 5.2), rng.range(-2.8, 2.8)),
@@ -418,6 +488,7 @@ fn random_level(theme: ThemeSpec, rng: &mut SeededRng) -> Option<Level> {
         k_max: theme.k_max,
         k_def: 0.0,
         recommended_step: theme.recommended_step,
+        exploration_attempts: theme.exploration_attempts,
         a,
         b,
         obstacles,
@@ -485,7 +556,7 @@ fn is_winnable(level: &Level) -> bool {
     let count = ((level.k_max - level.k_min) / step).round() as usize;
     (0..=count).any(|index| {
         let k = level.k_min + index as f64 * step;
-        integrate_with_mode(level, k, SimulationMode::Mission).reached()
+        integrate_with_mode(level, k, SimulationMode::Laboratory).reached()
     })
 }
 
@@ -633,7 +704,7 @@ fn closer(current: ClosestApproach, candidate: ClosestApproach) -> ClosestApproa
 }
 
 pub fn integrate(level: &Level, k: f64) -> SimResult {
-    integrate_with_mode(level, k, SimulationMode::Mission)
+    integrate_with_mode(level, k, SimulationMode::Laboratory)
 }
 
 pub fn integrate_with_mode(level: &Level, k: f64, mode: SimulationMode) -> SimResult {
@@ -662,7 +733,7 @@ pub fn integrate_with_mode(level: &Level, k: f64, mode: SimulationMode) -> SimRe
             })
             .filter(|(t, _)| *t <= 1.0);
 
-        if mode == SimulationMode::Mission {
+        if mode == SimulationMode::Laboratory {
             if let Some(t) = segment_circle_intersection(point, next, level.b, WIN_R) {
                 if event.as_ref().is_none_or(|(best, _)| t < *best) {
                     event = Some((t, Outcome::Reached));
@@ -730,7 +801,7 @@ mod tests {
 
     #[test]
     fn all_levels_load() {
-        assert_eq!(levels().len(), 4);
+        assert_eq!(levels().len(), 5);
     }
 
     #[test]
@@ -742,6 +813,16 @@ mod tests {
                 level.title
             );
         }
+    }
+
+    #[test]
+    fn exploration_budgets_grow_with_difficulty() {
+        let budgets: Vec<usize> = generate_levels(42)
+            .iter()
+            .map(|level| level.exploration_attempts)
+            .collect();
+        assert!(budgets.iter().all(|budget| (3..=5).contains(budget)));
+        assert!(budgets.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[test]
@@ -770,6 +851,15 @@ mod tests {
     }
 
     #[test]
+    fn opposed_field_reverses_vertical_current() {
+        let level = canonical_level(THEMES[4]);
+        let below = level.flow_at(0.0, -0.1, 0.0);
+        let above = level.flow_at(0.0, 0.1, 0.0);
+        assert!(below.y < 0.0);
+        assert!(above.y > 0.0);
+    }
+
+    #[test]
     fn same_field_gives_same_path() {
         let level = &levels()[2];
         assert_eq!(integrate(level, 0.2), integrate(level, 0.2));
@@ -789,6 +879,7 @@ mod tests {
             k_max: 1.0,
             k_def: 0.0,
             recommended_step: 0.01,
+            exploration_attempts: 3,
             a: (0.0, 0.0),
             b: (5.0, 5.0),
             obstacles: vec![Obstacle {
@@ -818,6 +909,7 @@ mod tests {
             k_max: 1.0,
             k_def: 0.0,
             recommended_step: 0.01,
+            exploration_attempts: 3,
             a: (0.0, 0.0),
             b: (5.0, 5.0),
             obstacles: vec![Obstacle {
