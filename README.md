@@ -20,6 +20,7 @@ dx build --package peoplemodeler-app --platform android  # APK/AAB (job build-an
 ## Ce qui diffère de la version JS
 - Moteur de champs vectoriels 2D : les quatre niveaux utilisent des vitesses `(vx, vy)` et une intégration RK4 temporelle.
 - Le réglage propose des pas précis, les trois dernières trajectoires restent visibles et les échecs indiquent le passage le plus proche ou le point d'impact.
+- Le mode Mission conserve les objectifs et collisions; le mode Exploration libre désactive les collisions, conserve toutes les trajectoires et affiche la référence de la balise.
 - Au largage, la trajectoire se dessine progressivement en SVG; les points de
   proximité et d'impact apparaissent à la fin du tracé.
 - Le champ est dessiné en SVG plutôt qu'en `<canvas>`, pour que le même code

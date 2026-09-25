@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use peoplemodeler_core::{
-    integrate, levels, Level, Outcome, SimResult, Vector2, WIN_R, XMAX, XMIN, YMAX, YMIN,
+    integrate_with_mode, levels, Level, Outcome, SimResult, SimulationMode, Vector2, WIN_R, XMAX,
+    XMIN, YMAX, YMIN,
 };
 
 const W: f64 = 640.0;
@@ -108,8 +109,15 @@ fn normalize_intensity(value: f64, min: f64, max: f64, step: f64) -> f64 {
     }
 }
 
-fn push_attempt(history: &mut Vec<Attempt>, attempt: Attempt) {
-    if history.len() == HISTORY_LIMIT {
+fn history_limit(mode: SimulationMode) -> usize {
+    match mode {
+        SimulationMode::Mission => HISTORY_LIMIT,
+        SimulationMode::Exploration => usize::MAX,
+    }
+}
+
+fn push_attempt(history: &mut Vec<Attempt>, attempt: Attempt, limit: usize) {
+    if limit != usize::MAX && history.len() >= limit {
         history.remove(0);
     }
     history.push(attempt);
@@ -118,48 +126,66 @@ fn push_attempt(history: &mut Vec<Attempt>, attempt: Attempt) {
 fn archive_active_attempt(
     active_attempt: &mut Signal<Option<Attempt>>,
     history: &mut Signal<Vec<Attempt>>,
+    mode: SimulationMode,
 ) {
     if let Some(attempt) = active_attempt() {
         let mut previous = history();
-        push_attempt(&mut previous, attempt);
+        push_attempt(&mut previous, attempt, history_limit(mode));
         history.set(previous);
     }
     active_attempt.set(None);
 }
 
-fn result_message(result: &SimResult) -> (String, bool) {
-    match result.outcome {
-        Outcome::Reached => ("La sonde a atteint la balise.".to_string(), true),
-        Outcome::Collision { obstacle, .. } => (
-            format!(
-                "La sonde a percuté l'astéroïde {}. Le point rouge indique l'impact.",
-                obstacle + 1
+fn result_message(result: &SimResult, mode: SimulationMode) -> (String, bool) {
+    match mode {
+        SimulationMode::Exploration => match result.outcome {
+            Outcome::NumericalFailure => (
+                "Le courant n'a pas pu être calculé. Réinitialise la simulation.".to_string(),
+                false,
             ),
-            false,
-        ),
-        Outcome::LeftField { .. } => (
-            format!("La sonde a quitté la zone. {}", closest_message(result)),
-            false,
-        ),
-        Outcome::TimeLimit => (
-            format!(
-                "La sonde a circulé trop longtemps. {}",
-                closest_message(result)
+            _ => (
+                format!("Exploration: parcours terminé. {}", closest_message(result)),
+                false,
             ),
-            false,
-        ),
-        Outcome::NumericalFailure => (
-            "Le courant n'a pas pu être calculé. Réinitialise la simulation.".to_string(),
-            false,
-        ),
+        },
+        SimulationMode::Mission => match result.outcome {
+            Outcome::Reached => ("La sonde a atteint la balise.".to_string(), true),
+            Outcome::Collision { obstacle, .. } => (
+                format!(
+                    "La sonde a percuté l'astéroïde {}. Le point rouge indique l'impact.",
+                    obstacle + 1
+                ),
+                false,
+            ),
+            Outcome::LeftField { .. } => (
+                format!("La sonde a quitté la zone. {}", closest_message(result)),
+                false,
+            ),
+            Outcome::TimeLimit => (
+                format!(
+                    "La sonde a circulé trop longtemps. {}",
+                    closest_message(result)
+                ),
+                false,
+            ),
+            Outcome::NumericalFailure => (
+                "Le courant n'a pas pu être calculé. Réinitialise la simulation.".to_string(),
+                false,
+            ),
+        },
     }
 }
 
-fn attempt_status(won: bool) -> &'static str {
-    if won {
-        "succès"
-    } else {
-        "échec"
+fn attempt_status(mode: SimulationMode, won: bool) -> &'static str {
+    match mode {
+        SimulationMode::Exploration => "terminé",
+        SimulationMode::Mission => {
+            if won {
+                "succès"
+            } else {
+                "échec"
+            }
+        }
     }
 }
 
@@ -179,6 +205,7 @@ fn closest_message(result: &SimResult) -> String {
 fn App() -> Element {
     let all_levels = use_hook(levels);
     let mut level_idx = use_signal(|| 0usize);
+    let mut mode = use_signal(|| SimulationMode::Mission);
     let mut k = use_signal(|| all_levels[0].k_def);
     let mut step_idx = use_signal(|| step_index(all_levels[0].recommended_step));
     let mut history: Signal<Vec<Attempt>> = use_signal(Vec::new);
@@ -195,8 +222,14 @@ fn App() -> Element {
 
     let current = all_levels[level_idx()];
     let launch_level = current;
+    let current_mode = mode();
     let current_step = STEPS[step_idx()];
-    let preview = integrate(&current, k());
+    let preview = integrate_with_mode(&current, k(), current_mode);
+    let description = if current_mode == SimulationMode::Exploration {
+        format!("Exploration libre — {}", current.desc)
+    } else {
+        current.desc.to_string()
+    };
     let active_result = active_attempt().map(|attempt| attempt.result);
     let shown_points = active_result
         .as_ref()
@@ -225,8 +258,11 @@ fn App() -> Element {
         Some(Outcome::Collision { point, .. }) => Some(point),
         _ => None,
     };
-    let active_message = active_result.as_ref().map(result_message);
-    let active_won = active_result.as_ref().is_some_and(SimResult::reached);
+    let active_message = active_result
+        .as_ref()
+        .map(|result| result_message(result, current_mode));
+    let active_won = current_mode == SimulationMode::Mission
+        && active_result.as_ref().is_some_and(SimResult::reached);
     let path_class = if animation_visible() && active_result.is_some() {
         "path active-path"
     } else {
@@ -243,6 +279,21 @@ fn App() -> Element {
         "collision-point"
     };
     let has_next_level = level_idx() + 1 < all_levels.len();
+    let mode_value = if current_mode == SimulationMode::Exploration {
+        "exploration"
+    } else {
+        "mission"
+    };
+    let mode_hint = if current_mode == SimulationMode::Exploration {
+        "Sans objectif ni collision"
+    } else {
+        "Atteindre la balise"
+    };
+    let history_title = if current_mode == SimulationMode::Exploration {
+        "Historique d'exploration"
+    } else {
+        "Essais précédents"
+    };
 
     rsx! {
         style { {STYLE} }
@@ -270,7 +321,27 @@ fn App() -> Element {
                         }
                     }
                 }
-                div { class: "desc", "{current.title} — {current.desc}" }
+                div { class: "mode-row",
+                    label { "Mode" }
+                    select {
+                        class: "mode-select",
+                        value: mode_value,
+                        onchange: move |event| {
+                            let next_mode = match event.value().as_str() {
+                                "exploration" => SimulationMode::Exploration,
+                                _ => SimulationMode::Mission,
+                            };
+                            mode.set(next_mode);
+                            history.set(Vec::new());
+                            active_attempt.set(None);
+                            animation_visible.set(false);
+                        },
+                        option { value: "mission", "Mission" }
+                        option { value: "exploration", "Exploration libre" }
+                    }
+                    span { class: "mode-hint", "{mode_hint}" }
+                }
+                div { class: "desc", "{current.title} — {description}" }
 
                 svg { view_box: "0 0 {W} {H}", class: "field-svg",
                     defs {
@@ -298,12 +369,14 @@ fn App() -> Element {
                             }
                         }
                     }
-                    for (index, obstacle) in current.obstacles.iter().enumerate() {
-                        ellipse {
-                            key: "{index}",
-                            cx: "{map_x(obstacle.x):.2}", cy: "{map_y(obstacle.y):.2}",
-                            rx: "{(obstacle.r * X_SCALE):.2}", ry: "{(obstacle.r * Y_SCALE):.2}",
-                            class: "obstacle",
+                    if current_mode == SimulationMode::Mission {
+                        for (index, obstacle) in current.obstacles.iter().enumerate() {
+                            ellipse {
+                                key: "{index}",
+                                cx: "{map_x(obstacle.x):.2}", cy: "{map_y(obstacle.y):.2}",
+                                rx: "{(obstacle.r * X_SCALE):.2}", ry: "{(obstacle.r * Y_SCALE):.2}",
+                                class: "obstacle",
+                            }
                         }
                     }
                     circle {
@@ -312,7 +385,12 @@ fn App() -> Element {
                     }
                     ellipse {
                         cx: "{map_x(current.b.0):.2}", cy: "{map_y(current.b.1):.2}",
-                        rx: "{(WIN_R * X_SCALE):.2}", ry: "{(WIN_R * Y_SCALE):.2}", class: "point-b",
+                        rx: "{(WIN_R * X_SCALE):.2}", ry: "{(WIN_R * Y_SCALE):.2}",
+                        class: if current_mode == SimulationMode::Mission {
+                            "point-b"
+                        } else {
+                            "point-b reference-point"
+                        },
                     }
                     for (index, (history_path, _, _)) in history_paths.iter().enumerate() {
                         path {
@@ -355,7 +433,7 @@ fn App() -> Element {
                                     current_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut active_attempt, &mut history);
+                                    archive_active_attempt(&mut active_attempt, &mut history, current_mode);
                                 }
                                 k.set(next);
                             },
@@ -377,7 +455,7 @@ fn App() -> Element {
                                         current_step,
                                     );
                                     if (next - k()).abs() > f64::EPSILON {
-                                        archive_active_attempt(&mut active_attempt, &mut history);
+                                        archive_active_attempt(&mut active_attempt, &mut history, current_mode);
                                     }
                                     k.set(next);
                                 }
@@ -394,7 +472,7 @@ fn App() -> Element {
                                     current_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut active_attempt, &mut history);
+                                    archive_active_attempt(&mut active_attempt, &mut history, current_mode);
                                 }
                                 k.set(next);
                             },
@@ -424,7 +502,7 @@ fn App() -> Element {
                                     next_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut active_attempt, &mut history);
+                                    archive_active_attempt(&mut active_attempt, &mut history, current_mode);
                                 }
                                 k.set(next);
                                 step_idx.set(index);
@@ -453,7 +531,7 @@ fn App() -> Element {
                                     current_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut active_attempt, &mut history);
+                                    archive_active_attempt(&mut active_attempt, &mut history, current_mode);
                                 }
                                 k.set(next);
                             }
@@ -472,10 +550,10 @@ fn App() -> Element {
                                 current_step,
                             );
                             k.set(launch_k);
-                            let result = integrate(&launch_level, launch_k);
+                            let result = integrate_with_mode(&launch_level, launch_k, current_mode);
                             animation_visible.set(false);
                             animation_id.set(animation_id() + 1);
-                            archive_active_attempt(&mut active_attempt, &mut history);
+                            archive_active_attempt(&mut active_attempt, &mut history, current_mode);
                             active_attempt.set(Some(Attempt {
                                 k: launch_k,
                                 result,
@@ -508,17 +586,30 @@ fn App() -> Element {
                 }
 
                 if let Some((text, won)) = active_message {
-                    div { class: if won { "msg win" } else { "msg fail" }, "{text}" }
+                    div {
+                        class: if current_mode == SimulationMode::Exploration {
+                            "msg explore"
+                        } else if won {
+                            "msg win"
+                        } else {
+                            "msg fail"
+                        },
+                        "{text}"
+                    }
                 }
 
                 if !history_paths.is_empty() {
                     div { class: "history",
-                        span { class: "history-title", "Essais précédents" }
+                        span { class: "history-title", "{history_title}" }
                         for (index, (_, label, won)) in history_paths.iter().enumerate() {
                             span {
                                 key: "history-label-{index}",
-                                class: if *won { "history-entry success" } else { "history-entry" },
-                                "intensité {label} · {attempt_status(*won)}"
+                                class: if current_mode == SimulationMode::Mission && *won {
+                                    "history-entry success"
+                                } else {
+                                    "history-entry"
+                                },
+                                "intensité {label} · {attempt_status(current_mode, *won)}"
                             }
                         }
                     }
@@ -527,7 +618,11 @@ fn App() -> Element {
                 div { class: "legend",
                     span { span { class: "dot dot-a" } " Largage" }
                     span { span { class: "dot dot-b" } " Balise" }
-                    span { span { class: "dot dot-o" } " Astéroïde" }
+                    if current_mode == SimulationMode::Mission {
+                        span { span { class: "dot dot-o" } " Astéroïde" }
+                    } else {
+                        span { span { class: "dot dot-b" } " Référence" }
+                    }
                     if closest_marker.is_some() {
                         span { span { class: "dot dot-c" } " Passage le plus proche" }
                     }
@@ -551,6 +646,10 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .levels{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
 .levels button{background:transparent;border:1px solid var(--line);color:var(--sub);padding:6px 12px;border-radius:20px;font-size:.85rem;cursor:pointer}
 .levels button.active{background:var(--accent);color:#04231d;border-color:var(--accent);font-weight:600}
+.mode-row{display:flex;align-items:center;gap:9px;margin-bottom:10px;flex-wrap:wrap}
+.mode-row label{font-size:.85rem;color:var(--sub)}
+.mode-select{height:32px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);padding:0 8px}
+.mode-hint{font-size:.78rem;color:var(--sub)}
 .desc{font-size:.85rem;color:var(--sub);margin-bottom:10px;line-height:1.5}
 .field-svg{width:100%;height:auto;background:var(--bg);border:1px solid var(--line);border-radius:10px}
 .arrow{stroke:var(--field);stroke-width:1.2}
@@ -558,6 +657,7 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .obstacle{fill:var(--accent2);opacity:.35}
 .point-a{fill:#4ade80}
 .point-b{fill:var(--danger)}
+.reference-point{opacity:.35;stroke-dasharray:3 4}
 .closest-point{fill:var(--closest);stroke:var(--bg);stroke-width:2}
 .collision-point{fill:var(--danger);stroke:#fff;stroke-width:2}
 .path{fill:none;stroke:var(--accent);stroke-width:2.4}
@@ -581,6 +681,7 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .ghost{background:transparent;border:1px solid var(--line);color:var(--ink);padding:9px 16px;border-radius:9px;cursor:pointer}
 .msg{margin-top:10px;font-size:.9rem;font-weight:600;line-height:1.45}
 .msg.win{color:var(--accent)}
+.msg.explore{color:var(--accent2)}
 .msg.fail{color:var(--danger)}
 .history{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:.76rem;color:var(--sub)}
 .history-title{font-weight:600;color:var(--ink)}
@@ -624,10 +725,27 @@ mod tests {
     fn history_keeps_only_three_attempts() {
         let mut history = Vec::new();
         for k in 0..5 {
-            push_attempt(&mut history, attempt(k as f64));
+            push_attempt(
+                &mut history,
+                attempt(k as f64),
+                history_limit(SimulationMode::Mission),
+            );
         }
         assert_eq!(history.len(), HISTORY_LIMIT);
         assert_eq!(history[0].k, 2.0);
         assert_eq!(history[2].k, 4.0);
+    }
+
+    #[test]
+    fn exploration_history_has_no_limit() {
+        let mut history = Vec::new();
+        for k in 0..5 {
+            push_attempt(
+                &mut history,
+                attempt(k as f64),
+                history_limit(SimulationMode::Exploration),
+            );
+        }
+        assert_eq!(history.len(), 5);
     }
 }

@@ -10,6 +10,13 @@ const MAX_STEPS: usize = 3_000;
 const EPSILON: f64 = 1e-9;
 
 pub type Point = (f64, f64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimulationMode {
+    Mission,
+    Exploration,
+}
+
 pub type FieldFn = fn(f64, f64, f64) -> Vector2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -265,6 +272,10 @@ fn closer(current: ClosestApproach, candidate: ClosestApproach) -> ClosestApproa
 }
 
 pub fn integrate(level: &Level, k: f64) -> SimResult {
+    integrate_with_mode(level, k, SimulationMode::Mission)
+}
+
+pub fn integrate_with_mode(level: &Level, k: f64, mode: SimulationMode) -> SimResult {
     let mut point = level.a;
     let mut points = vec![point];
     let mut closest = closest_on_segment(point, point, level.b);
@@ -290,27 +301,29 @@ pub fn integrate(level: &Level, k: f64) -> SimResult {
             })
             .filter(|(t, _)| *t <= 1.0);
 
-        if let Some(t) = segment_circle_intersection(point, next, level.b, WIN_R) {
-            if event.as_ref().is_none_or(|(best, _)| t < *best) {
-                event = Some((t, Outcome::Reached));
-            }
-        }
-
-        for (index, obstacle) in level.obstacles.iter().enumerate() {
-            if let Some(t) = segment_circle_intersection(
-                point,
-                next,
-                (obstacle.x, obstacle.y),
-                obstacle.r + OBJ_R,
-            ) {
+        if mode == SimulationMode::Mission {
+            if let Some(t) = segment_circle_intersection(point, next, level.b, WIN_R) {
                 if event.as_ref().is_none_or(|(best, _)| t < *best) {
-                    event = Some((
-                        t,
-                        Outcome::Collision {
-                            obstacle: index,
-                            point: lerp_point(point, next, t),
-                        },
-                    ));
+                    event = Some((t, Outcome::Reached));
+                }
+            }
+
+            for (index, obstacle) in level.obstacles.iter().enumerate() {
+                if let Some(t) = segment_circle_intersection(
+                    point,
+                    next,
+                    (obstacle.x, obstacle.y),
+                    obstacle.r + OBJ_R,
+                ) {
+                    if event.as_ref().is_none_or(|(best, _)| t < *best) {
+                        event = Some((
+                            t,
+                            Outcome::Collision {
+                                obstacle: index,
+                                point: lerp_point(point, next, t),
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -399,6 +412,30 @@ mod tests {
             result.outcome,
             Outcome::Collision { obstacle: 0, .. }
         ));
+    }
+
+    #[test]
+    fn exploration_disables_goal_and_obstacles() {
+        let level = Level {
+            title: "Exploration",
+            desc: "",
+            field: field1,
+            k_min: -1.0,
+            k_max: 1.0,
+            k_def: 0.0,
+            recommended_step: 0.01,
+            a: (0.0, 0.0),
+            b: (5.0, 5.0),
+            obstacles: &[Obstacle {
+                x: 0.01,
+                y: 0.0,
+                r: 0.1,
+            }],
+        };
+        let result = integrate_with_mode(&level, 0.0, SimulationMode::Exploration);
+        assert!(matches!(result.outcome, Outcome::LeftField { .. }));
+        assert!(!result.reached());
+        assert!(!result.collided());
     }
 
     #[test]
