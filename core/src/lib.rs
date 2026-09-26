@@ -14,7 +14,9 @@ const EPSILON: f64 = 1e-9;
 const COARSE_STEP_MAX: f64 = 0.5;
 const WINDOW_PROBE_LIMIT: usize = 32;
 const SPREAD_PROBES: usize = 49;
+const SPREAD_QUICK_PROBES: usize = 13;
 const SPREAD_LIMIT: f64 = 0.18;
+const ZONE_SPREAD_LIMIT: f64 = 0.35;
 const REFINE_MULTIPLE: f64 = 2.0;
 
 pub type Point = (f64, f64);
@@ -25,37 +27,151 @@ pub enum SimulationMode {
     Exploration,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Mechanic {
-    Steady,
-    Vortex,
-    Zones,
-    Opposed,
-    Sensitive,
-    Beacons,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+    pub min: Point,
+    pub max: Point,
 }
 
-impl Mechanic {
-    pub fn all() -> [Mechanic; 6] {
+impl Rect {
+    pub const fn new(min: Point, max: Point) -> Self {
+        Self { min, max }
+    }
+
+    pub fn contains(&self, point: Point) -> bool {
+        point.0 >= self.min.0 - EPSILON
+            && point.0 <= self.max.0 + EPSILON
+            && point.1 >= self.min.1 - EPSILON
+            && point.1 <= self.max.1 + EPSILON
+    }
+
+    pub fn center(&self) -> Point {
+        (
+            (self.min.0 + self.max.0) / 2.0,
+            (self.min.1 + self.max.1) / 2.0,
+        )
+    }
+
+    pub fn clamp(&self, point: Point) -> Point {
+        (
+            point.0.clamp(self.min.0, self.max.0),
+            point.1.clamp(self.min.1, self.max.1),
+        )
+    }
+
+    pub fn inset(&self, margin: f64) -> Rect {
+        Rect::new(
+            (self.min.0 + margin, self.min.1 + margin),
+            (self.max.0 - margin, self.max.1 - margin),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseMode {
+    Fixed,
+    Zone,
+    PerProbe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Visibility {
+    Full,
+    BlindStart { fraction: f64 },
+}
+
+impl Visibility {
+    pub fn shown_points(self, total: usize) -> usize {
+        match self {
+            Visibility::Full => total,
+            Visibility::BlindStart { fraction } => {
+                let wanted = (total as f64 * fraction.clamp(0.0, 1.0)).round() as usize;
+                wanted.clamp(2, total.max(2))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceRule {
+    None,
+    KeepOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LevelRules {
+    pub release: ReleaseMode,
+    pub zone: Rect,
+    pub visibility: Visibility,
+    pub corridor: bool,
+    pub traces: TraceRule,
+    pub probes: usize,
+}
+
+impl Default for LevelRules {
+    fn default() -> Self {
+        Self {
+            release: ReleaseMode::Fixed,
+            zone: Rect::new((0.0, 0.0), (0.0, 0.0)),
+            visibility: Visibility::Full,
+            corridor: false,
+            traces: TraceRule::None,
+            probes: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Probe {
+    pub start: Point,
+    pub target: Point,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Chapter {
+    Discover,
+    Position,
+    Predict,
+    Coordinate,
+    Corridor,
+    Traces,
+    Master,
+}
+
+impl Chapter {
+    pub fn all() -> [Chapter; 7] {
         [
-            Mechanic::Steady,
-            Mechanic::Vortex,
-            Mechanic::Zones,
-            Mechanic::Opposed,
-            Mechanic::Sensitive,
-            Mechanic::Beacons,
+            Chapter::Discover,
+            Chapter::Position,
+            Chapter::Predict,
+            Chapter::Coordinate,
+            Chapter::Corridor,
+            Chapter::Traces,
+            Chapter::Master,
         ]
     }
 
     pub fn group_index(self) -> usize {
-        Mechanic::all()
+        Chapter::all()
             .iter()
-            .position(|mechanic| *mechanic == self)
+            .position(|chapter| *chapter == self)
             .unwrap_or(0)
     }
 
     pub fn title(self) -> &'static str {
-        MECHANICS[self.group_index()].title
+        CHAPTERS[self.group_index()].title
+    }
+
+    pub fn question(self) -> &'static str {
+        CHAPTERS[self.group_index()].question
+    }
+
+    pub fn size(self) -> usize {
+        self.group_index_chapter_size()
+    }
+
+    fn group_index_chapter_size(self) -> usize {
+        CHAPTERS[self.group_index()].plans.len()
     }
 }
 
@@ -203,7 +319,8 @@ pub struct Level {
     pub title: &'static str,
     pub desc: &'static str,
     pub focus: &'static str,
-    pub mechanic: Mechanic,
+    pub chapter: Chapter,
+    pub rules: LevelRules,
     pub step_index: usize,
     pub field: FlowField,
     pub k_min: f64,
@@ -213,6 +330,9 @@ pub struct Level {
     pub exploration_attempts: usize,
     pub k_window: f64,
     pub a: Point,
+    pub default_release: Point,
+    pub probes: Vec<Probe>,
+    pub ghosts: Vec<Vec<Point>>,
     pub beacons: Vec<Point>,
     pub obstacles: Vec<Obstacle>,
 }
@@ -223,11 +343,35 @@ impl Level {
     }
 
     pub fn group_index(&self) -> usize {
-        self.mechanic.group_index()
+        self.chapter.group_index()
     }
 
     pub fn global_index(&self) -> usize {
-        self.group_index() * LEVELS_PER_GROUP + self.step_index + 1
+        chapter_offset(self.group_index()) + self.step_index + 1
+    }
+
+    pub fn launch_points(&self) -> Vec<Point> {
+        if self.rules.probes > 1 {
+            self.probes.iter().map(|probe| probe.start).collect()
+        } else {
+            vec![self.a]
+        }
+    }
+
+    pub fn targets(&self) -> Vec<Point> {
+        if self.rules.probes > 1 {
+            self.probes.iter().map(|probe| probe.target).collect()
+        } else {
+            self.beacons.clone()
+        }
+    }
+
+    pub fn is_won(&self, result: &SimResult) -> bool {
+        if self.rules.probes > 1 {
+            result.visited == self.rules.probes
+        } else {
+            result.reached()
+        }
     }
 }
 
@@ -254,6 +398,12 @@ struct LevelPlan {
     gain: f64,
     k_window_steps: Option<f64>,
     exploration_attempts: usize,
+    release: ReleaseMode,
+    zone: Rect,
+    visibility: Visibility,
+    corridor: bool,
+    traces: TraceRule,
+    probes: usize,
     focus: &'static str,
 }
 
@@ -271,6 +421,12 @@ impl LevelPlan {
             gain: 1.0,
             k_window_steps: None,
             exploration_attempts: 3,
+            release: ReleaseMode::Fixed,
+            zone: Rect::new((0.0, 0.0), (0.0, 0.0)),
+            visibility: Visibility::Full,
+            corridor: false,
+            traces: TraceRule::None,
+            probes: 1,
             focus: "",
         }
     }
@@ -311,238 +467,336 @@ impl LevelPlan {
         self.focus = focus;
         self
     }
+
+    const fn release(mut self, mode: ReleaseMode) -> Self {
+        self.release = mode;
+        self
+    }
+
+    const fn zone(mut self, x_span: f64, y_span: f64) -> Self {
+        self.zone = Rect::new((-x_span, -y_span), (x_span, y_span));
+        self.release = ReleaseMode::Zone;
+        self
+    }
+
+    const fn blind(mut self, fraction: f64) -> Self {
+        self.visibility = Visibility::BlindStart { fraction };
+        self
+    }
+
+    const fn corridor(mut self) -> Self {
+        self.corridor = true;
+        self
+    }
+
+    const fn traces(mut self) -> Self {
+        self.traces = TraceRule::KeepOptions;
+        self
+    }
+
+    const fn probes(mut self, count: usize) -> Self {
+        self.probes = count;
+        self.beacons = count;
+        self
+    }
 }
 
-struct MechanicSpec {
-    mechanic: Mechanic,
+struct ChapterSpec {
+    chapter: Chapter,
     title: &'static str,
+    question: &'static str,
     desc: &'static str,
-    plans: [LevelPlan; LEVELS_PER_GROUP],
+    plans: &'static [LevelPlan],
 }
 
-const MECHANICS: [MechanicSpec; 6] = [
-    MechanicSpec {
-        mechanic: Mechanic::Steady,
-        title: "Courants constants",
-        desc: "Un courant régulier traverse la zone. Règle son intensité pour que la sonde dérive jusqu'à la balise.",
-        plans: [
-            LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
-                .attempts(3)
-                .window(2.0)
-                .focus("dérive pure"),
-            LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
-                .attempts(3)
-                .window(2.0)
-                .focus("dérive inclinée"),
-            LevelPlan::new(FieldKind::Retention, 1.0, 0.05)
-                .obstacles(1, 0.5, 0.7)
-                .attempts(4)
-                .gain(2.0)
-                .window(4.0)
-                .focus("hauteur d'équilibre"),
-            LevelPlan::new(FieldKind::Retention, 2.0, 0.02)
-                .obstacles(2, 0.5, 0.8)
-                .attempts(4)
-                .gain(3.0)
-                .window(6.0)
-                .focus("équilibre mobile"),
-            LevelPlan::new(FieldKind::Retention, 3.0, 0.02)
-                .obstacles(2, 0.45, 0.75)
-                .attempts(5)
-                .gain(3.0)
-                .window(6.0)
-                .focus("contre-courant"),
-        ],
+const DISCOVER_PLANS: [LevelPlan; 5] = [
+    LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
+        .attempts(3)
+        .window(2.0)
+        .focus("dérive pure"),
+    LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
+        .attempts(3)
+        .window(2.0)
+        .focus("dérive inclinée"),
+    LevelPlan::new(FieldKind::Retention, 1.0, 0.05)
+        .obstacles(1, 0.5, 0.7)
+        .attempts(4)
+        .gain(2.0)
+        .window(4.0)
+        .focus("hauteur d'équilibre"),
+    LevelPlan::new(FieldKind::Retention, 2.0, 0.02)
+        .obstacles(2, 0.5, 0.8)
+        .attempts(4)
+        .gain(3.0)
+        .window(6.0)
+        .focus("équilibre mobile"),
+    LevelPlan::new(FieldKind::Retention, 3.0, 0.02)
+        .obstacles(2, 0.45, 0.75)
+        .attempts(5)
+        .gain(3.0)
+        .window(6.0)
+        .focus("contre-courant"),
+];
+
+const POSITION_PLANS: [LevelPlan; 5] = [
+    LevelPlan::new(FieldKind::Vortex, 1.5, 0.02)
+        .obstacles(1, 0.5, 0.8)
+        .attempts(3)
+        .gain(5.0)
+        .window(8.0)
+        .zone(1.2, 2.0)
+        .focus("rotation simple"),
+    LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
+        .obstacles(1, 0.45, 0.75)
+        .attempts(3)
+        .gain(5.0)
+        .window(8.0)
+        .zone(1.2, 2.0)
+        .focus("arc décalé"),
+    LevelPlan::new(FieldKind::Opposed, 1.5, 0.05)
+        .obstacles(1, 0.45, 0.7)
+        .attempts(3)
+        .window(3.0)
+        .zone(1.2, 2.0)
+        .focus("deux moitiés"),
+    LevelPlan::new(FieldKind::Opposed, 2.0, 0.05)
+        .obstacles(2, 0.4, 0.65)
+        .attempts(3)
+        .window(3.0)
+        .zone(1.2, 2.0)
+        .focus("séparation haute"),
+    LevelPlan::new(FieldKind::Opposed, 2.5, 0.02)
+        .obstacles(2, 0.4, 0.7)
+        .attempts(4)
+        .window(3.0)
+        .zone(1.2, 2.0)
+        .focus("séparation basse"),
+];
+
+const PREDICT_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Calm, 1.0, 0.01)
+        .obstacles(1, 0.4, 0.6)
+        .attempts(3)
+        .gain(1.5)
+        .window(3.0)
+        .focus("marge large"),
+    LevelPlan::new(FieldKind::Waves, 0.8, 0.01)
+        .obstacles(1, 0.4, 0.6)
+        .attempts(3)
+        .gain(2.0)
+        .window(4.0)
+        .focus("marge moyenne"),
+    LevelPlan::new(FieldKind::Bands, 0.6, 0.01)
+        .bands(2)
+        .obstacles(1, 0.35, 0.55)
+        .attempts(4)
+        .gain(2.5)
+        .window(3.0)
+        .focus("bandes serrées"),
+    LevelPlan::new(FieldKind::Bands, 0.5, 0.01)
+        .bands(3)
+        .obstacles(2, 0.35, 0.55)
+        .attempts(4)
+        .gain(3.0)
+        .window(2.0)
+        .focus("bandes étroites"),
+];
+
+const COORDINATE_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
+        .obstacles(1, 0.45, 0.7)
+        .probes(2)
+        .attempts(4)
+        .window(2.0)
+        .zone(1.0, 1.6)
+        .focus("deux balises"),
+    LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
+        .obstacles(1, 0.45, 0.7)
+        .probes(2)
+        .attempts(4)
+        .window(2.0)
+        .zone(1.0, 1.6)
+        .focus("deux balises en houle"),
+    LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
+        .obstacles(1, 0.4, 0.65)
+        .probes(3)
+        .attempts(5)
+        .gain(5.0)
+        .window(10.0)
+        .zone(1.0, 1.6)
+        .focus("trois balises"),
+    LevelPlan::new(FieldKind::Opposed, 3.0, 0.02)
+        .obstacles(2, 0.4, 0.65)
+        .probes(4)
+        .attempts(6)
+        .gain(3.0)
+        .window(3.0)
+        .zone(1.0, 1.6)
+        .focus("quatre balises"),
+];
+
+const CORRIDOR_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
+        .obstacles(1, 0.45, 0.7)
+        .attempts(3)
+        .window(2.0)
+        .zone(0.8, 2.0)
+        .focus("houle douce"),
+    LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
+        .obstacles(1, 0.45, 0.75)
+        .attempts(3)
+        .window(2.0)
+        .zone(0.8, 2.0)
+        .focus("période courte"),
+    LevelPlan::new(FieldKind::Bands, 1.5, 0.05)
+        .bands(2)
+        .obstacles(1, 0.45, 0.7)
+        .attempts(4)
+        .window(2.0)
+        .zone(0.8, 2.0)
+        .focus("deux bandes"),
+    LevelPlan::new(FieldKind::Bands, 2.0, 0.02)
+        .bands(2)
+        .obstacles(2, 0.4, 0.7)
+        .attempts(4)
+        .window(4.0)
+        .zone(0.8, 2.0)
+        .focus("bandes décalées"),
+];
+
+const TRACES_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Vortex, 2.5, 0.02)
+        .obstacles(2, 0.45, 0.8)
+        .attempts(4)
+        .gain(5.0)
+        .window(5.0)
+        .zone(1.4, 2.2)
+        .focus("deux obstacles"),
+    LevelPlan::new(FieldKind::Vortex, 3.0, 0.01)
+        .obstacles(2, 0.4, 0.7)
+        .attempts(4)
+        .gain(8.0)
+        .window(6.0)
+        .zone(1.4, 2.2)
+        .focus("pas fin"),
+    LevelPlan::new(FieldKind::Opposed, 3.0, 0.02)
+        .obstacles(2, 0.4, 0.65)
+        .attempts(4)
+        .gain(3.0)
+        .window(5.0)
+        .zone(1.4, 2.2)
+        .focus("fort rappel"),
+    LevelPlan::new(FieldKind::Bands, 3.0, 0.02)
+        .bands(3)
+        .obstacles(2, 0.4, 0.7)
+        .attempts(5)
+        .window(6.0)
+        .zone(1.4, 2.2)
+        .focus("trois bandes"),
+];
+
+const MASTER_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Vortex, 3.0, 0.01)
+        .obstacles(3, 0.35, 0.6)
+        .attempts(5)
+        .gain(8.0)
+        .window(6.0)
+        .zone(1.0, 1.8)
+        .focus("tourbillon serré"),
+    LevelPlan::new(FieldKind::Opposed, 3.0, 0.01)
+        .obstacles(3, 0.35, 0.6)
+        .attempts(5)
+        .gain(2.0)
+        .window(3.0)
+        .zone(1.0, 1.8)
+        .focus("équilibre instable"),
+    LevelPlan::new(FieldKind::Bands, 2.5, 0.02)
+        .bands(2)
+        .obstacles(2, 0.4, 0.65)
+        .probes(3)
+        .attempts(5)
+        .window(3.0)
+        .zone(1.0, 1.8)
+        .focus("trois balises étroites"),
+    LevelPlan::new(FieldKind::Opposed, 0.4, 0.01)
+        .obstacles(2, 0.35, 0.55)
+        .attempts(5)
+        .gain(3.0)
+        .window(2.0)
+        .zone(1.0, 1.8)
+        .focus("marge extrême"),
+];
+
+const CHAPTERS: [ChapterSpec; 7] = [
+    ChapterSpec {
+        chapter: Chapter::Discover,
+        title: "Découverte",
+        question: "Que fait le courant ?",
+        desc: "Le point de largage est fixé : règle l'intensité et regarde comment la sonde dérive.",
+        plans: &DISCOVER_PLANS,
     },
-    MechanicSpec {
-        mechanic: Mechanic::Vortex,
-        title: "Courants tourbillonnants",
-        desc: "Le courant tourbillonne autour de son axe. Vise juste, car de petites réglages changent beaucoup la trajectoire.",
-        plans: [
-            LevelPlan::new(FieldKind::Vortex, 1.5, 0.02)
-                .obstacles(1, 0.5, 0.8)
-                .attempts(3)
-                .gain(5.0)
-                .window(8.0)
-                .focus("rotation simple"),
-            LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
-                .obstacles(1, 0.45, 0.75)
-                .attempts(3)
-                .gain(5.0)
-                .window(8.0)
-                .focus("arc décalé"),
-            LevelPlan::new(FieldKind::Vortex, 2.5, 0.02)
-                .obstacles(2, 0.45, 0.8)
-                .attempts(4)
-                .gain(5.0)
-                .window(5.0)
-                .focus("deux obstacles"),
-            LevelPlan::new(FieldKind::Vortex, 3.0, 0.01)
-                .obstacles(2, 0.4, 0.7)
-                .attempts(4)
-                .gain(8.0)
-                .window(6.0)
-                .focus("pas fin"),
-            LevelPlan::new(FieldKind::Vortex, 3.0, 0.01)
-                .obstacles(3, 0.35, 0.6)
-                .attempts(5)
-                .gain(8.0)
-                .window(6.0)
-                .focus("tourbillon serré"),
-        ],
+    ChapterSpec {
+        chapter: Chapter::Position,
+        title: "Position",
+        question: "Où larguer ?",
+        desc: "Le largage devient libre dans la zone marquée : chaque départ ouvre une autre trajectoire.",
+        plans: &POSITION_PLANS,
     },
-    MechanicSpec {
-        mechanic: Mechanic::Zones,
-        title: "Plusieurs zones de courants",
-        desc: "Le courant change de caractère selon la zone traversée. Anticipe le virage avant la séparation.",
-        plans: [
-            LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
-                .obstacles(1, 0.45, 0.7)
-                .attempts(3)
-                .window(2.0)
-                .focus("houle douce"),
-            LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
-                .obstacles(1, 0.45, 0.75)
-                .attempts(3)
-                .window(2.0)
-                .focus("période courte"),
-            LevelPlan::new(FieldKind::Bands, 1.5, 0.05)
-                .bands(2)
-                .obstacles(1, 0.45, 0.7)
-                .attempts(4)
-                .window(2.0)
-                .focus("deux bandes"),
-            LevelPlan::new(FieldKind::Bands, 2.0, 0.02)
-                .bands(2)
-                .obstacles(2, 0.4, 0.7)
-                .attempts(4)
-                .window(4.0)
-                .focus("bandes décalées"),
-            LevelPlan::new(FieldKind::Bands, 3.0, 0.02)
-                .bands(3)
-                .obstacles(2, 0.4, 0.7)
-                .attempts(5)
-                .window(6.0)
-                .focus("trois bandes"),
-        ],
+    ChapterSpec {
+        chapter: Chapter::Predict,
+        title: "Prédiction",
+        question: "Où larguer pour deviner le chemin masqué ?",
+        desc: "La sonde n'est annoncée que sur son premier tronçon : le reste du trajet se prévoit.",
+        plans: &PREDICT_PLANS,
     },
-    MechanicSpec {
-        mechanic: Mechanic::Opposed,
-        title: "Courants opposés",
-        desc: "Deux zones de courant tirent vers des directions opposées. Explore la hauteur d'équilibre qui fait franchir la séparation.",
-        plans: [
-            LevelPlan::new(FieldKind::Opposed, 1.5, 0.05)
-                .obstacles(1, 0.45, 0.7)
-                .attempts(3)
-                .window(3.0)
-                .focus("deux moitiés"),
-            LevelPlan::new(FieldKind::Opposed, 2.0, 0.05)
-                .obstacles(2, 0.4, 0.65)
-                .attempts(3)
-                .window(3.0)
-                .focus("séparation haute"),
-            LevelPlan::new(FieldKind::Opposed, 2.5, 0.02)
-                .obstacles(2, 0.4, 0.7)
-                .attempts(4)
-                .window(3.0)
-                .focus("séparation basse"),
-            LevelPlan::new(FieldKind::Opposed, 3.0, 0.02)
-                .obstacles(2, 0.4, 0.65)
-                .attempts(4)
-                .gain(3.0)
-                .window(5.0)
-                .focus("fort rappel"),
-            LevelPlan::new(FieldKind::Opposed, 3.0, 0.01)
-                .obstacles(3, 0.35, 0.6)
-                .attempts(5)
-                .gain(2.0)
-                .window(3.0)
-                .focus("équilibre instable"),
-        ],
+    ChapterSpec {
+        chapter: Chapter::Coordinate,
+        title: "Coordination",
+        question: "Où lancer chaque sonde ?",
+        desc: "Toutes les sondes partagent le même courant et la même intensité, chacune vise sa balise.",
+        plans: &COORDINATE_PLANS,
     },
-    MechanicSpec {
-        mechanic: Mechanic::Sensitive,
-        title: "Zones très sensibles",
-        desc: "Une seule poignée de réglages atteint la balise. Affine pas à pas et surveille la marge.",
-        plans: [
-            LevelPlan::new(FieldKind::Calm, 1.0, 0.01)
-                .obstacles(1, 0.4, 0.6)
-                .attempts(3)
-                .gain(1.5)
-                .window(3.0)
-                .focus("marge large"),
-            LevelPlan::new(FieldKind::Waves, 0.8, 0.01)
-                .obstacles(1, 0.4, 0.6)
-                .attempts(3)
-                .gain(2.0)
-                .window(4.0)
-                .focus("marge moyenne"),
-            LevelPlan::new(FieldKind::Bands, 0.6, 0.01)
-                .bands(2)
-                .obstacles(1, 0.35, 0.55)
-                .attempts(4)
-                .gain(2.5)
-                .window(3.0)
-                .focus("bandes serrées"),
-            LevelPlan::new(FieldKind::Bands, 0.5, 0.01)
-                .bands(3)
-                .obstacles(2, 0.35, 0.55)
-                .attempts(4)
-                .gain(3.0)
-                .window(2.0)
-                .focus("bandes étroites"),
-            LevelPlan::new(FieldKind::Opposed, 0.4, 0.01)
-                .obstacles(2, 0.35, 0.55)
-                .attempts(5)
-                .gain(3.0)
-                .window(2.0)
-                .focus("marge extrême"),
-        ],
+    ChapterSpec {
+        chapter: Chapter::Corridor,
+        title: "Couloir",
+        question: "Où entrer dans le couloir ?",
+        desc: "Deux trajectoires fantômes délimitent un couloir : la sonde doit rester entre elles.",
+        plans: &CORRIDOR_PLANS,
     },
-    MechanicSpec {
-        mechanic: Mechanic::Beacons,
-        title: "Plusieurs balises",
-        desc: "La sonde doit toucher toutes les balises pendant un seul largage. Chaque réglage arbitre entre elles.",
-        plans: [
-            LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
-                .obstacles(1, 0.45, 0.7)
-                .beacons(2)
-                .attempts(4)
-                .window(2.0)
-                .focus("deux balises"),
-            LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
-                .obstacles(1, 0.45, 0.7)
-                .beacons(2)
-                .attempts(4)
-                .window(2.0)
-                .focus("deux balises en houle"),
-            LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
-                .obstacles(1, 0.4, 0.65)
-                .beacons(3)
-                .attempts(5)
-                .gain(5.0)
-                .window(10.0)
-                .focus("trois balises"),
-            LevelPlan::new(FieldKind::Bands, 2.5, 0.02)
-                .bands(2)
-                .obstacles(2, 0.4, 0.65)
-                .beacons(3)
-                .attempts(5)
-                .window(3.0)
-                .focus("trois balises étroites"),
-            LevelPlan::new(FieldKind::Opposed, 3.0, 0.02)
-                .obstacles(2, 0.4, 0.65)
-                .beacons(4)
-                .attempts(6)
-                .gain(3.0)
-                .window(3.0)
-                .focus("quatre balises"),
-        ],
+    ChapterSpec {
+        chapter: Chapter::Traces,
+        title: "Traces",
+        question: "Quel départ préserve mes options ?",
+        desc: "Chaque lancer consomme la zone de largage et sa trace devient une limite pour les suivants.",
+        plans: &TRACES_PLANS,
+    },
+    ChapterSpec {
+        chapter: Chapter::Master,
+        title: "Maîtrise",
+        question: "Tout à la fois",
+        desc: "Largage libre, plusieurs sondes, couloir et traces : chaque zone combine tout.",
+        plans: &MASTER_PLANS,
     },
 ];
 
-pub fn mechanic_count() -> usize {
-    MECHANICS.len()
+pub fn chapter_count() -> usize {
+    CHAPTERS.len()
+}
+
+pub fn chapter_size(index: usize) -> usize {
+    CHAPTERS[index.min(CHAPTERS.len() - 1)].plans.len()
+}
+
+pub fn chapter_offset(index: usize) -> usize {
+    CHAPTERS
+        .iter()
+        .take(index)
+        .map(|spec| spec.plans.len())
+        .sum()
+}
+
+pub fn total_level_count() -> usize {
+    CHAPTERS.iter().map(|spec| spec.plans.len()).sum()
 }
 
 pub const DEFAULT_SEED: u64 = 0xD1F7_1A2B_3C4D_5E6F;
@@ -556,7 +810,7 @@ const OBSTACLE_MARGIN: f64 = 0.12;
 const MIN_BEACON_DISTANCE: f64 = 3.0;
 const BEACON_SPACING: f64 = WIN_R * 2.2;
 const BEACON_CANDIDATES: usize = 2;
-const K_PROBES: usize = 8;
+const K_PROBES: usize = 4;
 const PLACEMENT_ATTEMPTS: usize = 96;
 
 struct SeededRng {
@@ -644,12 +898,21 @@ fn canonical_bands(count: usize, gain: f64) -> Vec<Band> {
         .collect()
 }
 
-fn shell_level(spec: &MechanicSpec, plan: &LevelPlan, field: FlowField) -> Level {
+fn shell_level(spec: &ChapterSpec, plan: &LevelPlan, field: FlowField) -> Level {
+    let anchor = (-5.0, 0.0);
     Level {
         title: spec.title,
         desc: spec.desc,
         focus: plan.focus,
-        mechanic: spec.mechanic,
+        chapter: spec.chapter,
+        rules: LevelRules {
+            release: plan.release,
+            zone: plan.zone,
+            visibility: plan.visibility,
+            corridor: plan.corridor,
+            traces: plan.traces,
+            probes: plan.probes,
+        },
         step_index: 0,
         field,
         k_min: -plan.k_span,
@@ -658,7 +921,13 @@ fn shell_level(spec: &MechanicSpec, plan: &LevelPlan, field: FlowField) -> Level
         recommended_step: plan.step,
         exploration_attempts: plan.exploration_attempts,
         k_window: 0.0,
-        a: (-5.0, 0.0),
+        a: anchor,
+        default_release: anchor,
+        probes: vec![Probe {
+            start: anchor,
+            target: anchor,
+        }],
+        ghosts: Vec::new(),
         beacons: Vec::new(),
         obstacles: Vec::new(),
     }
@@ -870,10 +1139,10 @@ fn grid_candidates(level: &Level, coarse: f64) -> Vec<f64> {
         .collect()
 }
 
-fn coarse_ranked(level: &Level, coarse: f64) -> Vec<f64> {
+fn coarse_ranked(level: &Level, start: Point, targets: &[Point], coarse: f64) -> Vec<f64> {
     let mut ranked: Vec<(f64, f64)> = grid_candidates(level, coarse)
         .into_iter()
-        .map(|k| (coarse_distance(level, k), k))
+        .map(|k| (coarse_distance(level, start, targets, k), k))
         .collect();
     ranked.sort_by(|first, second| {
         first
@@ -884,7 +1153,13 @@ fn coarse_ranked(level: &Level, coarse: f64) -> Vec<f64> {
     ranked.into_iter().map(|(_, k)| k).collect()
 }
 
-fn refine_candidate(level: &Level, seed: f64, coarse: f64) -> Option<f64> {
+fn refine_candidate(
+    level: &Level,
+    start: Point,
+    targets: &[Point],
+    seed: f64,
+    coarse: f64,
+) -> Option<f64> {
     let step = level.recommended_step;
     let count = (2.0 * coarse / step).ceil().max(1.0) as usize;
     let lowest = (level.k_min / step).ceil() * step;
@@ -892,14 +1167,18 @@ fn refine_candidate(level: &Level, seed: f64, coarse: f64) -> Option<f64> {
     (0..=count)
         .map(|index| snap_to_grid(level, seed - coarse + index as f64 * step))
         .filter(|k| *k >= lowest - EPSILON && *k <= highest + EPSILON)
-        .find(|k| integrate(level, *k).reached())
+        .find(|k| integrate_advanced(level, start, targets, *k, false).reached())
 }
 
 pub fn solve(level: &Level) -> Option<f64> {
+    solve_from(level, level.a, &level.beacons)
+}
+
+pub fn solve_from(level: &Level, start: Point, targets: &[Point]) -> Option<f64> {
     let coarse = coarse_step(level);
-    coarse_ranked(level, coarse)
+    coarse_ranked(level, start, targets, coarse)
         .into_iter()
-        .find_map(|k| refine_candidate(level, k, coarse))
+        .find_map(|k| refine_candidate(level, start, targets, k, coarse))
 }
 
 fn snap_to_grid(level: &Level, k: f64) -> f64 {
@@ -908,7 +1187,7 @@ fn snap_to_grid(level: &Level, k: f64) -> f64 {
     (level.k_min + steps * step).clamp(level.k_min, level.k_max)
 }
 
-fn k_window(level: &Level, winning_k: f64) -> f64 {
+fn k_window(level: &Level, start: Point, targets: &[Point], winning_k: f64) -> f64 {
     let step = level.recommended_step;
     let mut total = 0.0;
     for direction in [1.0, -1.0] {
@@ -917,7 +1196,7 @@ fn k_window(level: &Level, winning_k: f64) -> f64 {
             if candidate < level.k_min || candidate > level.k_max {
                 break;
             }
-            if !integrate(level, candidate).reached() {
+            if !integrate_advanced(level, start, targets, candidate, false).reached() {
                 break;
             }
             total += step;
@@ -926,14 +1205,21 @@ fn k_window(level: &Level, winning_k: f64) -> f64 {
     total / 2.0
 }
 
-fn k_spread(level: &Level) -> f64 {
+fn k_spread(level: &Level, start: Point, targets: &[Point]) -> f64 {
+    if sampled_spread(level, start, targets, SPREAD_QUICK_PROBES) == 0.0 {
+        return 0.0;
+    }
+    sampled_spread(level, start, targets, SPREAD_PROBES)
+}
+
+fn sampled_spread(level: &Level, start: Point, targets: &[Point], wanted: usize) -> f64 {
     let step = level.recommended_step;
     let count = ((level.k_max - level.k_min) / step).ceil().max(1.0) as usize;
-    let probes = count.min(SPREAD_PROBES);
+    let probes = count.min(wanted).max(1);
     let mut hits = 0;
     for probe in 0..probes {
         let k = snap_to_grid(level, level.k_min + (probe * count / probes) as f64 * step);
-        if integrate(level, k).reached() {
+        if integrate_advanced(level, start, targets, k, false).reached() {
             hits += 1;
         }
     }
@@ -1038,7 +1324,7 @@ const CANONICAL_OBSTACLES: [(f64, f64, f64); 3] =
     [(0.0, 2.2, 0.7), (2.2, -2.0, 0.65), (3.6, 1.6, 0.5)];
 
 fn plan_obstacle_count(level: &Level) -> usize {
-    MECHANICS[level.group_index()].plans[level.step_index].obstacles
+    CHAPTERS[level.group_index()].plans[level.step_index].obstacles
 }
 
 fn augment_obstacles(mut level: Level, winning_k: f64) -> Level {
@@ -1073,11 +1359,14 @@ fn augment_obstacles(mut level: Level, winning_k: f64) -> Level {
 fn finish_level(
     mut level: Level,
     plan: &LevelPlan,
+    start: Point,
     winning_k: f64,
     window_scale: f64,
     rng: &mut SeededRng,
 ) -> Option<Level> {
-    if !integrate(&level, winning_k).reached() {
+    level.a = start;
+    place_release_zone(&mut level, plan);
+    if !integrate_from(&level, start, winning_k).reached() {
         return None;
     }
     if plan.beacons > 1 {
@@ -1086,31 +1375,188 @@ fn finish_level(
             .extend(sample_beacons(&level, winning_k, plan.beacons - 1)?);
     }
     level.obstacles = random_obstacles(plan, level.a, &level.beacons, rng);
-    if !valid_geometry(&level) || !integrate(&level, winning_k).reached() {
+    if !valid_geometry(&level) || !integrate_from(&level, start, winning_k).reached() {
         return None;
     }
     level = augment_obstacles(level, winning_k);
-    if !integrate(&level, winning_k).reached() {
+    if !integrate_from(&level, start, winning_k).reached() {
         return None;
     }
-    level.k_window = k_window(&level, winning_k);
+    level.k_window = k_window(&level, start, &level.beacons, winning_k);
     if plan
         .k_window_steps
         .is_some_and(|steps| level.k_window > window_scale * steps * level.recommended_step)
     {
         return None;
     }
-    if integrate(&level, 0.0).reached() || k_spread(&level) > SPREAD_LIMIT {
+    if integrate_from(&level, start, 0.0).reached()
+        || k_spread(&level, start, &level.beacons) > SPREAD_LIMIT
+    {
         return None;
     }
     Some(level)
 }
 
+fn place_release_zone(level: &mut Level, plan: &LevelPlan) {
+    let (x_span, y_span) = match plan.release {
+        ReleaseMode::Fixed => (0.0, 0.0),
+        _ => (plan.zone.max.0, plan.zone.max.1),
+    };
+    let low_x = XMIN + ANCHOR_MARGIN;
+    let high_x = XMAX - ANCHOR_MARGIN;
+    let low_y = YMIN + ANCHOR_MARGIN;
+    let high_y = YMAX - ANCHOR_MARGIN;
+    level.rules.zone = Rect::new(
+        (
+            (level.a.0 - x_span).max(low_x),
+            (level.a.1 - y_span).max(low_y),
+        ),
+        (
+            (level.a.0 + x_span).min(high_x),
+            (level.a.1 + y_span).min(high_y),
+        ),
+    );
+}
+
+fn release_anchors(level: &Level) -> Vec<Point> {
+    match level.rules.release {
+        ReleaseMode::Fixed => vec![level.a],
+        _ => {
+            let zone = level.rules.zone;
+            let x_count = if zone.max.0 - zone.min.0 < 0.2 { 1 } else { 2 };
+            let y_count = if zone.max.1 - zone.min.1 < 0.2 { 1 } else { 3 };
+            let mut anchors = Vec::new();
+            for iy in 0..y_count {
+                for ix in 0..x_count {
+                    let fx = if x_count == 1 { 0.5 } else { ix as f64 / 2.0 };
+                    let fy = if y_count == 1 { 0.5 } else { iy as f64 / 2.0 };
+                    let anchor = (
+                        zone.min.0 + (zone.max.0 - zone.min.0) * fx,
+                        zone.min.1 + (zone.max.1 - zone.min.1) * fy,
+                    );
+                    if point_in_field(anchor, ANCHOR_MARGIN) {
+                        anchors.push(anchor);
+                    }
+                }
+            }
+            if anchors.is_empty() {
+                vec![level.a]
+            } else {
+                anchors
+            }
+        }
+    }
+}
+
+fn fair_anchors(level: &Level) -> Vec<Point> {
+    if level.rules.release == ReleaseMode::Fixed {
+        return vec![level.a];
+    }
+    let zone = level.rules.zone;
+    let count = 4;
+    let mut anchors = Vec::new();
+    for iy in 0..=count {
+        for ix in 0..=count {
+            let anchor = (
+                zone.min.0 + (zone.max.0 - zone.min.0) * ix as f64 / count as f64,
+                zone.min.1 + (zone.max.1 - zone.min.1) * iy as f64 / count as f64,
+            );
+            if point_in_field(anchor, ANCHOR_MARGIN) {
+                anchors.push(anchor);
+            }
+        }
+    }
+    if anchors.is_empty() {
+        vec![level.a]
+    } else {
+        anchors
+    }
+}
+
+pub fn zone_offers_no_free_win(level: &Level) -> bool {
+    !fair_anchors(level)
+        .iter()
+        .any(|anchor| integrate_from(level, *anchor, 0.0).reached())
+}
+
+pub fn zone_is_fair(level: &Level) -> bool {
+    for anchor in fair_anchors(level) {
+        if integrate_from(level, anchor, 0.0).reached() {
+            return false;
+        }
+        if anchor == level.a {
+            continue;
+        }
+        if coarse_spread(level, anchor) > ZONE_SPREAD_LIMIT {
+            return false;
+        }
+    }
+    true
+}
+
+const ANCHOR_TARGET: Point = (4.0, 0.0);
+const ANCHOR_REACH: f64 = 3.5;
+
+const ANCHOR_KEEP: usize = 3;
+
+fn viable_anchors(level: &Level, k_probes: usize) -> Vec<Point> {
+    let anchors = release_anchors(level);
+    if level.rules.release == ReleaseMode::Fixed {
+        return anchors;
+    }
+    let probes = k_probes.min(5);
+    let mut ranked: Vec<(f64, Point)> = anchors
+        .into_iter()
+        .map(|anchor| {
+            let best = (0..probes)
+                .map(|probe| {
+                    let k = level.k_min
+                        + (level.k_max - level.k_min) * (probe + 1) as f64 / (probes + 1) as f64;
+                    coarse_distance(level, anchor, &[ANCHOR_TARGET], k)
+                })
+                .fold(f64::INFINITY, f64::min);
+            (best, anchor)
+        })
+        .filter(|(best, _)| *best < ANCHOR_REACH)
+        .collect();
+    ranked.sort_by(|first, second| {
+        first
+            .0
+            .partial_cmp(&second.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let viable: Vec<Point> = ranked
+        .into_iter()
+        .take(ANCHOR_KEEP)
+        .map(|(_, anchor)| anchor)
+        .collect();
+    if viable.is_empty() {
+        release_anchors(level)
+    } else {
+        viable
+    }
+}
+
+fn coarse_spread(level: &Level, anchor: Point) -> f64 {
+    let step = level.recommended_step;
+    let count = ((level.k_max - level.k_min) / step).ceil().max(1.0) as usize;
+    let probes = count.clamp(3, SPREAD_PROBES / 7);
+    let mut hits = 0;
+    for probe in 0..probes {
+        let k = snap_to_grid(level, level.k_min + (probe * count / probes) as f64 * step);
+        if integrate_from(level, anchor, k).reached() {
+            hits += 1;
+        }
+    }
+    hits as f64 / probes as f64
+}
+
 fn random_level(
-    spec: &MechanicSpec,
+    spec: &ChapterSpec,
     plan: &LevelPlan,
     window_scale: f64,
     k_probes: usize,
+    strict_fairness: bool,
     rng: &mut SeededRng,
 ) -> Option<Level> {
     let field = random_field(plan, rng);
@@ -1118,61 +1564,235 @@ fn random_level(
     let mut base = shell_level(spec, plan, field);
     base.a = a;
 
-    for (k, beacon) in sharpened_candidates(&base, k_probes) {
+    for (k, anchor, beacon) in sharpened_candidates(&base, k_probes) {
         let mut level = base.clone();
         level.beacons = vec![beacon];
-        if let Some(next) = finish_level(level, plan, k, window_scale, rng) {
-            return Some(next);
+        if let Some(next) = finish_level(level, plan, anchor, k, window_scale, rng) {
+            if zone_acceptable(&next, strict_fairness) {
+                return Some(next);
+            }
         }
     }
     None
 }
 
-fn sharpened_candidates(level: &Level, k_probes: usize) -> Vec<(f64, Point)> {
+fn zone_acceptable(level: &Level, strict_fairness: bool) -> bool {
+    if strict_fairness {
+        zone_is_fair(level)
+    } else {
+        zone_offers_no_free_win(level)
+    }
+}
+
+fn sharpened_candidates(level: &Level, k_probes: usize) -> Vec<(f64, Point, Point)> {
     let mut candidates = Vec::new();
-    for probe in 0..k_probes {
-        let k = snap_to_grid(
-            level,
-            level.k_min + (level.k_max - level.k_min) * (probe + 1) as f64 / (k_probes + 1) as f64,
-        );
-        if k.abs() < EPSILON {
-            continue;
-        }
-        for beacon in sharpened_beacons(level, k, BEACON_CANDIDATES) {
-            candidates.push((k, beacon));
+    let anchors = viable_anchors(level, k_probes);
+    for anchor in anchors {
+        let mut route = level.clone();
+        route.a = anchor;
+        for probe in 0..k_probes {
+            let k = snap_to_grid(
+                level,
+                level.k_min
+                    + (level.k_max - level.k_min) * (probe + 1) as f64 / (k_probes + 1) as f64,
+            );
+            if k.abs() < EPSILON {
+                continue;
+            }
+            for beacon in sharpened_beacons(&route, k, BEACON_CANDIDATES) {
+                candidates.push((k, anchor, beacon));
+            }
         }
     }
     candidates
 }
 
-fn canonical_shell(spec: &MechanicSpec, plan: &LevelPlan, step_index: usize) -> Level {
-    with_plan_index(shell_level(spec, plan, canonical_field(plan)), step_index)
+fn canonical_shell(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> Level {
+    let mut shell = with_plan_index(shell_level(spec, plan, canonical_field(plan)), step_index);
+    place_release_zone(&mut shell, plan);
+    shell
 }
 
-fn canonical_level(spec: &MechanicSpec, plan: &LevelPlan, step_index: usize) -> Level {
+fn canonical_level(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> Level {
     let shell = canonical_shell(spec, plan, step_index);
-
     let mut rng = SeededRng::new(RELAXED_GOLDEN);
-    for (k, beacon) in sharpened_candidates(&shell, K_PROBES) {
-        let mut level = shell.clone();
-        level.beacons = vec![beacon];
-        if let Some(next) = finish_level(level, plan, k, RELAXED_WINDOW_SCALE, &mut rng) {
-            return next;
+    for window_scale in [1.0, RELAXED_WINDOW_SCALE] {
+        if let Some(level) = canonical_candidate(&shell, plan, step_index, window_scale, &mut rng) {
+            return level;
         }
     }
-
-    for (k, beacon) in trajectory_level_beacons(&shell) {
-        let mut level = shell.clone();
-        level.beacons = vec![beacon];
-        if let Some(next) = finish_level(level, plan, k, RELAXED_WINDOW_SCALE, &mut rng) {
-            return next;
+    // The canonical field is one fixed draw: for some plans it simply admits no
+    // intensity with a narrow enough window (three-band fields with a weak gain,
+    // for one). Retry the seeded generator on a deterministic rng before falling
+    // back to a placeholder, so the level keeps the chapter's mechanic.
+    for (window_scale, strict_fairness) in [(1.0, true), (RELAXED_WINDOW_SCALE, false)] {
+        for attempt in 0..GENERATION_ATTEMPTS {
+            let mut attempt_rng =
+                SeededRng::new(RELAXED_GOLDEN ^ (attempt as u64 + 1).wrapping_mul(GOLDEN_RATIO));
+            if let Some(level) = random_level(
+                spec,
+                plan,
+                window_scale,
+                K_PROBES,
+                strict_fairness,
+                &mut attempt_rng,
+            ) {
+                return with_plan_index(level, step_index);
+            }
         }
     }
-
     FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut level = shell;
-    level.beacons = vec![(4.0, 0.0)];
-    level
+    guaranteed_fallback(shell, step_index)
+}
+
+/// Absolute last resort when every generation pass has failed. The previous
+/// version placed a beacon at a fixed point `(4.0, 0.0)` with no reachability
+/// check at all — for some fields/chapters (narrow-window Bands levels in
+/// particular) that point is never actually reachable by any k, producing a
+/// level that is provably impossible to win. This version instead places the
+/// beacon exactly on the shell's own computed trajectory at a safe non-zero
+/// k, so reachability holds by construction, and verifies it with the same
+/// `integrate_from` check used everywhere else before accepting it.
+fn guaranteed_fallback(shell: Level, step_index: usize) -> Level {
+    let mut level = shell.clone();
+    level.obstacles = Vec::new();
+
+    let candidates = [
+        snap_to_grid(&shell, shell.k_max * 0.5),
+        snap_to_grid(&shell, shell.k_max),
+        snap_to_grid(&shell, shell.k_min * 0.5),
+        snap_to_grid(&shell, shell.k_min),
+    ];
+    for k in candidates {
+        if k.abs() < EPSILON {
+            continue;
+        }
+        if let Some(beacon) = interior_beacon(&level, k) {
+            level.beacons = vec![beacon];
+            if integrate_from(&level, level.a, k).reached() {
+                return with_plan_index(level, step_index);
+            }
+        }
+    }
+
+    // Should be unreachable for any well-formed field, but never ship an
+    // unverified placeholder: fall back to a trivial straight Calm field
+    // and derive the beacon from its own flow instead of guessing a point,
+    // so reachability still holds by construction.
+    // Also reset rules/probes/ghosts: the shell may carry Coordinate,
+    // Corridor or Master-chapter state that would be inconsistent with a
+    // single fixed beacon.
+    level.field = FlowField::Calm {
+        drift_x: 1.0,
+        baseline_y: 0.0,
+        gain_y: 1.0,
+    };
+    level.rules = LevelRules::default();
+    level.probes = Vec::new();
+    level.ghosts = Vec::new();
+    level.a = (-5.0, 0.0);
+    level.default_release = level.a;
+    level.k_min = -1.0;
+    level.k_max = 1.0;
+    level.k_def = 0.0;
+    for k in [0.25, -0.25, 0.5, -0.5] {
+        if let Some(beacon) = interior_beacon(&level, k) {
+            level.beacons = vec![beacon];
+            if integrate_from(&level, level.a, k).reached() {
+                return with_plan_index(level, step_index);
+            }
+        }
+    }
+    level.beacons = vec![(5.0, 0.0)];
+    with_plan_index(level, step_index)
+}
+
+/// An interior point of the level's own trajectory at `k`: on that path the run
+/// reaches the point by construction, and away from the edges the beacon stays
+/// clear of the field margin and of the minimum start distance.
+fn interior_beacon(level: &Level, k: f64) -> Option<Point> {
+    let path = trajectory(level, k);
+    let last = path.len().checked_sub(1)?;
+    if last == 0 {
+        return None;
+    }
+    for fraction in [0.6, 0.45, 0.75, 0.3] {
+        let point = path[clamped_index(fraction * last as f64, last)];
+        if point_in_field(point, WIN_R) && point_distance(point, level.a) > MIN_BEACON_DISTANCE {
+            return Some(point);
+        }
+    }
+    None
+}
+
+fn canonical_candidate(
+    shell: &Level,
+    plan: &LevelPlan,
+    step_index: usize,
+    window_scale: f64,
+    rng: &mut SeededRng,
+) -> Option<Level> {
+    for (k, anchor, beacon) in sharpened_candidates(shell, K_PROBES) {
+        let mut level = shell.clone();
+        level.beacons = vec![beacon];
+        if let Some(next) = finish_level(level, plan, anchor, k, window_scale, rng) {
+            if zone_offers_no_free_win(&next) {
+                return Some(next);
+            }
+        }
+    }
+
+    for (k, beacon) in trajectory_level_beacons(shell) {
+        let mut level = shell.clone();
+        level.beacons = vec![beacon];
+        if let Some(next) = finish_level(level, plan, shell.a, k, window_scale, rng) {
+            if zone_offers_no_free_win(&next) {
+                return Some(next);
+            }
+        }
+    }
+
+    sweep_level(shell, plan, step_index, window_scale)
+}
+
+const SWEEP_ATTEMPTS: usize = 40;
+
+fn sweep_level(
+    shell: &Level,
+    plan: &LevelPlan,
+    step_index: usize,
+    window_scale: f64,
+) -> Option<Level> {
+    let mut rng =
+        SeededRng::new(RELAXED_GOLDEN ^ (step_index as u64 + 1).wrapping_mul(GOLDEN_RATIO));
+    let step = plan.step;
+    let count = ((shell.k_max - shell.k_min) / step).floor() as usize;
+    let mut attempts = 0;
+    for anchor in fair_anchors(shell) {
+        let mut route = shell.clone();
+        route.a = anchor;
+        for index in 0..=count {
+            let k = snap_to_grid(shell, shell.k_min + index as f64 * step);
+            if k.abs() < EPSILON || !integrate_from(shell, anchor, k).reached() {
+                continue;
+            }
+            for beacon in sharpened_beacons(&route, k, 1) {
+                let mut level = shell.clone();
+                level.a = anchor;
+                level.beacons = vec![beacon];
+                if let Some(next) = finish_level(level, plan, anchor, k, window_scale, &mut rng) {
+                    if zone_offers_no_free_win(&next) {
+                        return Some(with_plan_index(next, step_index));
+                    }
+                }
+                attempts += 1;
+                if attempts >= SWEEP_ATTEMPTS {
+                    return None;
+                }
+            }
+        }
+    }
+    None
 }
 
 pub static FALLBACKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1205,12 +1825,19 @@ fn trajectory_level_beacons(level: &Level) -> Vec<(f64, Point)> {
     }
     candidates
 }
-fn generate_level(spec: &MechanicSpec, step_index: usize, seed: u64) -> Level {
+fn generate_level(spec: &ChapterSpec, step_index: usize, seed: u64) -> Level {
     let plan = spec.plans[step_index];
-    for (pass, window_scale, attempts, k_probes) in [
-        (0u64, 1.0, GENERATION_ATTEMPTS, K_PROBES),
-        (1, 1.0, GENERATION_ATTEMPTS, K_PROBES * 2),
-        (2, RELAXED_WINDOW_SCALE, GENERATION_ATTEMPTS / 4, K_PROBES),
+    for (pass, window_scale, attempts, k_probes, strict_fairness) in [
+        (0u64, 1.0, GENERATION_ATTEMPTS, K_PROBES, true),
+        (1, 1.0, GENERATION_ATTEMPTS, K_PROBES * 2, true),
+        (2, 1.0, GENERATION_ATTEMPTS / 4, K_PROBES, false),
+        (
+            3,
+            RELAXED_WINDOW_SCALE,
+            GENERATION_ATTEMPTS / 4,
+            K_PROBES,
+            false,
+        ),
     ] {
         for attempt in 0..attempts {
             let mut rng = SeededRng::new(
@@ -1220,7 +1847,14 @@ fn generate_level(spec: &MechanicSpec, step_index: usize, seed: u64) -> Level {
                         .wrapping_add(pass.wrapping_mul(RELAXED_GOLDEN)),
                 ),
             );
-            if let Some(level) = random_level(spec, &plan, window_scale, k_probes, &mut rng) {
+            if let Some(level) = random_level(
+                spec,
+                &plan,
+                window_scale,
+                k_probes,
+                strict_fairness,
+                &mut rng,
+            ) {
                 if valid_field(&level) {
                     return with_plan_index(level, step_index);
                 }
@@ -1231,14 +1865,14 @@ fn generate_level(spec: &MechanicSpec, step_index: usize, seed: u64) -> Level {
 }
 
 pub fn generate_level_group(seed: u64, group: usize) -> Vec<Level> {
-    let spec = &MECHANICS[group.min(MECHANICS.len() - 1)];
-    (0..LEVELS_PER_GROUP)
+    let spec = &CHAPTERS[group.min(CHAPTERS.len() - 1)];
+    (0..spec.plans.len())
         .map(|step_index| generate_level(spec, step_index, theme_seed(seed, group, step_index)))
         .collect()
 }
 
 pub fn generate_levels(seed: u64) -> Vec<Level> {
-    (0..MECHANICS.len())
+    (0..CHAPTERS.len())
         .flat_map(|group| generate_level_group(seed, group))
         .collect()
 }
@@ -1367,17 +2001,23 @@ fn closer(current: ClosestApproach, candidate: ClosestApproach) -> ClosestApproa
     }
 }
 
-fn integrate_advanced(level: &Level, k: f64, _mode: SimulationMode, cheap: bool) -> SimResult {
+fn integrate_advanced(
+    level: &Level,
+    start: Point,
+    targets: &[Point],
+    k: f64,
+    cheap: bool,
+) -> SimResult {
     let (step, max_steps) = if cheap {
         (CHEAP_STEP, CHEAP_STEPS)
     } else {
         (STEP, MAX_STEPS)
     };
-    let mut point = level.a;
+    let mut point = start;
     let mut points = vec![point];
-    let mut visited = vec![false; level.beacons.len()];
+    let mut visited = vec![false; targets.len()];
     let mut visited_count = 0usize;
-    let mut target = level.beacons.first().copied().unwrap_or(point);
+    let mut target = targets.first().copied().unwrap_or(point);
     let mut closest = closest_on_segment(point, point, target);
 
     for _ in 0..max_steps {
@@ -1403,7 +2043,7 @@ fn integrate_advanced(level: &Level, k: f64, _mode: SimulationMode, cheap: bool)
             .filter(|(t, _)| *t <= 1.0);
 
         let mut hits: Vec<(usize, f64)> = Vec::new();
-        for (index, beacon) in level.beacons.iter().enumerate() {
+        for (index, beacon) in targets.iter().enumerate() {
             if visited[index] {
                 continue;
             }
@@ -1411,13 +2051,12 @@ fn integrate_advanced(level: &Level, k: f64, _mode: SimulationMode, cheap: bool)
                 hits.push((index, t));
             }
         }
-        let complete =
-            !level.beacons.is_empty() && hits.len() == level.beacons.len() - visited_count;
+        let complete = !targets.is_empty() && hits.len() == targets.len() - visited_count;
         for (index, _) in hits.iter() {
             visited[*index] = true;
         }
         visited_count += hits.len();
-        if complete && visited_count == level.beacons.len() {
+        if complete && visited_count == targets.len() {
             let t = hits.iter().map(|(_, t)| *t).fold(0.0_f64, f64::max);
             if event.as_ref().is_none_or(|(best, _)| t < *best) {
                 event = Some((t, Outcome::Reached));
@@ -1448,7 +2087,7 @@ fn integrate_advanced(level: &Level, k: f64, _mode: SimulationMode, cheap: bool)
             .map(|(t, _)| lerp_point(point, next, *t))
             .unwrap_or(next);
         if let Some(index) = visited.iter().position(|done| !done) {
-            let next_target = level.beacons[index];
+            let next_target = targets[index];
             if next_target != target {
                 target = next_target;
                 closest = closest_on_segment(point, point, target);
@@ -1481,15 +2120,35 @@ fn integrate_advanced(level: &Level, k: f64, _mode: SimulationMode, cheap: bool)
 }
 
 pub fn integrate(level: &Level, k: f64) -> SimResult {
-    integrate_with_mode(level, k, SimulationMode::Laboratory)
+    integrate_from(level, level.a, k)
 }
 
-pub fn integrate_with_mode(level: &Level, k: f64, mode: SimulationMode) -> SimResult {
-    integrate_advanced(level, k, mode, false)
+pub fn integrate_from(level: &Level, start: Point, k: f64) -> SimResult {
+    integrate_advanced(level, start, &level.beacons, k, false)
 }
 
-fn coarse_distance(level: &Level, k: f64) -> f64 {
-    integrate_advanced(level, k, SimulationMode::Exploration, true)
+pub fn integrate_route(level: &Level, start: Point, target: Point, k: f64) -> SimResult {
+    integrate_advanced(level, start, std::slice::from_ref(&target), k, false)
+}
+
+pub fn integrate_with_mode(level: &Level, k: f64, _mode: SimulationMode) -> SimResult {
+    integrate_from(level, level.a, k)
+}
+
+pub fn release_points(level: &Level) -> Vec<Point> {
+    release_anchors(level)
+}
+
+pub fn route_won(level: &Level, result: &SimResult) -> bool {
+    if level.rules.probes > 1 {
+        result.visited == level.rules.probes
+    } else {
+        result.reached()
+    }
+}
+
+fn coarse_distance(level: &Level, start: Point, targets: &[Point], k: f64) -> f64 {
+    integrate_advanced(level, start, targets, k, true)
         .closest
         .map(|closest| closest.distance)
         .unwrap_or(f64::INFINITY)
@@ -1512,7 +2171,8 @@ mod tests {
             title: "Test",
             desc: "",
             focus: "",
-            mechanic: Mechanic::Steady,
+            chapter: Chapter::Discover,
+            rules: LevelRules::default(),
             step_index: 0,
             field: FlowField::Calm {
                 drift_x: 1.0,
@@ -1526,6 +2186,12 @@ mod tests {
             exploration_attempts: 3,
             k_window: 0.0,
             a: (0.0, 0.0),
+            default_release: (0.0, 0.0),
+            probes: vec![Probe {
+                start: (0.0, 0.0),
+                target: (0.0, 0.0),
+            }],
+            ghosts: Vec::new(),
             beacons,
             obstacles: Vec::new(),
         }
@@ -1534,29 +2200,30 @@ mod tests {
     #[test]
     fn all_levels_load() {
         let levels = levels();
-        assert_eq!(levels.len(), MECHANICS.len() * LEVELS_PER_GROUP);
-        for (group, mechanic) in Mechanic::all().iter().enumerate() {
-            for step in 0..LEVELS_PER_GROUP {
-                let level = &levels[group * LEVELS_PER_GROUP + step];
-                assert_eq!(level.mechanic, *mechanic);
+        assert_eq!(levels.len(), total_level_count());
+        for (group, chapter) in Chapter::all().iter().enumerate() {
+            for step in 0..chapter_size(group) {
+                let level = &levels[chapter_offset(group) + step];
+                assert_eq!(level.chapter, *chapter);
                 assert_eq!(level.step_index, step);
-                assert_eq!(level.global_index(), group * LEVELS_PER_GROUP + step + 1);
-                assert_eq!(level.beacons.len(), MECHANICS[group].plans[step].beacons);
+                assert_eq!(level.global_index(), chapter_offset(group) + step + 1);
+                assert_eq!(level.beacons.len(), CHAPTERS[group].plans[step].beacons);
             }
         }
     }
 
     #[test]
-    fn mechanics_follow_the_teaching_order() {
+    fn chapters_follow_the_teaching_order() {
         assert_eq!(
-            Mechanic::all(),
+            Chapter::all(),
             [
-                Mechanic::Steady,
-                Mechanic::Vortex,
-                Mechanic::Zones,
-                Mechanic::Opposed,
-                Mechanic::Sensitive,
-                Mechanic::Beacons
+                Chapter::Discover,
+                Chapter::Position,
+                Chapter::Predict,
+                Chapter::Coordinate,
+                Chapter::Corridor,
+                Chapter::Traces,
+                Chapter::Master
             ]
         );
     }
@@ -1601,16 +2268,16 @@ mod tests {
                 level.focus
             );
         }
-        for group in 0..mechanic_count() {
+        for group in 0..chapter_count() {
             let budgets: Vec<usize> = levels
-                [group * LEVELS_PER_GROUP..(group + 1) * LEVELS_PER_GROUP]
+                [chapter_offset(group)..chapter_offset(group) + chapter_size(group)]
                 .iter()
                 .map(|level| level.exploration_attempts)
                 .collect();
             assert!(
                 budgets.windows(2).all(|pair| pair[0] <= pair[1]),
                 "budgets décroissants dans {:?}: {:?}",
-                MECHANICS[group].title,
+                CHAPTERS[group].title,
                 budgets
             );
         }
@@ -1618,9 +2285,9 @@ mod tests {
 
     #[test]
     fn every_level_keeps_a_narrow_but_playable_window() {
-        for (group, spec) in MECHANICS.iter().enumerate() {
-            for step in 0..LEVELS_PER_GROUP {
-                let level = &levels()[group * LEVELS_PER_GROUP + step];
+        for (group, spec) in CHAPTERS.iter().enumerate() {
+            for step in 0..CHAPTERS[group].plans.len() {
+                let level = &levels()[chapter_offset(group) + step];
                 let max_window = spec.plans[step]
                     .k_window_steps
                     .expect("chaque plan doit viser une marge")
@@ -1690,7 +2357,7 @@ mod tests {
 
     #[test]
     fn multi_beacon_generated_levels_are_solved_together() {
-        for level in generate_level_group(DEFAULT_SEED, Mechanic::Beacons.group_index()) {
+        for level in generate_level_group(DEFAULT_SEED, Chapter::Coordinate.group_index()) {
             assert!(level.beacons.len() >= 2);
             let k = solve(&level).expect("les balises multiples doivent rester solubles");
             let result = integrate(&level, k);
@@ -1701,7 +2368,7 @@ mod tests {
 
     #[test]
     fn band_field_switches_direction_between_bands() {
-        let level = canonical_level(&MECHANICS[2], &MECHANICS[2].plans[4], 4);
+        let level = canonical_level(&CHAPTERS[5], &CHAPTERS[5].plans[3], 3);
         let FlowField::Bands { bands } = &level.field else {
             panic!("le groupe zones attend un champ à bandes");
         };
@@ -1717,18 +2384,18 @@ mod tests {
     #[test]
     fn lazy_generation_matches_eager_generation() {
         let eager = generate_levels(42);
-        for group in 0..mechanic_count() {
+        for group in 0..chapter_count() {
             assert_eq!(
                 generate_level_group(42, group),
-                eager[group * LEVELS_PER_GROUP..(group + 1) * LEVELS_PER_GROUP]
+                eager[chapter_offset(group)..chapter_offset(group) + chapter_size(group)]
             );
         }
     }
 
     #[test]
     fn canonical_fallbacks_stay_playable() {
-        for spec in MECHANICS.iter() {
-            for step in 0..LEVELS_PER_GROUP {
+        for spec in CHAPTERS.iter() {
+            for step in 0..spec.plans.len() {
                 let level = canonical_level(spec, &spec.plans[step], step);
                 assert!(
                     valid_geometry(&level),
@@ -1745,6 +2412,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn predict_narrow_bands_fallback_is_reachable() {
+        // Reported bug: chapter "Prédiction" (index 2), step 3 ("bandes
+        // étroites") produced an unreachable level under some seeds. This
+        // exercises the exact plan whether it's satisfied by procedural
+        // generation or falls through to canonical_level/guaranteed_fallback.
+        let spec = &CHAPTERS[Chapter::Predict.group_index()];
+        let plan = &spec.plans[3];
+        assert_eq!(plan.focus, "bandes étroites");
+
+        for seed in [DEFAULT_SEED, 1, 7, 42, 0xdead, 0xfeed] {
+            let level = generate_level(spec, 3, theme_seed(seed, spec.chapter.group_index(), 3));
+            assert!(
+                solve(&level).is_some(),
+                "seed {seed:x}: niveau insoluble malgré generate_level"
+            );
+        }
+
+        // Directly exercise the last-resort path itself, bypassing RNG,
+        // to make sure guaranteed_fallback() alone is never unreachable.
+        let shell = canonical_shell(spec, plan, 3);
+        let fallback = guaranteed_fallback(shell, 3);
+        assert!(
+            solve(&fallback).is_some(),
+            "guaranteed_fallback produced an unreachable level"
+        );
     }
 
     #[test]
@@ -1780,7 +2475,7 @@ mod tests {
 
     #[test]
     fn opposed_field_reverses_vertical_current() {
-        let level = canonical_level(&MECHANICS[3], &MECHANICS[3].plans[0], 0);
+        let level = canonical_level(&CHAPTERS[1], &CHAPTERS[1].plans[2], 2);
         let below = level.flow_at(0.0, -0.1, 0.0);
         let above = level.flow_at(0.0, 0.1, 0.0);
         assert!(below.y < 0.0);
@@ -1864,7 +2559,7 @@ mod tests {
 
     #[test]
     fn rk4_preserves_a_constant_field() {
-        let level = canonical_level(&MECHANICS[0], &MECHANICS[0].plans[0], 0);
+        let level = canonical_level(&CHAPTERS[0], &CHAPTERS[0].plans[0], 0);
         let point = rk4(&level, (0.0, 0.0), 0.5, 0.1);
         assert!((point.0 - 0.1).abs() < 1e-12);
         assert!((point.1 - 0.05).abs() < 1e-12);

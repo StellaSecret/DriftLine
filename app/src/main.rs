@@ -3,8 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
 use peoplemodeler_core::{
-    generate_level_group, integrate_with_mode, mechanic_count, Level, Outcome, SimResult,
-    SimulationMode, Vector2, DEFAULT_SEED, LEVELS_PER_GROUP, WIN_R, XMAX, XMIN, YMAX, YMIN,
+    chapter_count, chapter_offset, chapter_size, generate_level_group, integrate_from,
+    total_level_count, Chapter, Level, Outcome, ReleaseMode, SimResult, SimulationMode, Vector2,
+    DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX, YMIN,
 };
 
 const W: f64 = 640.0;
@@ -34,6 +35,7 @@ struct LevelProgress {
     active_attempt: Option<Attempt>,
     attempts: usize,
     solved: bool,
+    release: Option<(f64, f64)>,
 }
 
 fn main() {
@@ -46,6 +48,69 @@ fn map_x(x: f64) -> f64 {
 
 fn map_y(y: f64) -> f64 {
     H - (y - YMIN) / (YMAX - YMIN) * H
+}
+
+fn invert_map_x(px: f64) -> f64 {
+    XMIN + px / W * (XMAX - XMIN)
+}
+
+fn invert_map_y(py: f64) -> f64 {
+    YMAX - py / H * (YMAX - YMIN)
+}
+
+fn release_of(level: &Level, progress: &LevelProgress) -> (f64, f64) {
+    match level.rules.release {
+        ReleaseMode::Fixed => level.default_release,
+        _ => progress.release.unwrap_or(level.default_release),
+    }
+}
+
+fn accepts_release(level: &Level, point: (f64, f64)) -> bool {
+    level.rules.release != ReleaseMode::Fixed && level.rules.zone.contains(point)
+}
+
+async fn handle_field_click(
+    event: Event<MouseData>,
+    mut progress: Signal<Vec<LevelProgress>>,
+    level_idx: usize,
+    level: Level,
+) {
+    let pointer = event.client_coordinates();
+    let script = field_pick_script(pointer.x, pointer.y);
+    let Ok(value) = dioxus::document::eval(&script).await else {
+        return;
+    };
+    let Some(text) = value.as_str().map(str::to_owned) else {
+        return;
+    };
+    let Some(world) = text
+        .split_once(',')
+        .and_then(|(x, y)| Some((x.parse::<f64>().ok()?, y.parse::<f64>().ok()?)))
+        .map(|(px, py)| (invert_map_x(px), invert_map_y(py)))
+    else {
+        return;
+    };
+    if !accepts_release(&level, world) {
+        return;
+    }
+    let mut levels = progress();
+    if let Some(entry) = levels.get_mut(level_idx) {
+        entry.active_attempt = None;
+        entry.release = Some(world);
+    }
+    progress.set(levels);
+}
+
+/// `dioxus::document::eval` runs the script as a function body, so the value has to
+/// come back through an explicit `return`; a bare expression yields `undefined`.
+fn field_pick_script(client_x: f64, client_y: f64) -> String {
+    format!(
+        "const svg = document.querySelector('svg.field-svg'); \
+         if (!svg) return ''; \
+         const box = svg.getBoundingClientRect(); \
+         return [({client_x} - box.left) / box.width * {W}, \
+                 ({client_y} - box.top) / box.height * {H}].join(',');"
+    )
 }
 
 fn field_grid_x() -> Vec<f64> {
@@ -201,7 +266,10 @@ fn append_group(
     levels.extend(generate_level_group(seed, group));
     all_levels.set(levels);
     let mut progress = (signals.progress)();
-    progress.resize(progress.len() + LEVELS_PER_GROUP, LevelProgress::default());
+    progress.resize(
+        progress.len() + chapter_size(group),
+        LevelProgress::default(),
+    );
     signals.progress.set(progress);
 }
 
@@ -212,7 +280,7 @@ fn format_seed(seed: u64) -> String {
 async fn entropy_seed() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
-        dioxus::document::eval("Math.floor(Math.random() * 4294967296)")
+        dioxus::document::eval("return Math.floor(Math.random() * 4294967296)")
             .await
             .ok()
             .and_then(|value| value.as_u64())
@@ -243,8 +311,14 @@ fn history_limit(mode: SimulationMode) -> usize {
     }
 }
 
-fn should_show_vectors(mode: SimulationMode, level_idx: usize) -> bool {
-    mode == SimulationMode::Laboratory || level_idx < LEVELS_PER_GROUP
+fn should_show_vectors(mode: SimulationMode, chapter: Chapter) -> bool {
+    mode == SimulationMode::Laboratory || chapter == Chapter::Discover
+}
+
+fn chapter_index_of(level_index: usize) -> usize {
+    (0..chapter_count())
+        .find(|group| level_index < chapter_offset(*group) + chapter_size(*group))
+        .unwrap_or_else(|| chapter_count() - 1)
 }
 
 fn solved_prefix(progress: &[LevelProgress]) -> usize {
@@ -409,12 +483,12 @@ fn App() -> Element {
     let all_levels = use_signal(|| generate_level_group(DEFAULT_SEED, 0));
     let initial_k = all_levels()[0].k_def;
     let initial_step = all_levels()[0].recommended_step;
-    let total_levels = mechanic_count() * LEVELS_PER_GROUP;
+    let total_levels = total_level_count();
     let level_idx = use_signal(|| 0usize);
     let mut mode = use_signal(|| SimulationMode::Exploration);
     let mut k = use_signal(|| initial_k);
     let mut step_idx = use_signal(|| step_index(initial_step));
-    let mut progress = use_signal(|| vec![LevelProgress::default(); LEVELS_PER_GROUP]);
+    let mut progress = use_signal(|| vec![LevelProgress::default(); chapter_size(0)]);
     let mut show_levels = use_signal(|| false);
     let mut animation_id = use_signal(|| 0usize);
     let mut animation_visible = use_signal(|| false);
@@ -457,7 +531,7 @@ fn App() -> Element {
         let loaded = all_levels().len();
         let solved = solved_prefix(&progress());
         if loaded < total_levels && solved + 1 >= loaded {
-            let group = loaded / LEVELS_PER_GROUP;
+            let group = chapter_index_of(loaded);
             let seed = active_seed();
             spawn(async move {
                 append_group(all_levels, level_signals, seed, group);
@@ -469,24 +543,26 @@ fn App() -> Element {
     let current_level_idx = level_idx();
     let current = levels_snapshot[current_level_idx].clone();
     let launch_level = current.clone();
+    let clickable_level = current.clone();
     let current_mode = mode();
     let current_step = STEPS[step_idx()];
-    let preview = integrate_with_mode(&current, k(), current_mode);
+    let current_progress = progress()[current_level_idx].clone();
+    let release = release_of(&current, &current_progress);
+    let preview = integrate_from(&current, release, k());
     let description = if current_mode == SimulationMode::Exploration {
         format!("Exploration libre — {}", current.desc)
     } else {
         current.desc.to_string()
     };
-    let current_progress = progress()[current_level_idx].clone();
     let run_blocked = exploration_blocked(current_mode, &current, &current_progress);
     let active_result = current_progress
         .active_attempt
         .as_ref()
         .map(|attempt| attempt.result.clone());
-    let show_preview = should_show_vectors(current_mode, current_level_idx);
+    let show_preview = should_show_vectors(current_mode, current.chapter);
     let has_launched = active_result.is_some();
     let direction_hint = if !show_preview && !has_launched {
-        Some(launch_heading(&current, current.a, k()))
+        Some(launch_heading(&current, release, k()))
     } else {
         None
     };
@@ -519,6 +595,16 @@ fn App() -> Element {
             result.closest
         }
     });
+    // Exploration hides the field and the launched path, but leaving the
+    // player with only a bare distance number after a miss gave no way to
+    // adjust intentionally. This shows the actual local current at the
+    // closest-approach point, once per failed attempt — a real clue, not a
+    // full reveal of the field.
+    let closest_direction_hint = if current_mode == SimulationMode::Exploration {
+        closest_marker.map(|closest| launch_heading(&current, closest.point, k()))
+    } else {
+        None
+    };
     let collision_point = match active_result.as_ref().map(|result| result.outcome) {
         Some(Outcome::Collision { point, .. }) => Some(point),
         _ => None,
@@ -550,11 +636,14 @@ fn App() -> Element {
     let unlocked = unlocked_count(&progress_snapshot, levels_snapshot.len());
     let can_go_previous = current_level_idx > 0;
     let can_go_next = current_level_idx + 1 < unlocked;
-    let level_groups: Vec<(String, Vec<LevelChip>)> = levels_snapshot
-        .chunks(LEVELS_PER_GROUP)
-        .enumerate()
-        .flat_map(|(group, chunk)| {
-            let chips = (group * LEVELS_PER_GROUP..(group + 1) * LEVELS_PER_GROUP)
+    let level_groups: Vec<(String, Vec<LevelChip>)> = (0..chapter_count())
+        .filter_map(|group| {
+            let first = chapter_offset(group);
+            if first >= levels_snapshot.len() {
+                return None;
+            }
+            let last = (first + chapter_size(group)).min(levels_snapshot.len());
+            let chips = (first..last)
                 .map(|index| LevelChip {
                     index,
                     class: level_button_class(
@@ -567,7 +656,7 @@ fn App() -> Element {
                     disabled: index >= unlocked,
                 })
                 .collect();
-            [(chunk[0].mechanic.title().to_string(), chips)]
+            Some((levels_snapshot[first].chapter.title().to_string(), chips))
         })
         .collect();
     let show_levels_menu = show_levels();
@@ -588,7 +677,10 @@ fn App() -> Element {
     } else {
         "Atteindre la balise"
     };
-    let mode_hint = match (current_mode, current_level_idx < LEVELS_PER_GROUP) {
+    let mode_hint = match (
+        current_mode,
+        should_show_vectors(current_mode, current.chapter),
+    ) {
         (SimulationMode::Laboratory, _) => format!("{lab_goal} · vecteurs actifs"),
         (SimulationMode::Exploration, true) => "Libre · vecteurs tutoriel".to_string(),
         (SimulationMode::Exploration, false) => "Libre · vecteurs masqués".to_string(),
@@ -623,7 +715,7 @@ fn App() -> Element {
                     }
                     div { class: "level-heading",
                         span { class: "level-index", "Zone {current_level_idx + 1} / {total_levels}" }
-                        span { class: "level-family", "{current.mechanic.title()} · {current.focus} ({current.step_index + 1}/{LEVELS_PER_GROUP})" }
+                        span { class: "level-family", "Chapitre {current.chapter.group_index() + 1} · {current.chapter.title()} · {current.focus} ({current.step_index + 1}/{current.chapter.size()})" }
                     }
                     button {
                         r#type: "button",
@@ -730,7 +822,16 @@ fn App() -> Element {
                 }
                 div { class: "desc", "{current.title} — {description}" }
 
-                svg { view_box: "0 0 {W} {H}", class: "field-svg",
+                svg {
+                    view_box: "0 0 {W} {H}", class: "field-svg",
+                    onclick: move |event: Event<MouseData>| {
+                        spawn(handle_field_click(
+                            event,
+                            progress,
+                            current_level_idx,
+                            clickable_level.clone(),
+                        ));
+                    },
                     defs {
                         marker {
                             id: "flow-arrow",
@@ -752,8 +853,18 @@ fn App() -> Element {
                             orient: "auto",
                             path { d: "M 0 0 L 10 5 L 0 10 z", class: "hint-arrow-head" }
                         }
+                        marker {
+                            id: "hint-arrow-closest",
+                            view_box: "0 0 10 10",
+                            ref_x: "8",
+                            ref_y: "5",
+                            marker_width: "5",
+                            marker_height: "5",
+                            orient: "auto",
+                            path { d: "M 0 0 L 10 5 L 0 10 z", class: "closest-hint-arrow-head" }
+                        }
                     }
-                    if should_show_vectors(current_mode, level_idx()) {
+                    if should_show_vectors(current_mode, current.chapter) {
                         for gx in field_grid_x() {
                             for gy in field_grid_y() {
                                 if let Some((x1, y1, x2, y2)) =
@@ -786,9 +897,19 @@ fn App() -> Element {
                             marker_end: "url(#hint-arrow)",
                         }
                     }
+                    if current.rules.release != ReleaseMode::Fixed {
+                        rect {
+                            x: "{map_x(current.rules.zone.min.0):.2}",
+                            y: "{map_y(current.rules.zone.max.1):.2}",
+                            width: "{(map_x(current.rules.zone.max.0) - map_x(current.rules.zone.min.0)):.2}",
+                            height: "{(map_y(current.rules.zone.min.1) - map_y(current.rules.zone.max.1)):.2}",
+                            class: "release-zone",
+                        }
+                    }
                     circle {
-                        cx: "{map_x(current.a.0):.2}", cy: "{map_y(current.a.1):.2}",
-                        r: "6", class: "point-a",
+                        cx: "{map_x(release.0):.2}", cy: "{map_y(release.1):.2}",
+                        r: if current.rules.release == ReleaseMode::Fixed { "6" } else { "7" },
+                        class: "point-a release-handle",
                     }
                     for (index, beacon) in current.beacons.iter().enumerate() {
                         ellipse {
@@ -829,6 +950,14 @@ fn App() -> Element {
                             cx: "{map_x(closest.point.0):.2}",
                             cy: "{map_y(closest.point.1):.2}",
                             r: "6", class: closest_class,
+                        }
+                    }
+                    if let Some((sx, sy, ex, ey)) = closest_direction_hint {
+                        line {
+                            x1: "{sx:.2}", y1: "{sy:.2}",
+                            x2: "{ex:.2}", y2: "{ey:.2}",
+                            class: "closest-direction-hint",
+                            marker_end: "url(#hint-arrow-closest)",
                         }
                     }
                     if let Some(point) = collision_point {
@@ -976,7 +1105,7 @@ fn App() -> Element {
                                 current_step,
                             );
                             k.set(launch_k);
-                            let result = integrate_with_mode(&launch_level, launch_k, current_mode);
+                            let result = integrate_from(&launch_level, release, launch_k);
                             let won = result.reached();
                             animation_visible.set(false);
                             animation_id.set(animation_id() + 1);
@@ -1002,6 +1131,11 @@ fn App() -> Element {
                         class: "ghost",
                         onclick: move |_| {
                             reset_level_progress(&mut progress, current_level_idx, true);
+                            let mut levels = progress();
+                            if let Some(entry) = levels.get_mut(current_level_idx) {
+                                entry.release = None;
+                            }
+                            progress.set(levels);
                             animation_visible.set(false);
                         },
                         "Réinitialiser"
@@ -1102,6 +1236,8 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .seed-status{font-size:.76rem;color:var(--accent)}
 .desc{font-size:.85rem;color:var(--sub);margin-bottom:10px;line-height:1.5}
 .field-svg{width:100%;height:auto;background:var(--bg);border:1px solid var(--line);border-radius:10px}
+.release-zone{fill:var(--accent);opacity:.07;stroke:var(--accent);stroke-opacity:.55;stroke-width:1;stroke-dasharray:5 4}
+.release-handle{stroke:var(--accent);stroke-width:2}
 .arrow{stroke:var(--field);stroke-width:1.2}
 .arrow-head{fill:var(--field)}
 .obstacle{fill:var(--accent2);opacity:.35}
@@ -1113,6 +1249,8 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .direction-hint{stroke:#4ade80;stroke-width:2.4;stroke-linecap:round}
 .hint-arrow-head{fill:#4ade80}
 .closest-point{fill:var(--closest);stroke:var(--bg);stroke-width:2}
+.closest-direction-hint{stroke:var(--closest);stroke-width:2.4;stroke-linecap:round}
+.closest-hint-arrow-head{fill:var(--closest)}
 .collision-point{fill:var(--danger);stroke:#fff;stroke-width:2}
 .path{fill:none;stroke:var(--accent);stroke-width:2.4}
 .active-path{stroke-dasharray:1;stroke-dashoffset:1;animation:draw-path 1.2s ease-out forwards}
@@ -1208,22 +1346,34 @@ mod tests {
     }
 
     #[test]
-    fn exploration_hides_vectors_after_the_intro_group() {
-        assert!(should_show_vectors(SimulationMode::Exploration, 0));
+    fn laboratory_always_shows_the_field_vectors() {
+        for chapter in Chapter::all() {
+            assert!(
+                should_show_vectors(SimulationMode::Laboratory, chapter),
+                "{}",
+                chapter.title()
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_first_chapter_teaches_the_field_vectors() {
         assert!(should_show_vectors(
             SimulationMode::Exploration,
-            LEVELS_PER_GROUP - 1
+            Chapter::Discover
         ));
-        assert!(!should_show_vectors(
-            SimulationMode::Exploration,
-            LEVELS_PER_GROUP
-        ));
-        assert!(should_show_vectors(SimulationMode::Laboratory, 7));
+        for chapter in Chapter::all().iter().skip(1) {
+            assert!(
+                !should_show_vectors(SimulationMode::Exploration, *chapter),
+                "{}",
+                chapter.title()
+            );
+        }
     }
 
     #[test]
     fn zones_unlock_one_at_a_time() {
-        let mut progress = vec![LevelProgress::default(); mechanic_count() * LEVELS_PER_GROUP];
+        let mut progress = vec![LevelProgress::default(); total_level_count()];
         assert_eq!(unlocked_count(&progress, progress.len()), 1);
         progress[0].solved = true;
         assert_eq!(unlocked_count(&progress, progress.len()), 2);
@@ -1235,13 +1385,13 @@ mod tests {
 
     #[test]
     fn unlock_stops_at_the_loaded_levels() {
-        let mut progress = vec![LevelProgress::default(); LEVELS_PER_GROUP];
-        for level in progress.iter_mut().take(LEVELS_PER_GROUP - 1) {
+        let mut progress = vec![LevelProgress::default(); chapter_size(0)];
+        for level in progress.iter_mut().take(chapter_size(0) - 1) {
             level.solved = true;
         }
         assert_eq!(
-            unlocked_count(&progress, LEVELS_PER_GROUP - 1),
-            LEVELS_PER_GROUP - 1
+            unlocked_count(&progress, chapter_size(0) - 1),
+            chapter_size(0) - 1
         );
     }
 
@@ -1273,7 +1423,8 @@ mod tests {
             title: "test",
             desc: "test",
             focus: "test",
-            mechanic: peoplemodeler_core::Mechanic::Steady,
+            chapter: Chapter::Discover,
+            rules: peoplemodeler_core::LevelRules::default(),
             step_index: 0,
             field: peoplemodeler_core::FlowField::Calm {
                 drift_x: -2.0,
@@ -1287,6 +1438,9 @@ mod tests {
             exploration_attempts: 1,
             k_window: 0.0,
             a: (-4.5, 0.0),
+            default_release: (-4.5, 0.0),
+            probes: Vec::new(),
+            ghosts: Vec::new(),
             beacons: Vec::new(),
             obstacles: Vec::new(),
         }
@@ -1343,5 +1497,68 @@ mod tests {
             attempt_status(SimulationMode::Exploration, false),
             "terminé"
         );
+    }
+
+    #[test]
+    fn svg_coordinates_invert_the_field_mapping() {
+        for world in [
+            (XMIN, YMIN),
+            (XMAX, YMAX),
+            (0.0, 0.0),
+            (-4.5, 1.25),
+            (3.75, -2.0),
+        ] {
+            let (px, py) = (map_x(world.0), map_y(world.1));
+            assert!((px - 0.0).abs() < 1e-9 || (px - W).abs() < 1e-9 || (0.0..=W).contains(&px));
+            assert!((0.0..=H).contains(&py));
+            let back = (invert_map_x(px), invert_map_y(py));
+            assert!((back.0 - world.0).abs() < 1e-9, "{world:?} -> {back:?}");
+            assert!((back.1 - world.1).abs() < 1e-9, "{world:?} -> {back:?}");
+        }
+        assert!((invert_map_y(0.0) - YMAX).abs() < 1e-9);
+        assert!((invert_map_y(H) - YMIN).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fixed_release_levels_ignore_the_stored_point() {
+        let level = calm_test_level();
+        let progress = LevelProgress {
+            release: Some((0.0, 1.0)),
+            ..LevelProgress::default()
+        };
+        assert_eq!(release_of(&level, &progress), level.default_release);
+        assert!(!accepts_release(&level, (0.0, 1.0)));
+        assert!(!accepts_release(&level, level.default_release));
+    }
+
+    #[test]
+    fn zone_release_levels_only_accept_points_inside() {
+        let mut level = calm_test_level();
+        level.rules.release = ReleaseMode::Zone;
+        level.rules.zone = peoplemodeler_core::Rect::new((-3.0, -1.0), (-1.0, 1.0));
+        let default = release_of(&level, &LevelProgress::default());
+        assert_eq!(default, level.default_release);
+        assert!(accepts_release(&level, (-2.0, 0.0)));
+        assert!(accepts_release(&level, (-3.0, -1.0)));
+        assert!(!accepts_release(&level, (-0.5, 0.0)));
+        assert!(!accepts_release(&level, (-2.0, 1.5)));
+        let progress = LevelProgress {
+            release: Some((-2.0, 0.5)),
+            ..LevelProgress::default()
+        };
+        assert_eq!(release_of(&level, &progress), (-2.0, 0.5));
+    }
+
+    #[test]
+    fn the_pick_script_returns_its_value() {
+        // `eval` wraps the script as `return (async function(){ <script> })()`, so a
+        // script without its own `return` resolves to `undefined` and the click is dropped.
+        let script = field_pick_script(120.0, 340.0);
+        assert!(script.contains("return ["), "{script}");
+        assert!(!script.contains("=>"), "{script}");
+        assert!(script.contains("120"), "{script}");
+        assert!(script.contains("340"), "{script}");
+        assert!(script.contains(&format!("* {W}")), "{script}");
+        assert!(script.contains(&format!("* {H}")), "{script}");
     }
 }
