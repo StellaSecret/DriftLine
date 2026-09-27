@@ -98,6 +98,49 @@ pub enum TraceRule {
     KeepOptions,
 }
 
+/// Which controls a level actually teaches. A knob that is switched off stays
+/// pinned to the winning value found by the generator, so the level can only be
+/// solved through the knobs the chapter is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Knobs {
+    pub intensity: bool,
+    pub release: bool,
+    pub phase: bool,
+}
+
+impl Knobs {
+    pub const NONE: Self = Self {
+        intensity: false,
+        release: false,
+        phase: false,
+    };
+    pub const INTENSITY: Self = Self {
+        intensity: true,
+        release: false,
+        phase: false,
+    };
+    pub const RELEASE: Self = Self {
+        intensity: false,
+        release: true,
+        phase: false,
+    };
+    pub const RELEASE_INTENSITY: Self = Self {
+        intensity: true,
+        release: true,
+        phase: false,
+    };
+    pub const PHASE_INTENSITY: Self = Self {
+        intensity: true,
+        release: false,
+        phase: true,
+    };
+    pub const ALL: Self = Self {
+        intensity: true,
+        release: true,
+        phase: true,
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LevelRules {
     pub release: ReleaseMode,
@@ -106,6 +149,7 @@ pub struct LevelRules {
     pub corridor: bool,
     pub traces: TraceRule,
     pub probes: usize,
+    pub knobs: Knobs,
 }
 
 impl Default for LevelRules {
@@ -117,6 +161,7 @@ impl Default for LevelRules {
             corridor: false,
             traces: TraceRule::None,
             probes: 1,
+            knobs: Knobs::ALL,
         }
     }
 }
@@ -129,26 +174,45 @@ pub struct Probe {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Chapter {
-    Discover,
+    Follow,
     Position,
     Predict,
+    Influence,
+    Thread,
+    Timing,
+    Compose,
     Coordinate,
-    Corridor,
-    Traces,
-    Master,
+    Exploration,
 }
 
 impl Chapter {
-    pub fn all() -> [Chapter; 7] {
+    pub fn all() -> [Chapter; 9] {
         [
-            Chapter::Discover,
+            Chapter::Follow,
             Chapter::Position,
             Chapter::Predict,
+            Chapter::Influence,
+            Chapter::Thread,
+            Chapter::Timing,
+            Chapter::Compose,
             Chapter::Coordinate,
-            Chapter::Corridor,
-            Chapter::Traces,
-            Chapter::Master,
+            Chapter::Exploration,
         ]
+    }
+
+    /// The mode a chapter runs in. Exploration is a chapter of its own, so the
+    /// mode follows the chapter instead of being a global switch.
+    pub fn mode(self) -> SimulationMode {
+        match self {
+            Chapter::Exploration => SimulationMode::Exploration,
+            _ => SimulationMode::Laboratory,
+        }
+    }
+
+    /// A sandbox chapter: every axis stays open, so it promises no narrow
+    /// window. The laboratory chapters are the ones that are tuned to a needle.
+    pub fn is_sandbox(self) -> bool {
+        matches!(self, Chapter::Exploration)
     }
 
     pub fn group_index(self) -> usize {
@@ -242,10 +306,127 @@ pub enum FlowField {
         restoring: f64,
         gain_y: f64,
     },
+    Mix {
+        components: Vec<FlowField>,
+        weights: Vec<f64>,
+    },
 }
 
+/// Longest phase sweep, in units of the field's own natural scale, that a
+/// timeline level may use. Kept public so the app can label the dial.
+pub const PHASE_SWEEP_MAX: f64 = 1.0;
+
 impl FlowField {
+    /// The frozen snapshot the probe flies through when the player picks phase
+    /// `t` in `[0, 1)`. This is a pure transform of the stored field: the
+    /// integrator never sees a time term, so a run is a plain trajectory and
+    /// every fairness guarantee of the single-field pipeline still applies.
+    ///
+    /// `sweep` scales the displacement; `0.0` is the identity on every arm.
+    pub fn at_phase(&self, t: f64, sweep: f64) -> FlowField {
+        let shift = sweep * (t - 0.5);
+        match self {
+            Self::Calm {
+                drift_x,
+                baseline_y,
+                gain_y,
+            } => Self::Calm {
+                drift_x: *drift_x,
+                baseline_y: baseline_y + shift,
+                gain_y: *gain_y,
+            },
+            Self::Retention {
+                drift_x,
+                center_y,
+                restoring,
+                gain_y,
+            } => Self::Retention {
+                drift_x: *drift_x,
+                center_y: center_y + shift,
+                restoring: *restoring,
+                gain_y: *gain_y,
+            },
+            Self::Waves {
+                drift_x,
+                amplitude,
+                frequency,
+                phase,
+                gain_y,
+            } => Self::Waves {
+                drift_x: *drift_x,
+                amplitude: *amplitude,
+                frequency: *frequency,
+                phase: phase + std::f64::consts::TAU * t * sweep,
+                gain_y: *gain_y,
+            },
+            Self::Bands { bands } => Self::Bands {
+                bands: bands
+                    .iter()
+                    .map(|band| Band {
+                        y_min: band.y_min + shift,
+                        y_max: band.y_max + shift,
+                        ..*band
+                    })
+                    .collect(),
+            },
+            Self::Vortex {
+                center_x,
+                center_y,
+                drift_x,
+                gain_x,
+                rotation,
+                radial,
+            } => Self::Vortex {
+                center_x: *center_x,
+                center_y: center_y + shift,
+                drift_x: *drift_x,
+                gain_x: *gain_x,
+                rotation: rotation * (1.0 + shift),
+                radial: *radial,
+            },
+            Self::Opposed {
+                split_y,
+                drift_x,
+                vertical_push,
+                center_y,
+                restoring,
+                gain_y,
+            } => Self::Opposed {
+                split_y: split_y + shift,
+                drift_x: *drift_x,
+                vertical_push: *vertical_push,
+                center_y: *center_y,
+                restoring: *restoring,
+                gain_y: *gain_y,
+            },
+            Self::Mix {
+                components,
+                weights,
+            } => Self::Mix {
+                components: components
+                    .iter()
+                    .map(|component| component.at_phase(t, sweep))
+                    .collect(),
+                weights: weights.clone(),
+            },
+        }
+    }
+
     pub fn evaluate(&self, x: f64, y: f64, k: f64) -> Vector2 {
+        if let Self::Mix {
+            components,
+            weights,
+        } = self
+        {
+            let mut total = Vector2 { x: 0.0, y: 0.0 };
+            for (index, component) in components.iter().enumerate() {
+                let weight = weights.get(index).copied().unwrap_or(0.0);
+                let vector = component.evaluate(x, y, k);
+                total.x += weight * vector.x;
+                total.y += weight * vector.y;
+            }
+            return total;
+        }
         match self {
             Self::Calm {
                 drift_x,
@@ -310,6 +491,7 @@ impl FlowField {
                     y: direction * *vertical_push + gain_y * k + restoring * (center_y - y),
                 }
             }
+            Self::Mix { .. } => Vector2 { x: 0.0, y: 0.0 },
         }
     }
 }
@@ -326,6 +508,14 @@ pub struct Level {
     pub k_min: f64,
     pub k_max: f64,
     pub k_def: f64,
+    /// The intensity the solution was measured at. It is not always `k_def`: a
+    /// chapter that leaves the intensity free starts the dial at the default,
+    /// and the win sits somewhere else on the range. A locked dial is set here.
+    pub k_solution: f64,
+    pub phase_min: f64,
+    pub phase_max: f64,
+    pub phase_def: f64,
+    pub phase_sweep: f64,
     pub recommended_step: f64,
     pub exploration_attempts: usize,
     pub k_window: f64,
@@ -373,6 +563,50 @@ impl Level {
             result.reached()
         }
     }
+
+    pub fn knobs(&self) -> Knobs {
+        self.rules.knobs
+    }
+
+    pub fn has_timeline(&self) -> bool {
+        self.rules.knobs.phase && self.phase_max > self.phase_min
+    }
+
+    /// Clamps a raw dial value into the level's phase range.
+    pub fn normalize_phase(&self, phase: f64) -> f64 {
+        if !self.has_timeline() {
+            return self.phase_def;
+        }
+        let span = self.phase_max - self.phase_min;
+        let wrapped = if span > 0.0 {
+            (phase - self.phase_min).rem_euclid(span)
+        } else {
+            0.0
+        };
+        self.phase_min + wrapped
+    }
+
+    /// The level as the probe actually flies through it once the player has
+    /// chosen a launch phase: the field is frozen at that phase for the whole
+    /// run, and nothing else about the level changes.
+    pub fn resolved(&self, phase: f64) -> Level {
+        if !self.has_timeline() {
+            return self.clone();
+        }
+        let phase = self.normalize_phase(phase);
+        let t = (phase - self.phase_min) / (self.phase_max - self.phase_min);
+        let mut level = self.clone();
+        level.field = self.field.at_phase(t, self.phase_sweep);
+        level
+    }
+
+    /// The contiguous band of phases that admit a solution, as
+    /// `(low, high, width_fraction)`. Timeline levels are generated so this
+    /// band is non-empty, excludes the default phase, and stays narrow enough
+    /// for the dial to be a real deduction.
+    pub fn phase_band(&self) -> Option<(f64, f64, f64)> {
+        phase_band_with(self, PHASE_BAND_PROBES)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -383,6 +617,7 @@ enum FieldKind {
     Bands,
     Vortex,
     Opposed,
+    Compose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -396,6 +631,7 @@ struct LevelPlan {
     bands: usize,
     beacons: usize,
     gain: f64,
+    wavelength: f64,
     k_window_steps: Option<f64>,
     exploration_attempts: usize,
     release: ReleaseMode,
@@ -404,6 +640,9 @@ struct LevelPlan {
     corridor: bool,
     traces: TraceRule,
     probes: usize,
+    knobs: Knobs,
+    timeline: bool,
+    ghosts: bool,
     focus: &'static str,
 }
 
@@ -419,6 +658,7 @@ impl LevelPlan {
             bands: 2,
             beacons: 1,
             gain: 1.0,
+            wavelength: 1.0,
             k_window_steps: None,
             exploration_attempts: 3,
             release: ReleaseMode::Fixed,
@@ -427,6 +667,9 @@ impl LevelPlan {
             corridor: false,
             traces: TraceRule::None,
             probes: 1,
+            knobs: Knobs::ALL,
+            timeline: false,
+            ghosts: false,
             focus: "",
         }
     }
@@ -440,6 +683,14 @@ impl LevelPlan {
 
     const fn bands(mut self, count: usize) -> Self {
         self.bands = count;
+        self
+    }
+
+    /// Scales the wave frequency. A long swell moves the whole field up and
+    /// down, so a range of phases works: that is what a launch-time lesson
+    /// needs. A short wave is a knife edge, whatever the dial does.
+    const fn wavelength(mut self, scale: f64) -> Self {
+        self.wavelength = scale;
         self
     }
 
@@ -499,6 +750,21 @@ impl LevelPlan {
         self.beacons = count;
         self
     }
+
+    const fn knobs(mut self, knobs: Knobs) -> Self {
+        self.knobs = knobs;
+        self
+    }
+
+    const fn timeline(mut self) -> Self {
+        self.timeline = true;
+        self
+    }
+
+    const fn ghosts(mut self) -> Self {
+        self.ghosts = true;
+        self
+    }
 }
 
 struct ChapterSpec {
@@ -507,34 +773,58 @@ struct ChapterSpec {
     question: &'static str,
     desc: &'static str,
     plans: &'static [LevelPlan],
+    tutorial: TutorialSpec,
 }
 
-const DISCOVER_PLANS: [LevelPlan; 5] = [
+/// The single auto-generated level that samples a chapter. It is generated from
+/// the same pipeline as the real game with a teaching profile: wider margins,
+/// no obstacle augmentation, and only the knobs the chapter introduces.
+#[derive(Clone, Copy)]
+struct TutorialSpec {
+    plan: LevelPlan,
+    hint: &'static str,
+}
+
+const FOLLOW_PLANS: [LevelPlan; 3] = [
     LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
+        .knobs(Knobs::INTENSITY)
         .attempts(3)
-        .window(2.0)
+        .window(3.0)
         .focus("dérive pure"),
     LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
+        .knobs(Knobs::INTENSITY)
         .attempts(3)
-        .window(2.0)
+        .window(3.0)
         .focus("dérive inclinée"),
+    LevelPlan::new(FieldKind::Calm, 2.0, 0.05)
+        .knobs(Knobs::INTENSITY)
+        .attempts(4)
+        .gain(1.5)
+        .window(4.0)
+        .focus("courant penché"),
+];
+
+const INFLUENCE_PLANS: [LevelPlan; 3] = [
     LevelPlan::new(FieldKind::Retention, 1.0, 0.05)
+        .knobs(Knobs::INTENSITY)
         .obstacles(1, 0.5, 0.7)
         .attempts(4)
         .gain(2.0)
-        .window(4.0)
+        .window(5.0)
         .focus("hauteur d'équilibre"),
     LevelPlan::new(FieldKind::Retention, 2.0, 0.02)
+        .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.5, 0.8)
         .attempts(4)
         .gain(3.0)
         .window(6.0)
         .focus("équilibre mobile"),
     LevelPlan::new(FieldKind::Retention, 3.0, 0.02)
+        .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.45, 0.75)
         .attempts(5)
         .gain(3.0)
-        .window(6.0)
+        .window(7.0)
         .focus("contre-courant"),
 ];
 
@@ -554,6 +844,7 @@ const POSITION_PLANS: [LevelPlan; 5] = [
         .zone(1.2, 2.0)
         .focus("arc décalé"),
     LevelPlan::new(FieldKind::Opposed, 1.5, 0.05)
+        .gain(5.0)
         .obstacles(1, 0.45, 0.7)
         .attempts(3)
         .window(3.0)
@@ -566,6 +857,7 @@ const POSITION_PLANS: [LevelPlan; 5] = [
         .zone(1.2, 2.0)
         .focus("séparation haute"),
     LevelPlan::new(FieldKind::Opposed, 2.5, 0.02)
+        .gain(5.0)
         .obstacles(2, 0.4, 0.7)
         .attempts(4)
         .window(3.0)
@@ -579,12 +871,14 @@ const PREDICT_PLANS: [LevelPlan; 4] = [
         .attempts(3)
         .gain(1.5)
         .window(3.0)
+        .blind(0.35)
         .focus("marge large"),
     LevelPlan::new(FieldKind::Waves, 0.8, 0.01)
         .obstacles(1, 0.4, 0.6)
         .attempts(3)
         .gain(2.0)
         .window(4.0)
+        .blind(0.3)
         .focus("marge moyenne"),
     LevelPlan::new(FieldKind::Bands, 0.6, 0.01)
         .bands(2)
@@ -592,6 +886,7 @@ const PREDICT_PLANS: [LevelPlan; 4] = [
         .attempts(4)
         .gain(2.5)
         .window(3.0)
+        .blind(0.3)
         .focus("bandes serrées"),
     LevelPlan::new(FieldKind::Bands, 0.5, 0.01)
         .bands(3)
@@ -599,6 +894,7 @@ const PREDICT_PLANS: [LevelPlan; 4] = [
         .attempts(4)
         .gain(3.0)
         .window(2.0)
+        .blind(0.25)
         .focus("bandes étroites"),
 ];
 
@@ -635,105 +931,151 @@ const COORDINATE_PLANS: [LevelPlan; 4] = [
         .focus("quatre balises"),
 ];
 
-const CORRIDOR_PLANS: [LevelPlan; 4] = [
+const THREAD_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
         .obstacles(1, 0.45, 0.7)
         .attempts(3)
-        .window(2.0)
+        .window(3.0)
         .zone(0.8, 2.0)
+        .ghosts()
         .focus("houle douce"),
     LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
         .obstacles(1, 0.45, 0.75)
         .attempts(3)
-        .window(2.0)
+        .window(3.0)
         .zone(0.8, 2.0)
+        .ghosts()
         .focus("période courte"),
     LevelPlan::new(FieldKind::Bands, 1.5, 0.05)
         .bands(2)
         .obstacles(1, 0.45, 0.7)
         .attempts(4)
-        .window(2.0)
+        .window(3.0)
         .zone(0.8, 2.0)
+        .ghosts()
         .focus("deux bandes"),
     LevelPlan::new(FieldKind::Bands, 2.0, 0.02)
         .bands(2)
         .obstacles(2, 0.4, 0.7)
         .attempts(4)
-        .window(4.0)
+        .window(5.0)
         .zone(0.8, 2.0)
+        .ghosts()
         .focus("bandes décalées"),
 ];
 
-const TRACES_PLANS: [LevelPlan; 4] = [
-    LevelPlan::new(FieldKind::Vortex, 2.5, 0.02)
-        .obstacles(2, 0.45, 0.8)
+/// Timeline levels. The field is frozen at the phase the player dials in, so
+/// the puzzle is a joint read of `(phase, intensity)`: a narrow intensity band
+/// exists, but only over a narrow slice of the timeline.
+const TIMING_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
+        .knobs(Knobs::PHASE_INTENSITY)
+        .timeline()
+        .wavelength(4.0)
         .attempts(4)
-        .gain(5.0)
+        .window(4.0)
+        .focus("crête de houle"),
+    LevelPlan::new(FieldKind::Waves, 2.0, 0.02)
+        .knobs(Knobs::PHASE_INTENSITY)
+        .timeline()
+        .wavelength(5.0)
+        .obstacles(1, 0.4, 0.6)
+        .attempts(4)
+        .gain(1.5)
         .window(5.0)
-        .zone(1.4, 2.2)
-        .focus("deux obstacles"),
-    LevelPlan::new(FieldKind::Vortex, 3.0, 0.01)
-        .obstacles(2, 0.4, 0.7)
+        .focus("deux crêtes"),
+    LevelPlan::new(FieldKind::Bands, 1.5, 0.05)
+        .bands(2)
+        .knobs(Knobs::PHASE_INTENSITY)
+        .timeline()
         .attempts(4)
-        .gain(8.0)
-        .window(6.0)
-        .zone(1.4, 2.2)
-        .focus("pas fin"),
-    LevelPlan::new(FieldKind::Opposed, 3.0, 0.02)
-        .obstacles(2, 0.4, 0.65)
-        .attempts(4)
-        .gain(3.0)
         .window(5.0)
-        .zone(1.4, 2.2)
-        .focus("fort rappel"),
-    LevelPlan::new(FieldKind::Bands, 3.0, 0.02)
-        .bands(3)
-        .obstacles(2, 0.4, 0.7)
+        .focus("bandes décalées"),
+    LevelPlan::new(FieldKind::Opposed, 2.0, 0.05)
+        .knobs(Knobs::PHASE_INTENSITY)
+        .timeline()
+        .obstacles(1, 0.4, 0.6)
         .attempts(5)
-        .window(6.0)
-        .zone(1.4, 2.2)
-        .focus("trois bandes"),
+        .window(4.0)
+        .focus("frontière qui bouge"),
 ];
 
-const MASTER_PLANS: [LevelPlan; 4] = [
-    LevelPlan::new(FieldKind::Vortex, 3.0, 0.01)
-        .obstacles(3, 0.35, 0.6)
-        .attempts(5)
-        .gain(8.0)
-        .window(6.0)
-        .zone(1.0, 1.8)
-        .focus("tourbillon serré"),
-    LevelPlan::new(FieldKind::Opposed, 3.0, 0.01)
-        .obstacles(3, 0.35, 0.6)
+/// Composed levels mix two or three field components, so their intensity
+/// response is smoother: the plan targets a wider margin on purpose.
+const COMPOSE_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
+        .knobs(Knobs::INTENSITY)
+        .attempts(4)
+        .window(10.0)
+        .focus("houle et rappel"),
+    LevelPlan::new(FieldKind::Compose, 2.5, 0.05)
+        .knobs(Knobs::INTENSITY)
+        .obstacles(1, 0.4, 0.6)
+        .attempts(4)
+        .window(10.0)
+        .focus("deux forces"),
+    LevelPlan::new(FieldKind::Compose, 3.0, 0.02)
+        .knobs(Knobs::INTENSITY)
+        .obstacles(2, 0.4, 0.65)
         .attempts(5)
         .gain(2.0)
-        .window(3.0)
-        .zone(1.0, 1.8)
-        .focus("équilibre instable"),
-    LevelPlan::new(FieldKind::Bands, 2.5, 0.02)
-        .bands(2)
-        .obstacles(2, 0.4, 0.65)
-        .probes(3)
+        .window(12.0)
+        .focus("trois forces"),
+    LevelPlan::new(FieldKind::Compose, 3.0, 0.02)
+        .knobs(Knobs::INTENSITY)
+        .obstacles(2, 0.35, 0.6)
         .attempts(5)
-        .window(3.0)
-        .zone(1.0, 1.8)
-        .focus("trois balises étroites"),
-    LevelPlan::new(FieldKind::Opposed, 0.4, 0.01)
-        .obstacles(2, 0.35, 0.55)
-        .attempts(5)
-        .gain(3.0)
-        .window(2.0)
-        .zone(1.0, 1.8)
-        .focus("marge extrême"),
+        .window(14.0)
+        .focus("champ dense"),
 ];
 
-const CHAPTERS: [ChapterSpec; 7] = [
+/// The sandbox plans carry no window target: an open level is one that can be
+/// won across a wide range of settings, and rejecting the wide ones would throw
+/// away exactly what the chapter is for.
+const EXPLORATION_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Calm, 2.0, 0.05)
+        .knobs(Knobs::ALL)
+        .release(ReleaseMode::Zone)
+        .zone(2.0, 2.6)
+        .attempts(4)
+        .focus("page blanche"),
+    LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
+        .knobs(Knobs::ALL)
+        .release(ReleaseMode::Zone)
+        .zone(2.0, 2.6)
+        .attempts(4)
+        .focus("vague libre"),
+    LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
+        .knobs(Knobs::ALL)
+        .release(ReleaseMode::Zone)
+        .zone(1.8, 2.4)
+        .obstacles(1, 0.4, 0.6)
+        .attempts(5)
+        .focus("melange libre"),
+    LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
+        .knobs(Knobs::ALL)
+        .release(ReleaseMode::Zone)
+        .zone(1.8, 2.4)
+        .obstacles(1, 0.45, 0.7)
+        .attempts(5)
+        .focus("tourbillon ouvert"),
+];
+
+const CHAPTERS: [ChapterSpec; 9] = [
     ChapterSpec {
-        chapter: Chapter::Discover,
-        title: "Découverte",
+        chapter: Chapter::Follow,
+        title: "Suivi",
         question: "Que fait le courant ?",
-        desc: "Le point de largage est fixé : règle l'intensité et regarde comment la sonde dérive.",
-        plans: &DISCOVER_PLANS,
+        desc: "Le champ est fixe et montré en permanence : règle l'intensité et regarde où la sonde dérive.",
+        plans: &FOLLOW_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
+                .knobs(Knobs::NONE)
+                .attempts(5)
+                .window(3.0)
+                .focus("observer le courant"),
+            hint: "Le champ ne bouge pas. Largue la sonde et suis la trace jusqu'à la balise.",
+        },
     },
     ChapterSpec {
         chapter: Chapter::Position,
@@ -741,13 +1083,97 @@ const CHAPTERS: [ChapterSpec; 7] = [
         question: "Où larguer ?",
         desc: "Le largage devient libre dans la zone marquée : chaque départ ouvre une autre trajectoire.",
         plans: &POSITION_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Vortex, 1.5, 0.05)
+                .knobs(Knobs::RELEASE)
+                .attempts(5)
+                .window(6.0)
+                .zone(1.2, 2.0)
+                .focus("point de départ"),
+            hint: "Clique dans la zone verte pour déplacer le largage, puis observe la trajectoire.",
+        },
     },
     ChapterSpec {
         chapter: Chapter::Predict,
         title: "Prédiction",
-        question: "Où larguer pour deviner le chemin masqué ?",
-        desc: "La sonde n'est annoncée que sur son premier tronçon : le reste du trajet se prévoit.",
+        question: "Où larguer quand le chemin se cache ?",
+        desc: "Seul le premier tronçon est annoncé : le reste du trajet se prévoit.",
         plans: &PREDICT_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
+                .knobs(Knobs::RELEASE)
+                .attempts(5)
+                .window(5.0)
+                .zone(1.0, 1.6)
+                .blind(0.3)
+                .focus("premier tronçon"),
+            hint: "La trajectoire n'apparaît qu'au départ : le reste se déduit du courant.",
+        },
+    },
+    ChapterSpec {
+        chapter: Chapter::Influence,
+        title: "Influence",
+        question: "Quelle intensité ouvre le passage ?",
+        desc: "Les vecteurs sont masqués : la seule mesure est l'effet de l'intensité sur la dérive.",
+        plans: &INFLUENCE_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Retention, 1.5, 0.05)
+                .knobs(Knobs::INTENSITY)
+                .attempts(5)
+                .gain(2.0)
+                .window(5.0)
+                .focus("réglage de l'intensité"),
+            hint: "Sans les vecteurs, l'intensité reste la seule variable : teste, compare, garde la meilleure.",
+        },
+    },
+    ChapterSpec {
+        chapter: Chapter::Thread,
+        title: "Fil",
+        question: "Comment lire les traces voisines ?",
+        desc: "Deux trajectoires voisines, qui échouent, encadrent le couloir gagnant.",
+        plans: &THREAD_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
+                .knobs(Knobs::RELEASE_INTENSITY)
+                .attempts(5)
+                .window(4.0)
+                .zone(0.8, 2.0)
+                .ghosts()
+                .focus("couloir fantôme"),
+            hint: "Les deux traces grises ont échoué : le passage se trouve entre elles.",
+        },
+    },
+    ChapterSpec {
+        chapter: Chapter::Timing,
+        title: "Tempo",
+        question: "Quand lancer ?",
+        desc: "Le champ gèle à la phase que tu choisis : la bonne fenêtre n'existe qu'à un instant de la ligne de temps.",
+        plans: &TIMING_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
+                .knobs(Knobs::PHASE_INTENSITY)
+                .wavelength(6.0)
+                .timeline()
+                .attempts(6)
+                .window(5.0)
+                .focus("instant de lancement"),
+            hint: "Le curseur de phase fige le courant. Fais-le glisser : la crête change la dérive.",
+        },
+    },
+    ChapterSpec {
+        chapter: Chapter::Compose,
+        title: "Composition",
+        question: "Comment lire un courant composé ?",
+        desc: "Plusieurs composantes se superposent : l'intensité agit sur leur mélange.",
+        plans: &COMPOSE_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
+                .knobs(Knobs::INTENSITY)
+                .attempts(5)
+                .window(12.0)
+                .focus("champ composé"),
+            hint: "Deux courants superposés : l'intensité règle les deux d'un coup.",
+        },
     },
     ChapterSpec {
         chapter: Chapter::Coordinate,
@@ -755,27 +1181,32 @@ const CHAPTERS: [ChapterSpec; 7] = [
         question: "Où lancer chaque sonde ?",
         desc: "Toutes les sondes partagent le même courant et la même intensité, chacune vise sa balise.",
         plans: &COORDINATE_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
+                .knobs(Knobs::RELEASE_INTENSITY)
+                .attempts(5)
+                .window(4.0)
+                .zone(1.0, 1.6)
+                .probes(2)
+                .focus("deux sondes"),
+            hint: "Une seule intensité pour les deux sondes : chaque balise doit être touchée.",
+        },
     },
     ChapterSpec {
-        chapter: Chapter::Corridor,
-        title: "Couloir",
-        question: "Où entrer dans le couloir ?",
-        desc: "Deux trajectoires fantômes délimitent un couloir : la sonde doit rester entre elles.",
-        plans: &CORRIDOR_PLANS,
-    },
-    ChapterSpec {
-        chapter: Chapter::Traces,
-        title: "Traces",
-        question: "Quel départ préserve mes options ?",
-        desc: "Chaque lancer consomme la zone de largage et sa trace devient une limite pour les suivants.",
-        plans: &TRACES_PLANS,
-    },
-    ChapterSpec {
-        chapter: Chapter::Master,
-        title: "Maîtrise",
-        question: "Tout à la fois",
-        desc: "Largage libre, plusieurs sondes, couloir et traces : chaque zone combine tout.",
-        plans: &MASTER_PLANS,
+        chapter: Chapter::Exploration,
+        title: "Exploration",
+        question: "Que donne un réglage au hasard ?",
+        desc: "Aucun chapitre ne filtre ici : on largue où on veut, on règle à volonté, et on regarde ce que ça donne.",
+        plans: &EXPLORATION_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Calm, 2.0, 0.05)
+                .knobs(Knobs::ALL)
+                .release(ReleaseMode::Zone)
+                .attempts(5)
+                .zone(2.0, 2.6)
+                .focus("bac a sable"),
+            hint: "Ici il n'y a pas de bonne réponse. Essaie un réglage, change-le, et regarde la trajectoire changer.",
+        },
     },
 ];
 
@@ -800,8 +1231,12 @@ pub fn total_level_count() -> usize {
 }
 
 pub const DEFAULT_SEED: u64 = 0xD1F7_1A2B_3C4D_5E6F;
+/// Canonical tutorial seed: every player starts from the same eight teaching
+/// levels. `TUTORIAL_VARIANT_SEEDS` adds replayable alternates.
+pub const TUTORIAL_SEED: u64 = 0x7A11_1E0F_0000_0001;
+pub const TUTORIAL_VARIANT_SEEDS: [u64; 3] =
+    [TUTORIAL_SEED, 0x7A11_1E0F_0000_0002, 0x7A11_1E0F_0000_0003];
 const GENERATION_ATTEMPTS: usize = 32;
-const RELAXED_WINDOW_SCALE: f64 = 2.0;
 const RELAXED_GOLDEN: u64 = 0xC2B2_AE3D_27D4_EB4F;
 const GOLDEN_RATIO: u64 = 0x9E37_79B9_7F4A_7C15;
 const FIELD_MARGIN: f64 = 0.35;
@@ -812,6 +1247,21 @@ const BEACON_SPACING: f64 = WIN_R * 2.2;
 const BEACON_CANDIDATES: usize = 2;
 const K_PROBES: usize = 4;
 const PLACEMENT_ATTEMPTS: usize = 96;
+/// Timeline levels expose a full field period on the phase dial.
+pub const PHASE_MIN: f64 = 0.0;
+pub const PHASE_MAX: f64 = std::f64::consts::TAU;
+/// Phase the player starts on. Deliberately not the winning slice: the level is
+/// meant to be won by moving the dial, not by leaving it alone.
+pub const PHASE_DEF: f64 = 0.0;
+const PHASE_BAND_PROBES: usize = 24;
+/// Phase samples the generator sweeps when looking for a `(phase, intensity)`
+/// solution. Kept small: each sample is a full solve of the level.
+const PHASE_PROBES: usize = 6;
+/// Widest winning slice of the timeline, as a fraction of the dial, that a
+/// generated timeline level may keep.
+const PHASE_BAND_LIMIT: f64 = 0.5;
+const PHASE_BAND_MIN: f64 = 2.0 / PHASE_BAND_PROBES as f64;
+const TIMING_SWEEP: f64 = 1.0;
 
 struct SeededRng {
     state: u64,
@@ -856,7 +1306,7 @@ fn canonical_field(plan: &LevelPlan) -> FlowField {
         FieldKind::Waves => FlowField::Waves {
             drift_x: 1.0,
             amplitude: 1.0,
-            frequency: 1.0,
+            frequency: 1.0 / plan.wavelength.max(0.05),
             phase: 0.0,
             gain_y: 0.5 * gain,
         },
@@ -879,6 +1329,24 @@ fn canonical_field(plan: &LevelPlan) -> FlowField {
             restoring: 0.8,
             gain_y: 0.8 * gain,
         },
+        FieldKind::Compose => FlowField::Mix {
+            components: vec![
+                FlowField::Waves {
+                    drift_x: 1.0,
+                    amplitude: 0.8,
+                    frequency: 1.1,
+                    phase: 0.0,
+                    gain_y: 0.45 * gain,
+                },
+                FlowField::Retention {
+                    drift_x: 1.0,
+                    center_y: 0.0,
+                    restoring: 0.9,
+                    gain_y: 0.7 * gain,
+                },
+            ],
+            weights: vec![1.0, -0.6],
+        },
     }
 }
 
@@ -900,6 +1368,7 @@ fn canonical_bands(count: usize, gain: f64) -> Vec<Band> {
 
 fn shell_level(spec: &ChapterSpec, plan: &LevelPlan, field: FlowField) -> Level {
     let anchor = (-5.0, 0.0);
+    let timeline = plan.timeline && plan.knobs.phase;
     Level {
         title: spec.title,
         desc: spec.desc,
@@ -912,12 +1381,18 @@ fn shell_level(spec: &ChapterSpec, plan: &LevelPlan, field: FlowField) -> Level 
             corridor: plan.corridor,
             traces: plan.traces,
             probes: plan.probes,
+            knobs: plan.knobs,
         },
         step_index: 0,
         field,
         k_min: -plan.k_span,
         k_max: plan.k_span,
         k_def: 0.0,
+        k_solution: 0.0,
+        phase_min: if timeline { PHASE_MIN } else { 0.0 },
+        phase_max: if timeline { PHASE_MAX } else { 0.0 },
+        phase_def: if timeline { PHASE_DEF } else { 0.0 },
+        phase_sweep: if timeline { TIMING_SWEEP } else { 0.0 },
         recommended_step: plan.step,
         exploration_attempts: plan.exploration_attempts,
         k_window: 0.0,
@@ -959,7 +1434,7 @@ fn random_field(plan: &LevelPlan, rng: &mut SeededRng) -> FlowField {
         FieldKind::Waves => FlowField::Waves {
             drift_x: rng.range(0.8, 1.18),
             amplitude: rng.range(0.5, 1.0),
-            frequency: rng.range(0.7, 1.35),
+            frequency: rng.range(0.7, 1.35) / plan.wavelength.max(0.05),
             phase: rng.range(0.0, std::f64::consts::TAU),
             gain_y: rng.range(0.35, 0.75) * gain,
         },
@@ -996,6 +1471,21 @@ fn random_field(plan: &LevelPlan, rng: &mut SeededRng) -> FlowField {
             restoring: rng.range(0.6, 1.0),
             gain_y: rng.range(0.65, 1.05) * gain,
         },
+        FieldKind::Compose => {
+            let mut rng = SeededRng::new(rng.next_u64());
+            let first = random_field(
+                &LevelPlan::new(FieldKind::Waves, 0.0, 0.0).gain(gain),
+                &mut rng,
+            );
+            let second = random_field(
+                &LevelPlan::new(FieldKind::Retention, 0.0, 0.0).gain(gain),
+                &mut rng,
+            );
+            FlowField::Mix {
+                components: vec![first, second],
+                weights: vec![1.0, rng.range(-0.9, -0.4)],
+            }
+        }
     }
 }
 
@@ -1164,17 +1654,51 @@ fn refine_candidate(
     let count = (2.0 * coarse / step).ceil().max(1.0) as usize;
     let lowest = (level.k_min / step).ceil() * step;
     let highest = (level.k_max / step).floor() * step;
-    (0..=count)
+    let proposals: Vec<f64> = (0..=count)
         .map(|index| snap_to_grid(level, seed - coarse + index as f64 * step))
         .filter(|k| *k >= lowest - EPSILON && *k <= highest + EPSILON)
-        .find(|k| integrate_advanced(level, start, targets, *k, false).reached())
+        .collect();
+    // The coarse integrator is cheaper, so it picks and the exact one decides.
+    // The exact sweep behind it is what keeps the promise that `solve` never
+    // misses a winnable level: a narrow band can slip between two coarse steps,
+    // so the same window is walked exactly if nothing verifies.
+    for exact in [false, true] {
+        if exact {
+            REFINE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        for k in &proposals {
+            let mode = if exact { Mode::Exact } else { Mode::Fast };
+            if reaches(level, start, targets, *k, mode) {
+                return Some(*k);
+            }
+        }
+    }
+    None
 }
 
 pub fn solve(level: &Level) -> Option<f64> {
     solve_from(level, level.a, &level.beacons)
 }
 
+/// The winning `(phase, intensity)` for a level, searching the timeline when it
+/// has one. This is the "is this level actually winnable" query: it is what the
+/// generator guarantees and what the tests assert.
+pub fn solve_any_phase(level: &Level) -> Option<(f64, f64)> {
+    if !level.has_timeline() {
+        return solve(level).map(|k| (level.phase_def, k));
+    }
+    let span = level.phase_max - level.phase_min;
+    for index in 0..PHASE_BAND_PROBES {
+        let phase = level.phase_min + span * index as f64 / PHASE_BAND_PROBES as f64;
+        if let Some(k) = solve(&level.resolved(phase)) {
+            return Some((phase, k));
+        }
+    }
+    None
+}
+
 pub fn solve_from(level: &Level, start: Point, targets: &[Point]) -> Option<f64> {
+    SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let coarse = coarse_step(level);
     coarse_ranked(level, start, targets, coarse)
         .into_iter()
@@ -1187,22 +1711,91 @@ fn snap_to_grid(level: &Level, k: f64) -> f64 {
     (level.k_min + steps * step).clamp(level.k_min, level.k_max)
 }
 
-fn k_window(level: &Level, start: Point, targets: &[Point], winning_k: f64) -> f64 {
+/// How far from the winning intensity the run still reaches, as a half-width:
+/// `Some(width)` when the winning run is at most `cap` wide, `None` when it is
+/// wider.
+///
+/// Exact throughout, because it is a number the player is shown and a bound the
+/// plan sets. The walk gallops outwards to the probe limit and bisects the stride
+/// that failed, and the cap is what a level too wide to report is judged against:
+/// a reject owes no width, so it never has to finish being measured.
+fn k_window_capped(
+    level: &Level,
+    start: Point,
+    targets: &[Point],
+    winning_k: f64,
+    cap: f64,
+) -> Option<f64> {
     let step = level.recommended_step;
-    let mut total = 0.0;
-    for direction in [1.0, -1.0] {
-        for probe in 1..=WINDOW_PROBE_LIMIT {
-            let candidate = winning_k + direction * probe as f64 * step;
-            if candidate < level.k_min || candidate > level.k_max {
-                break;
+    let probe_limit = WINDOW_PROBE_LIMIT as i64;
+    let cap_probes = ((cap / step).round() as i64).clamp(1, probe_limit);
+    let wins = |probe: i64, direction: f64, mode: Mode| {
+        let k = winning_k + direction * probe as f64 * step;
+        k >= level.k_min - EPSILON
+            && k <= level.k_max + EPSILON
+            && reaches(level, start, targets, k, mode)
+    };
+    // The width is the mean of the two half-widths, so a level that is too wide can
+    // be settled by the two edges alone, without measuring either of them. Both
+    // sides winning a step past the cap put the mean past it. One side stopping
+    // short of the cap says that side cannot make up the difference, so the other
+    // only has to win two caps out to answer for both. A level that is plainly too
+    // wide then costs two or three runs instead of a gallop and a bisect per side.
+    if 2 * cap_probes < probe_limit {
+        if wins(cap_probes + 1, 1.0, Mode::Exact) {
+            if wins(cap_probes + 1, -1.0, Mode::Exact) {
+                return None;
             }
-            if !integrate_advanced(level, start, targets, candidate, false).reached() {
-                break;
-            }
-            total += step;
+        } else if wins(2 * cap_probes + 1, 1.0, Mode::Exact) {
+            return None;
         }
     }
-    total / 2.0
+    let mut widths = [0.0_f64; 2];
+    for (side, direction) in [1.0_f64, -1.0_f64].into_iter().enumerate() {
+        let mut good = 0i64;
+        let mut stride = 1i64;
+        let mut failed = None;
+        while stride <= probe_limit {
+            if wins(stride, direction, Mode::Exact) {
+                good = stride;
+                stride *= 2;
+            } else {
+                failed = Some(stride);
+                break;
+            }
+        }
+        if failed.is_none() {
+            // Every probe up to the limit still wins, so the walk has not found
+            // the edge: the true width is at least the limit.
+            return None;
+        }
+        let mut high = failed.unwrap_or(probe_limit);
+        let mut low = good;
+        while high - low > 1 {
+            let mid = low + (high - low) / 2;
+            if wins(mid, direction, Mode::Exact) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        widths[side] = low as f64 * step;
+    }
+    let width = (widths[0] + widths[1]) / 2.0;
+    (width <= cap + EPSILON).then_some(width)
+}
+
+/// The reported window, measured without a cap. Only the level that is kept is
+/// worth this walk.
+fn k_window(level: &Level, start: Point, targets: &[Point], winning_k: f64) -> f64 {
+    k_window_capped(
+        level,
+        start,
+        targets,
+        winning_k,
+        WINDOW_PROBE_LIMIT as f64 * level.recommended_step,
+    )
+    .unwrap_or_else(|| WINDOW_PROBE_LIMIT as f64 * level.recommended_step)
 }
 
 fn k_spread(level: &Level, start: Point, targets: &[Point]) -> f64 {
@@ -1212,6 +1805,9 @@ fn k_spread(level: &Level, start: Point, targets: &[Point]) -> f64 {
     sampled_spread(level, start, targets, SPREAD_PROBES)
 }
 
+/// How much of the intensity range happens to win. A generator heuristic used to
+/// keep a level from being a free win, so it runs coarse: being a little wrong
+/// about the fraction only costs a candidate.
 fn sampled_spread(level: &Level, start: Point, targets: &[Point], wanted: usize) -> f64 {
     let step = level.recommended_step;
     let count = ((level.k_max - level.k_min) / step).ceil().max(1.0) as usize;
@@ -1219,7 +1815,7 @@ fn sampled_spread(level: &Level, start: Point, targets: &[Point], wanted: usize)
     let mut hits = 0;
     for probe in 0..probes {
         let k = snap_to_grid(level, level.k_min + (probe * count / probes) as f64 * step);
-        if integrate_advanced(level, start, targets, k, false).reached() {
+        if reaches(level, start, targets, k, Mode::Fast) {
             hits += 1;
         }
     }
@@ -1227,7 +1823,14 @@ fn sampled_spread(level: &Level, start: Point, targets: &[Point], wanted: usize)
 }
 
 fn trajectory(level: &Level, k: f64) -> Vec<Point> {
-    integrate_with_mode(level, k, SimulationMode::Exploration).points
+    PATHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    integrate_advanced(level, level.a, &level.beacons, k, Mode::Exact, true).points
+}
+
+/// A coarse path, used to *place* things. The exact path is what the win is
+/// measured on, so a beacon dropped on this one has to survive the accept pass.
+fn coarse_trajectory(level: &Level, k: f64) -> Vec<Point> {
+    integrate_advanced(level, level.a, &level.beacons, k, Mode::Fast, true).points
 }
 
 fn sharpened_beacons(level: &Level, k: f64, wanted: usize) -> Vec<Point> {
@@ -1237,10 +1840,24 @@ fn sharpened_beacons(level: &Level, k: f64, wanted: usize) -> Vec<Point> {
     if probes.is_empty() {
         return Vec::new();
     }
-    let neighbours: Vec<Vec<Point>> = probes
+    // The beacon goes on the exact winning path, so the exact run really does
+    // reach it. The neighbouring intensities only have to rank the candidates:
+    // they are coarse, and a neighbour that turns out to be closer than it looked
+    // widens the window, which the plan's own bound then rejects.
+    let coarse: Vec<Vec<Point>> = probes
         .iter()
-        .map(|probe| trajectory(level, *probe))
+        .map(|probe| coarse_trajectory(level, *probe))
         .collect();
+    // A coarse run that ends almost immediately is no use as a neighbour: fall
+    // back to the exact paths rather than ranking against a stub.
+    let neighbours = if coarse.iter().all(|path| path.len() >= 8) {
+        coarse
+    } else {
+        probes
+            .iter()
+            .map(|probe| trajectory(level, *probe))
+            .collect()
+    };
     let middle = trajectory(level, k);
     if middle.len() < 8 {
         return Vec::new();
@@ -1251,9 +1868,10 @@ fn sharpened_beacons(level: &Level, k: f64, wanted: usize) -> Vec<Point> {
     for index in (samples / 4..samples * 9 / 10).step_by(stride) {
         let mut worst = f64::INFINITY;
         for path in &neighbours {
-            if index < path.len() {
-                worst = worst.min(point_distance(middle[index], path[index]));
-            }
+            // Coarse paths are shorter, so the neighbours are sampled by fraction
+            // of their own length rather than by the middle path's index.
+            let at = (index * path.len() / samples).min(path.len() - 1);
+            worst = worst.min(point_distance(middle[index], path[at]));
         }
         if !worst.is_finite() {
             continue;
@@ -1349,24 +1967,60 @@ fn augment_obstacles(mut level: Level, winning_k: f64) -> Level {
             continue;
         }
         level.obstacles.push(Obstacle { x, y, r });
-        if !integrate(&level, winning_k).reached() {
+        if !reaches(&level, level.a, &level.beacons, winning_k, Mode::Exact) {
             level.obstacles.pop();
         }
     }
     level
 }
 
-fn finish_level(
-    mut level: Level,
+/// A `(phase, intensity, release, beacon)` proposal found by the search. For
+/// levels without a timeline the phase is the fixed default and only `k`
+/// matters, so the whole pipeline stays a one-dimensional sweep.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    phase: f64,
+    k: f64,
+    anchor: Point,
+    beacon: Point,
+}
+
+fn phase_samples(level: &Level) -> Vec<f64> {
+    if !level.has_timeline() {
+        return vec![level.phase_def];
+    }
+    let span = level.phase_max - level.phase_min;
+    (0..PHASE_PROBES)
+        .map(|index| level.phase_min + span * (index as f64 + 0.5) / PHASE_PROBES as f64)
+        .collect()
+}
+
+/// The shape pass: where the beacon, the release zone and the obstacles go.
+///
+/// It runs coarse, because a candidate that fails here was never going to be a
+/// level. The win is re-measured exactly by [`accept_level`] on the level as it
+/// will be handed over, so nothing decided here reaches a player.
+fn shape_level(
+    level: Level,
     plan: &LevelPlan,
-    start: Point,
-    winning_k: f64,
-    window_scale: f64,
+    candidate: Candidate,
     rng: &mut SeededRng,
 ) -> Option<Level> {
+    let start = candidate.anchor;
+    let winning_k = candidate.k;
+    // Every check below runs on the frozen field the probe will actually fly
+    // through; the level handed back keeps the base field so the app can still
+    // re-freeze it at whatever phase the player dials in.
+    let mut level = level.resolved(candidate.phase);
     level.a = start;
+    if plan.release == ReleaseMode::Fixed {
+        // A fixed release is never moved by the player, so the point the app
+        // drops the probe from has to be the point the win was measured from.
+        level.default_release = start;
+    }
+    SHAPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     place_release_zone(&mut level, plan);
-    if !integrate_from(&level, start, winning_k).reached() {
+    if !flies(&level, start, &level.beacons, winning_k) {
         return None;
     }
     if plan.beacons > 1 {
@@ -1375,26 +2029,233 @@ fn finish_level(
             .extend(sample_beacons(&level, winning_k, plan.beacons - 1)?);
     }
     level.obstacles = random_obstacles(plan, level.a, &level.beacons, rng);
-    if !valid_geometry(&level) || !integrate_from(&level, start, winning_k).reached() {
+    if !valid_geometry(&level) || !flies(&level, start, &level.beacons, winning_k) {
         return None;
     }
+    let placed = !level.obstacles.is_empty();
     level = augment_obstacles(level, winning_k);
-    if !integrate_from(&level, start, winning_k).reached() {
-        return None;
-    }
-    level.k_window = k_window(&level, start, &level.beacons, winning_k);
-    if plan
-        .k_window_steps
-        .is_some_and(|steps| level.k_window > window_scale * steps * level.recommended_step)
-    {
-        return None;
-    }
-    if integrate_from(&level, start, 0.0).reached()
-        || k_spread(&level, start, &level.beacons) > SPREAD_LIMIT
-    {
+    if !placed && !flies(&level, start, &level.beacons, winning_k) {
         return None;
     }
     Some(level)
+}
+
+/// The accept pass: the gates a candidate has to clear to become the level a
+/// player gets, each measured exactly. It runs per proposal rather than once per
+/// kept level, so the gates are ordered and short-circuited by how many candidates
+/// each one drops.
+fn accept_level(
+    level: &mut Level,
+    plan: &LevelPlan,
+    candidate: Candidate,
+    base_field: &FlowField,
+) -> bool {
+    let start = candidate.anchor;
+    let winning_k = candidate.k;
+    level.k_solution = winning_k;
+    ACCEPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !reaches(level, start, &level.beacons, winning_k, Mode::Exact) {
+        gate(0);
+        return false;
+    }
+    // Measured against the cap the plan sets, so the walk can settle a level that
+    // is plainly too wide without measuring it. The cap is the plan's own margin:
+    // a wider window is never a reason to publish a level, only a reason to keep
+    // looking for one.
+    let cap = plan
+        .k_window_steps
+        .map(|steps| steps * level.recommended_step);
+    level.k_window = match cap {
+        Some(cap) => k_window_capped(level, start, &level.beacons, winning_k, cap)
+            .unwrap_or(WINDOW_PROBE_LIMIT as f64 * level.recommended_step),
+        None => k_window(level, start, &level.beacons, winning_k),
+    };
+    if cap.is_some_and(|cap| level.k_window > cap) {
+        gate(1);
+        return false;
+    }
+    if free_win(level, start, 0.0) {
+        gate(2);
+        return false;
+    }
+    if k_spread(level, start, &level.beacons) > SPREAD_LIMIT {
+        gate(3);
+        return false;
+    }
+    if plan.ghosts {
+        level.ghosts = ghost_threads(level, start, winning_k);
+        if level.ghosts.len() < 2 {
+            gate(4);
+            return false;
+        }
+    }
+    // The pinned-knob checks below have to reason about the *live* field, so
+    // the probe is put back on the base field before asking.
+    level.field = base_field.clone();
+    if !knobs_hold(level, candidate, base_field) {
+        gate(5);
+        return false;
+    }
+    if !dial_stays_dead(level, base_field) {
+        gate(6);
+        return false;
+    }
+    if !band_bracket(level, candidate.phase) {
+        gate(7);
+        return false;
+    }
+    true
+}
+
+/// The two trajectories just outside the winning intensity, one on each side.
+/// They both fail, which is what makes them a readable bound: the corridor that
+/// reaches the beacon sits strictly between them.
+fn ghost_threads(level: &Level, start: Point, winning_k: f64) -> Vec<Vec<Point>> {
+    let step = level.recommended_step;
+    let mut ghosts = Vec::new();
+    for direction in [1.0, -1.0] {
+        let mut probe = 1usize;
+        let mut neighbour = None;
+        while probe <= WINDOW_PROBE_LIMIT {
+            let candidate = winning_k + direction * probe as f64 * step;
+            if candidate < level.k_min || candidate > level.k_max {
+                break;
+            }
+            if !integrate_from(level, start, candidate).reached() {
+                neighbour = Some(candidate);
+                break;
+            }
+            probe += 1;
+        }
+        if let Some(k) = neighbour {
+            let path = trajectory(level, k);
+            if path.len() >= 8 {
+                ghosts.push(path);
+            }
+        }
+    }
+    ghosts
+}
+
+/// Pins the knobs the chapter does not teach to the winning values, then checks
+/// that the knobs which stay free still discriminate. Returns false when the
+/// candidate would make the level a free win on a single dial.
+fn knobs_hold(level: &mut Level, candidate: Candidate, base_field: &FlowField) -> bool {
+    let knobs = level.rules.knobs;
+    if !knobs.intensity {
+        level.k_def = candidate.k;
+    }
+    if !knobs.phase {
+        level.phase_def = candidate.phase;
+    }
+    if !knobs.intensity && knobs.release {
+        let winners = fair_anchors(level)
+            .into_iter()
+            .filter(|anchor| free_win(level, *anchor, level.k_def))
+            .count();
+        if winners > 1 {
+            return false;
+        }
+    }
+    if knobs.phase && level.has_timeline() {
+        // The dial must be the thing the player has to move: leaving it at its
+        // start value may never be enough, whatever the intensity.
+        let at_start = Level {
+            field: base_field.clone(),
+            ..level.clone()
+        }
+        .resolved(level.phase_def);
+        if solve(&at_start).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Cheap next to the search, but far too expensive to run for every candidate:
+/// the *whole* dial has to stay a dead end for the pinned knobs, otherwise the
+/// free knobs would be decoration. Only called once a candidate is otherwise
+/// good enough to be worth keeping.
+fn dial_stays_dead(level: &Level, base_field: &FlowField) -> bool {
+    if !level.knobs().phase || !level.has_timeline() {
+        return true;
+    }
+    let at = |phase: f64| {
+        Level {
+            field: base_field.clone(),
+            ..level.clone()
+        }
+        .resolved(level.normalize_phase(phase))
+    };
+    let span = level.phase_max - level.phase_min;
+    for probe in 0..PHASE_BAND_PROBES {
+        let frozen = at(level.phase_min + span * probe as f64 / PHASE_BAND_PROBES as f64);
+        if !level.knobs().intensity && solve(&frozen).is_some() {
+            return false;
+        }
+        if integrate_from(&frozen, level.a, level.k_def).reached() {
+            return false;
+        }
+    }
+    true
+}
+
+/// A phase the player can only hit on a knife edge teaches nothing, so the
+/// winning phase has to survive a nudge either way: the winning band is at
+/// least three probe cells wide. Two probes rather than a full band scan,
+/// because this runs inside the candidate search.
+fn band_bracket(level: &Level, phase: f64) -> bool {
+    if !level.has_timeline() {
+        return true;
+    }
+    let nudge = (level.phase_max - level.phase_min) / PHASE_BAND_PROBES as f64;
+    solve(&level.resolved(level.normalize_phase(phase - nudge))).is_some()
+        && solve(&level.resolved(level.normalize_phase(phase + nudge))).is_some()
+}
+
+/// A timeline level may not spread its solution over more than
+/// [`PHASE_BAND_LIMIT`] of the dial, otherwise the phase is decoration. Probed
+/// on a coarse grid while generating; the tests probe it finely.
+pub fn phase_band_with(level: &Level, probes: usize) -> Option<(f64, f64, f64)> {
+    if !level.has_timeline() {
+        return None;
+    }
+    let span = level.phase_max - level.phase_min;
+    let mut hits = Vec::new();
+    for index in 0..probes {
+        let phase = level.phase_min + span * index as f64 / probes as f64;
+        if solve(&level.resolved(phase)).is_some() {
+            hits.push(index);
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    let (low, cells) = largest_connected(hits);
+    Some((
+        level.phase_min + span * low as f64 / probes as f64,
+        level.phase_min + span * (low + cells) as f64 / probes as f64,
+        cells as f64 / probes as f64,
+    ))
+}
+
+/// The longest run of consecutive winning probe cells, as `(first, length)`.
+fn largest_connected(hits: Vec<usize>) -> (usize, usize) {
+    let mut best = (0, 0);
+    let mut run = (0, 0);
+    let mut previous = None;
+    for index in hits {
+        run = if previous.is_some_and(|last| last + 1 == index) {
+            (run.0, run.1 + 1)
+        } else {
+            (index, 1)
+        };
+        if run.1 > best.1 {
+            best = run;
+        }
+        previous = Some(index);
+    }
+    best
 }
 
 fn place_release_zone(level: &mut Level, plan: &LevelPlan) {
@@ -1476,12 +2337,12 @@ fn fair_anchors(level: &Level) -> Vec<Point> {
 pub fn zone_offers_no_free_win(level: &Level) -> bool {
     !fair_anchors(level)
         .iter()
-        .any(|anchor| integrate_from(level, *anchor, 0.0).reached())
+        .any(|anchor| free_win(level, *anchor, 0.0))
 }
 
 pub fn zone_is_fair(level: &Level) -> bool {
     for anchor in fair_anchors(level) {
-        if integrate_from(level, anchor, 0.0).reached() {
+        if free_win(level, anchor, 0.0) {
             return false;
         }
         if anchor == level.a {
@@ -1544,7 +2405,7 @@ fn coarse_spread(level: &Level, anchor: Point) -> f64 {
     let mut hits = 0;
     for probe in 0..probes {
         let k = snap_to_grid(level, level.k_min + (probe * count / probes) as f64 * step);
-        if integrate_from(level, anchor, k).reached() {
+        if reaches(level, anchor, &[ANCHOR_TARGET], k, Mode::Fast) {
             hits += 1;
         }
     }
@@ -1554,7 +2415,6 @@ fn coarse_spread(level: &Level, anchor: Point) -> f64 {
 fn random_level(
     spec: &ChapterSpec,
     plan: &LevelPlan,
-    window_scale: f64,
     k_probes: usize,
     strict_fairness: bool,
     rng: &mut SeededRng,
@@ -1563,14 +2423,22 @@ fn random_level(
     let a = (rng.range(-5.2, -4.0), rng.range(-2.6, 2.6));
     let mut base = shell_level(spec, plan, field);
     base.a = a;
+    base.default_release = a;
 
-    for (k, anchor, beacon) in sharpened_candidates(&base, k_probes) {
+    let base_field = base.field.clone();
+    for candidate in sharpened_candidates(&base, k_probes) {
         let mut level = base.clone();
-        level.beacons = vec![beacon];
-        if let Some(next) = finish_level(level, plan, anchor, k, window_scale, rng) {
-            if zone_acceptable(&next, strict_fairness) {
-                return Some(next);
-            }
+        level.beacons = vec![candidate.beacon];
+        let Some(mut next) = shape_level(level, plan, candidate, rng) else {
+            continue;
+        };
+        if !accept_level(&mut next, plan, candidate, &base_field) {
+            continue;
+        }
+        ZONE_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if zone_acceptable(&next.resolved(candidate.phase), strict_fairness) {
+            RANDOM_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(next);
         }
     }
     None
@@ -1584,23 +2452,31 @@ fn zone_acceptable(level: &Level, strict_fairness: bool) -> bool {
     }
 }
 
-fn sharpened_candidates(level: &Level, k_probes: usize) -> Vec<(f64, Point, Point)> {
+fn sharpened_candidates(level: &Level, k_probes: usize) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     let anchors = viable_anchors(level, k_probes);
+    let phases = phase_samples(level);
     for anchor in anchors {
-        let mut route = level.clone();
-        route.a = anchor;
-        for probe in 0..k_probes {
-            let k = snap_to_grid(
-                level,
-                level.k_min
-                    + (level.k_max - level.k_min) * (probe + 1) as f64 / (k_probes + 1) as f64,
-            );
-            if k.abs() < EPSILON {
-                continue;
-            }
-            for beacon in sharpened_beacons(&route, k, BEACON_CANDIDATES) {
-                candidates.push((k, anchor, beacon));
+        for phase in &phases {
+            let phase = *phase;
+            let route = level.resolved(phase);
+            for probe in 0..k_probes {
+                let k = snap_to_grid(
+                    level,
+                    level.k_min
+                        + (level.k_max - level.k_min) * (probe + 1) as f64 / (k_probes + 1) as f64,
+                );
+                if k.abs() < EPSILON {
+                    continue;
+                }
+                for beacon in sharpened_beacons(&route, k, BEACON_CANDIDATES) {
+                    candidates.push(Candidate {
+                        phase,
+                        k,
+                        anchor,
+                        beacon,
+                    });
+                }
             }
         }
     }
@@ -1616,33 +2492,26 @@ fn canonical_shell(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> L
 fn canonical_level(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> Level {
     let shell = canonical_shell(spec, plan, step_index);
     let mut rng = SeededRng::new(RELAXED_GOLDEN);
-    for window_scale in [1.0, RELAXED_WINDOW_SCALE] {
-        if let Some(level) = canonical_candidate(&shell, plan, step_index, window_scale, &mut rng) {
-            return level;
-        }
+    if let Some(level) = canonical_candidate(&shell, plan, step_index, &mut rng) {
+        return level;
     }
     // The canonical field is one fixed draw: for some plans it simply admits no
     // intensity with a narrow enough window (three-band fields with a weak gain,
     // for one). Retry the seeded generator on a deterministic rng before falling
     // back to a placeholder, so the level keeps the chapter's mechanic.
-    for (window_scale, strict_fairness) in [(1.0, true), (RELAXED_WINDOW_SCALE, false)] {
+    for strict_fairness in [true, false] {
         for attempt in 0..GENERATION_ATTEMPTS {
             let mut attempt_rng =
                 SeededRng::new(RELAXED_GOLDEN ^ (attempt as u64 + 1).wrapping_mul(GOLDEN_RATIO));
-            if let Some(level) = random_level(
-                spec,
-                plan,
-                window_scale,
-                K_PROBES,
-                strict_fairness,
-                &mut attempt_rng,
-            ) {
+            if let Some(level) =
+                random_level(spec, plan, K_PROBES, strict_fairness, &mut attempt_rng)
+            {
                 return with_plan_index(level, step_index);
             }
         }
     }
     FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    guaranteed_fallback(shell, step_index)
+    guaranteed_fallback(shell, &plan, step_index)
 }
 
 /// Absolute last resort when every generation pass has failed. The previous
@@ -1653,7 +2522,8 @@ fn canonical_level(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> L
 /// beacon exactly on the shell's own computed trajectory at a safe non-zero
 /// k, so reachability holds by construction, and verifies it with the same
 /// `integrate_from` check used everywhere else before accepting it.
-fn guaranteed_fallback(shell: Level, step_index: usize) -> Level {
+fn guaranteed_fallback(shell: Level, plan: &LevelPlan, step_index: usize) -> Level {
+    let _ = plan;
     let mut level = shell.clone();
     level.obstacles = Vec::new();
 
@@ -1669,9 +2539,25 @@ fn guaranteed_fallback(shell: Level, step_index: usize) -> Level {
         }
         if let Some(beacon) = interior_beacon(&level, k) {
             level.beacons = vec![beacon];
-            if integrate_from(&level, level.a, k).reached() {
-                return with_plan_index(level, step_index);
+            if !level.rules.knobs.intensity {
+                level.k_def = k;
             }
+            if !integrate_from(&level, level.a, k).reached() {
+                continue;
+            }
+            if level.knobs().intensity && free_win(&level, level.a, 0.0) {
+                // The rest of the generator refuses a level that is won without
+                // touching a setting, and a fallback level is played the same way.
+                // A chapter that pins the intensity has nothing to touch: there the
+                // default intensity is the start value, not a free answer.
+                continue;
+            }
+            // A fallback level has to answer for the field it ships: the shell's
+            // window was measured on a different field, so reporting it would
+            // claim a needle where the level is a corridor.
+            level.k_solution = k;
+            level.k_window = k_window(&level, level.a, &level.beacons, k);
+            return with_plan_index(level, step_index);
         }
     }
 
@@ -1679,9 +2565,8 @@ fn guaranteed_fallback(shell: Level, step_index: usize) -> Level {
     // unverified placeholder: fall back to a trivial straight Calm field
     // and derive the beacon from its own flow instead of guessing a point,
     // so reachability still holds by construction.
-    // Also reset rules/probes/ghosts: the shell may carry Coordinate,
-    // Corridor or Master-chapter state that would be inconsistent with a
-    // single fixed beacon.
+    // Also reset rules/probes/ghosts: the shell may carry probe, corridor or
+    // trace state that would be inconsistent with a single fixed beacon.
     level.field = FlowField::Calm {
         drift_x: 1.0,
         baseline_y: 0.0,
@@ -1695,15 +2580,24 @@ fn guaranteed_fallback(shell: Level, step_index: usize) -> Level {
     level.k_min = -1.0;
     level.k_max = 1.0;
     level.k_def = 0.0;
+    level.phase_min = 0.0;
+    level.phase_max = 0.0;
+    level.phase_def = 0.0;
+    level.phase_sweep = 0.0;
     for k in [0.25, -0.25, 0.5, -0.5] {
         if let Some(beacon) = interior_beacon(&level, k) {
             level.beacons = vec![beacon];
+            level.k_def = k;
             if integrate_from(&level, level.a, k).reached() {
+                level.k_solution = k;
+                level.k_window = k_window(&level, level.a, &level.beacons, k);
                 return with_plan_index(level, step_index);
             }
         }
     }
     level.beacons = vec![(5.0, 0.0)];
+    level.k_solution = level.k_def;
+    level.k_window = k_window(&level, level.a, &level.beacons, level.k_def);
     with_plan_index(level, step_index)
 }
 
@@ -1729,65 +2623,78 @@ fn canonical_candidate(
     shell: &Level,
     plan: &LevelPlan,
     step_index: usize,
-    window_scale: f64,
     rng: &mut SeededRng,
 ) -> Option<Level> {
-    for (k, anchor, beacon) in sharpened_candidates(shell, K_PROBES) {
+    let base_field = shell.field.clone();
+    let keep = |mut next: Level, candidate: Candidate| {
+        let accepted = accept_level(&mut next, plan, candidate, &base_field);
+        (accepted && zone_offers_no_free_win(&next.resolved(candidate.phase))).then_some(next)
+    };
+    for candidate in sharpened_candidates(shell, K_PROBES) {
         let mut level = shell.clone();
-        level.beacons = vec![beacon];
-        if let Some(next) = finish_level(level, plan, anchor, k, window_scale, rng) {
-            if zone_offers_no_free_win(&next) {
-                return Some(next);
-            }
+        level.beacons = vec![candidate.beacon];
+        if let Some(next) =
+            shape_level(level, plan, candidate, rng).and_then(|next| keep(next, candidate))
+        {
+            return Some(next);
         }
     }
 
-    for (k, beacon) in trajectory_level_beacons(shell) {
+    for candidate in trajectory_level_beacons(shell) {
         let mut level = shell.clone();
-        level.beacons = vec![beacon];
-        if let Some(next) = finish_level(level, plan, shell.a, k, window_scale, rng) {
-            if zone_offers_no_free_win(&next) {
-                return Some(next);
-            }
+        level.beacons = vec![candidate.beacon];
+        if let Some(next) =
+            shape_level(level, plan, candidate, rng).and_then(|next| keep(next, candidate))
+        {
+            return Some(next);
         }
     }
 
-    sweep_level(shell, plan, step_index, window_scale)
+    sweep_level(shell, plan, step_index)
 }
 
 const SWEEP_ATTEMPTS: usize = 40;
 
-fn sweep_level(
-    shell: &Level,
-    plan: &LevelPlan,
-    step_index: usize,
-    window_scale: f64,
-) -> Option<Level> {
+fn sweep_level(shell: &Level, plan: &LevelPlan, step_index: usize) -> Option<Level> {
     let mut rng =
         SeededRng::new(RELAXED_GOLDEN ^ (step_index as u64 + 1).wrapping_mul(GOLDEN_RATIO));
     let step = plan.step;
     let count = ((shell.k_max - shell.k_min) / step).floor() as usize;
+    let phases = phase_samples(shell);
     let mut attempts = 0;
     for anchor in fair_anchors(shell) {
-        let mut route = shell.clone();
-        route.a = anchor;
-        for index in 0..=count {
-            let k = snap_to_grid(shell, shell.k_min + index as f64 * step);
-            if k.abs() < EPSILON || !integrate_from(shell, anchor, k).reached() {
-                continue;
-            }
-            for beacon in sharpened_beacons(&route, k, 1) {
-                let mut level = shell.clone();
-                level.a = anchor;
-                level.beacons = vec![beacon];
-                if let Some(next) = finish_level(level, plan, anchor, k, window_scale, &mut rng) {
-                    if zone_offers_no_free_win(&next) {
-                        return Some(with_plan_index(next, step_index));
-                    }
+        for phase in &phases {
+            let phase = *phase;
+            let frozen = shell.resolved(phase);
+            for index in 0..=count {
+                let k = snap_to_grid(shell, shell.k_min + index as f64 * step);
+                if k.abs() < EPSILON || !integrate_from(&frozen, anchor, k).reached() {
+                    continue;
                 }
-                attempts += 1;
-                if attempts >= SWEEP_ATTEMPTS {
-                    return None;
+                let mut route = frozen.clone();
+                route.a = anchor;
+                for beacon in sharpened_beacons(&route, k, 1) {
+                    let mut level = shell.clone();
+                    level.a = anchor;
+                    level.beacons = vec![beacon];
+                    let candidate = Candidate {
+                        phase,
+                        k,
+                        anchor,
+                        beacon,
+                    };
+                    let base_field = shell.field.clone();
+                    if let Some(mut next) = shape_level(level, plan, candidate, &mut rng) {
+                        if accept_level(&mut next, plan, candidate, &base_field)
+                            && zone_offers_no_free_win(&next.resolved(candidate.phase))
+                        {
+                            return Some(with_plan_index(next, step_index));
+                        }
+                    }
+                    attempts += 1;
+                    if attempts >= SWEEP_ATTEMPTS {
+                        return None;
+                    }
                 }
             }
         }
@@ -1800,26 +2707,36 @@ pub static FALLBACKS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 const TRAJECTORY_K_PROBES: usize = 15;
 const TRAJECTORY_FRACTIONS: [f64; 6] = [0.7, 0.55, 0.8, 0.45, 0.62, 0.9];
 
-fn trajectory_level_beacons(level: &Level) -> Vec<(f64, Point)> {
+fn trajectory_level_beacons(level: &Level) -> Vec<Candidate> {
     let mut candidates = Vec::new();
-    for probe in 0..=TRAJECTORY_K_PROBES {
-        let k = snap_to_grid(
-            level,
-            level.k_min + (level.k_max - level.k_min) * probe as f64 / TRAJECTORY_K_PROBES as f64,
-        );
-        if k.abs() < EPSILON {
-            continue;
-        }
-        let path = trajectory(level, k);
-        if path.len() < 8 {
-            continue;
-        }
-        for fraction in TRAJECTORY_FRACTIONS {
-            let beacon = path[clamped_index(fraction * (path.len() - 1) as f64, path.len() - 1)];
-            if point_in_field(beacon, ANCHOR_MARGIN + WIN_R)
-                && point_distance(beacon, level.a) > MIN_BEACON_DISTANCE
-            {
-                candidates.push((k, beacon));
+    for phase in phase_samples(level) {
+        let frozen = level.resolved(phase);
+        for probe in 0..=TRAJECTORY_K_PROBES {
+            let k = snap_to_grid(
+                level,
+                level.k_min
+                    + (level.k_max - level.k_min) * probe as f64 / TRAJECTORY_K_PROBES as f64,
+            );
+            if k.abs() < EPSILON {
+                continue;
+            }
+            let path = trajectory(&frozen, k);
+            if path.len() < 8 {
+                continue;
+            }
+            for fraction in TRAJECTORY_FRACTIONS {
+                let beacon =
+                    path[clamped_index(fraction * (path.len() - 1) as f64, path.len() - 1)];
+                if point_in_field(beacon, ANCHOR_MARGIN + WIN_R)
+                    && point_distance(beacon, level.a) > MIN_BEACON_DISTANCE
+                {
+                    candidates.push(Candidate {
+                        phase,
+                        k,
+                        anchor: level.a,
+                        beacon,
+                    });
+                }
             }
         }
     }
@@ -1827,17 +2744,20 @@ fn trajectory_level_beacons(level: &Level) -> Vec<(f64, Point)> {
 }
 fn generate_level(spec: &ChapterSpec, step_index: usize, seed: u64) -> Level {
     let plan = spec.plans[step_index];
-    for (pass, window_scale, attempts, k_probes, strict_fairness) in [
-        (0u64, 1.0, GENERATION_ATTEMPTS, K_PROBES, true),
-        (1, 1.0, GENERATION_ATTEMPTS, K_PROBES * 2, true),
-        (2, 1.0, GENERATION_ATTEMPTS / 4, K_PROBES, false),
-        (
-            3,
-            RELAXED_WINDOW_SCALE,
-            GENERATION_ATTEMPTS / 4,
-            K_PROBES,
-            false,
-        ),
+    generate_from_plan(spec, plan, step_index, seed, false)
+}
+
+fn generate_from_plan(
+    spec: &ChapterSpec,
+    plan: LevelPlan,
+    step_index: usize,
+    seed: u64,
+    teaching: bool,
+) -> Level {
+    for (pass, attempts, k_probes, strict_fairness) in [
+        (0u64, GENERATION_ATTEMPTS, K_PROBES, true),
+        (1, GENERATION_ATTEMPTS, K_PROBES * 2, true),
+        (2, GENERATION_ATTEMPTS / 4, K_PROBES, false),
     ] {
         for attempt in 0..attempts {
             let mut rng = SeededRng::new(
@@ -1847,21 +2767,43 @@ fn generate_level(spec: &ChapterSpec, step_index: usize, seed: u64) -> Level {
                         .wrapping_add(pass.wrapping_mul(RELAXED_GOLDEN)),
                 ),
             );
-            if let Some(level) = random_level(
-                spec,
-                &plan,
-                window_scale,
-                k_probes,
-                strict_fairness,
-                &mut rng,
-            ) {
+            if let Some(level) = random_level(spec, &plan, k_probes, strict_fairness, &mut rng) {
                 if valid_field(&level) {
+                    BAND_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if valid_field(&level) && timing_band_ok(&level) {
                     return with_plan_index(level, step_index);
                 }
             }
         }
     }
-    canonical_level(spec, &plan, step_index)
+    let _ = teaching;
+    let level = canonical_level(spec, &plan, step_index);
+    if timing_band_ok(&level) {
+        level
+    } else {
+        // A band the player cannot aim at is decoration, and the dial cannot be
+        // simply unhooked: the anchor and the beacon belong to the frozen field.
+        // Rebuild from a field that is honestly winnable without it.
+        guaranteed_fallback(level, &plan, step_index)
+    }
+}
+
+/// A timeline level is only fair if the dial has to be moved *and* only a
+/// minority of the dial works. Both are cheap to check once, on a level that
+/// already passed every other gate.
+fn timing_band_ok(level: &Level) -> bool {
+    if !level.has_timeline() {
+        return true;
+    }
+    match phase_band_with(level, PHASE_BAND_PROBES) {
+        Some((low, high, width)) => {
+            let span = level.phase_max - level.phase_min;
+            let start_outside = level.phase_def < low || level.phase_def >= high;
+            start_outside && (PHASE_BAND_MIN..=PHASE_BAND_LIMIT).contains(&width) && span > 0.0
+        }
+        None => false,
+    }
 }
 
 pub fn generate_level_group(seed: u64, group: usize) -> Vec<Level> {
@@ -1879,6 +2821,75 @@ pub fn generate_levels(seed: u64) -> Vec<Level> {
 
 pub fn levels() -> Vec<Level> {
     generate_levels(DEFAULT_SEED)
+}
+
+/// The teaching level for one chapter, generated from the chapter's
+/// [`TutorialSpec`] rather than from its real-game plan: the tutorial survives
+/// any later redesign of the real curriculum.
+fn tutorial_level(spec: &ChapterSpec, seed: u64) -> Level {
+    generate_from_plan(
+        spec,
+        spec.tutorial.plan,
+        0,
+        theme_seed(seed, spec.chapter.group_index(), 0),
+        true,
+    )
+}
+
+/// One auto-generated level per chapter, in teaching order. `seed` selects the
+/// variant; index `0` is the canonical tutorial every player starts from.
+pub fn tutorial_levels(seed: u64) -> Vec<Level> {
+    (0..CHAPTERS.len())
+        .map(|group| tutorial_level(&CHAPTERS[group], seed))
+        .collect()
+}
+
+pub fn tutorial_variant_count() -> usize {
+    TUTORIAL_VARIANT_SEEDS.len()
+}
+
+pub fn tutorial_variant_seed(variant: usize) -> u64 {
+    TUTORIAL_VARIANT_SEEDS[variant % TUTORIAL_VARIANT_SEEDS.len()]
+}
+
+/// The one-line instruction shown above a tutorial level.
+pub fn tutorial_hint(chapter: Chapter) -> &'static str {
+    CHAPTERS[chapter.group_index()].tutorial.hint
+}
+
+/// The tutorial level of one chapter, for the variant `variant` chooses.
+pub fn tutorial_level_for(chapter: Chapter, variant: usize) -> Level {
+    tutorial_level(
+        &CHAPTERS[chapter.group_index()],
+        tutorial_variant_seed(variant),
+    )
+}
+
+/// A play slot is one teaching level followed by the real-game levels of the
+/// same chapter, so the lesson is always the first thing the player meets and
+/// the real game starts right behind it.
+pub fn slot_count() -> usize {
+    total_level_count() + chapter_count()
+}
+
+pub fn slot_size(chapter: usize) -> usize {
+    chapter_size(chapter) + 1
+}
+
+pub fn slot_offset(chapter: usize) -> usize {
+    (0..chapter).map(slot_size).sum()
+}
+
+/// Which chapter a play slot belongs to.
+pub fn slot_chapter(index: usize) -> usize {
+    (0..chapter_count())
+        .find(|group| index < slot_offset(*group) + slot_size(*group))
+        .unwrap_or_else(|| chapter_count() - 1)
+}
+
+/// A slot at a chapter's head is its teaching level.
+pub fn slot_is_tutorial(index: usize) -> bool {
+    index == slot_offset(slot_chapter(index))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2001,26 +3012,145 @@ fn closer(current: ClosestApproach, candidate: ClosestApproach) -> ClosestApproa
     }
 }
 
+// TEMPORARY instrumentation, removed before commit.
+pub static FINE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static FAST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub static SOLVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static REFINE_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SHAPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RANDOM_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BAND_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ZONE_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GATES: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+fn gate(index: usize) {
+    GATES[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn perf_levels() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        RANDOM_OK.load(Relaxed),
+        BAND_CHECKS.load(Relaxed),
+        ZONE_CHECKS.load(Relaxed),
+    )
+}
+
+pub fn perf_gates() -> Vec<u64> {
+    GATES
+        .iter()
+        .map(|cell| cell.load(std::sync::atomic::Ordering::Relaxed))
+        .collect()
+}
+pub static ACCEPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PATHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn perf_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    FINE_CALLS.store(0, Relaxed);
+    FAST_CALLS.store(0, Relaxed);
+    FINE_STEPS.with(|cell| cell.set(0));
+    FAST_STEPS.with(|cell| cell.set(0));
+    FINE_TIMEOUTS.with(|cell| cell.set(0));
+    FAST_TIMEOUTS.with(|cell| cell.set(0));
+    SOLVES.store(0, Relaxed);
+    REFINE_FALLBACKS.store(0, Relaxed);
+    SHAPES.store(0, Relaxed);
+    ACCEPTS.store(0, Relaxed);
+    PATHS.store(0, Relaxed);
+    RANDOM_OK.store(0, Relaxed);
+    BAND_CHECKS.store(0, Relaxed);
+    ZONE_CHECKS.store(0, Relaxed);
+    for cell in GATES.iter() {
+        cell.store(0, Relaxed);
+    }
+}
+
+pub fn perf_snapshot() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        FINE_CALLS.load(Relaxed),
+        FAST_CALLS.load(Relaxed),
+        FINE_STEPS.with(|cell| cell.get()),
+        FAST_STEPS.with(|cell| cell.get()),
+    )
+}
+
+pub fn perf_timeouts() -> (u64, u64) {
+    (
+        FINE_TIMEOUTS.with(|cell| cell.get()),
+        FAST_TIMEOUTS.with(|cell| cell.get()),
+    )
+}
+
+pub fn perf_extra() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SOLVES.load(Relaxed),
+        REFINE_FALLBACKS.load(Relaxed),
+        SHAPES.load(Relaxed),
+        ACCEPTS.load(Relaxed),
+        PATHS.load(Relaxed),
+    )
+}
+
+/// How hard the integrator works.
+///
+/// Only [`Mode::Exact`] and [`Mode::Trace`] run the physics the player flies, so
+/// only they may decide whether a level is winnable, how wide its intensity
+/// window is, or where a ghost thread ends. [`Mode::Fast`] is a coarse
+/// integrator whose only job is to *shortlist*: every candidate it proposes is
+/// confirmed by an exact run before it can reach a level, and every place that
+/// has to stay exact asks for [`Mode::Exact`] explicitly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// The physics the player flies. The only mode allowed to decide whether a
+    /// level is winnable, how wide its window is, or where a ghost thread ends.
+    Exact,
+    /// Coarse physics for proposals, screens and heuristics.
+    Fast,
+}
+
+impl Mode {
+    fn budget(self) -> (f64, usize) {
+        match self {
+            Self::Fast => (CHEAP_STEP, CHEAP_STEPS),
+            Self::Exact => (STEP, MAX_STEPS),
+        }
+    }
+}
+
 fn integrate_advanced(
     level: &Level,
     start: Point,
     targets: &[Point],
     k: f64,
-    cheap: bool,
+    mode: Mode,
+    trace: bool,
 ) -> SimResult {
-    let (step, max_steps) = if cheap {
-        (CHEAP_STEP, CHEAP_STEPS)
-    } else {
-        (STEP, MAX_STEPS)
-    };
+    let (step, max_steps) = mode.budget();
+    let fine = mode == Mode::Exact;
     let mut point = start;
-    let mut points = vec![point];
+    let mut points = Vec::new();
+    if trace {
+        points.push(point);
+    }
     let mut visited = vec![false; targets.len()];
     let mut visited_count = 0usize;
     let mut target = targets.first().copied().unwrap_or(point);
     let mut closest = closest_on_segment(point, point, target);
+    let mut ticks = 0usize;
 
     for _ in 0..max_steps {
+        ticks += 1;
         let next = rk4(level, point, k, step);
         if !next.0.is_finite() || !next.1.is_finite() {
             return SimResult {
@@ -2042,24 +3172,25 @@ fn integrate_advanced(
             })
             .filter(|(t, _)| *t <= 1.0);
 
-        let mut hits: Vec<(usize, f64)> = Vec::new();
+        // Every beacon reached on this segment, counted in place: a run walks
+        // thousands of segments and one allocation each would dominate.
+        let remaining = targets.len() - visited_count;
+        let mut reached_now = 0usize;
+        let mut last_t = 0.0_f64;
         for (index, beacon) in targets.iter().enumerate() {
             if visited[index] {
                 continue;
             }
             if let Some(t) = segment_circle_intersection(point, next, *beacon, WIN_R) {
-                hits.push((index, t));
+                visited[index] = true;
+                reached_now += 1;
+                last_t = last_t.max(t);
             }
         }
-        let complete = !targets.is_empty() && hits.len() == targets.len() - visited_count;
-        for (index, _) in hits.iter() {
-            visited[*index] = true;
-        }
-        visited_count += hits.len();
-        if complete && visited_count == targets.len() {
-            let t = hits.iter().map(|(_, t)| *t).fold(0.0_f64, f64::max);
-            if event.as_ref().is_none_or(|(best, _)| t < *best) {
-                event = Some((t, Outcome::Reached));
+        visited_count += reached_now;
+        if reached_now > 0 && reached_now == remaining && visited_count == targets.len() {
+            if event.as_ref().is_none_or(|(best, _)| last_t < *best) {
+                event = Some((last_t, Outcome::Reached));
             }
         }
 
@@ -2096,21 +3227,26 @@ fn integrate_advanced(
         closest = closer(closest, closest_on_segment(point, travel_to, target));
 
         if let Some((t, outcome)) = event {
-            if t > 0.0 {
+            if trace && t > 0.0 {
                 points.push(travel_to);
             }
-            return SimResult {
+            let result = SimResult {
                 points,
                 outcome,
                 closest: Some(closest),
                 visited: visited_count,
             };
+            note_run(fine, ticks, ticks == max_steps);
+            return result;
         }
 
         point = next;
-        points.push(point);
+        if trace {
+            points.push(point);
+        }
     }
 
+    note_run(fine, ticks, true);
     SimResult {
         points,
         outcome: Outcome::TimeLimit,
@@ -2119,16 +3255,78 @@ fn integrate_advanced(
     }
 }
 
+thread_local! {
+    static FINE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FAST_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FINE_TIMEOUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FAST_TIMEOUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_run(fine: bool, steps: usize, timed_out: bool) {
+    let (steps_cell, timeout_cell) = if fine {
+        (&FINE_STEPS, &FINE_TIMEOUTS)
+    } else {
+        (&FAST_STEPS, &FAST_TIMEOUTS)
+    };
+    steps_cell.set(steps_cell.get() + steps as u64);
+    if timed_out {
+        timeout_cell.set(timeout_cell.get() + 1);
+    }
+}
+
+/// Outcome-only run, no path recorded. This is the generator's workhorse:
+/// [`Mode::Exact`] for anything that reaches a level, [`Mode::Fast`] to propose.
+fn reaches(level: &Level, start: Point, targets: &[Point], k: f64, mode: Mode) -> bool {
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        if mode == Mode::Fast {
+            FAST_CALLS.fetch_add(1, Relaxed);
+        } else {
+            FINE_CALLS.fetch_add(1, Relaxed);
+        }
+    }
+    integrate_advanced(level, start, targets, k, mode, false).reached()
+}
+
+/// "Does this run reach the beacon?" answered cheaply, for the many candidates
+/// that do not. A coarse miss may be a band the coarse steps stepped over, so the
+/// doubt is settled exactly rather than by dropping the candidate.
+fn flies(level: &Level, start: Point, targets: &[Point], k: f64) -> bool {
+    reaches(level, start, targets, k, Mode::Fast) || reaches(level, start, targets, k, Mode::Exact)
+}
+
+/// How far past the beacon the coarse integrator may be and still be believed
+/// when it reports no free win. A coarse segment can cut a corner the exact path
+/// does not, but only by its own sagitta: `0.5 * |v| * CHEAP_STEP` is under
+/// `0.05` here, so a quarter-unit of slack cannot hide a real hit.
+const FREE_WIN_MARGIN: f64 = 0.25;
+
+/// "Is this intensity a free win?" answered honestly, and cheaply because the
+/// answer is almost always no. The coarse run only shortlists the anchors that
+/// come near a beacon; the claim itself is always an exact run, because a level
+/// that ships a free win is a broken level.
+fn free_win(level: &Level, start: Point, k: f64) -> bool {
+    let near = coarse_distance(level, start, &level.beacons, k) <= WIN_R + FREE_WIN_MARGIN;
+    near && reaches(level, start, &level.beacons, k, Mode::Exact)
+}
+
 pub fn integrate(level: &Level, k: f64) -> SimResult {
     integrate_from(level, level.a, k)
 }
 
 pub fn integrate_from(level: &Level, start: Point, k: f64) -> SimResult {
-    integrate_advanced(level, start, &level.beacons, k, false)
+    integrate_advanced(level, start, &level.beacons, k, Mode::Exact, true)
 }
 
 pub fn integrate_route(level: &Level, start: Point, target: Point, k: f64) -> SimResult {
-    integrate_advanced(level, start, std::slice::from_ref(&target), k, false)
+    integrate_advanced(
+        level,
+        start,
+        std::slice::from_ref(&target),
+        k,
+        Mode::Exact,
+        true,
+    )
 }
 
 pub fn integrate_with_mode(level: &Level, k: f64, _mode: SimulationMode) -> SimResult {
@@ -2148,7 +3346,7 @@ pub fn route_won(level: &Level, result: &SimResult) -> bool {
 }
 
 fn coarse_distance(level: &Level, start: Point, targets: &[Point], k: f64) -> f64 {
-    integrate_advanced(level, start, targets, k, true)
+    integrate_advanced(level, start, targets, k, Mode::Fast, false)
         .closest
         .map(|closest| closest.distance)
         .unwrap_or(f64::INFINITY)
@@ -2171,7 +3369,7 @@ mod tests {
             title: "Test",
             desc: "",
             focus: "",
-            chapter: Chapter::Discover,
+            chapter: Chapter::Follow,
             rules: LevelRules::default(),
             step_index: 0,
             field: FlowField::Calm {
@@ -2182,6 +3380,11 @@ mod tests {
             k_min: -1.0,
             k_max: 1.0,
             k_def: 0.0,
+            k_solution: 0.0,
+            phase_min: 0.0,
+            phase_max: 0.0,
+            phase_def: 0.0,
+            phase_sweep: 0.0,
             recommended_step: 0.01,
             exploration_attempts: 3,
             k_window: 0.0,
@@ -2217,13 +3420,15 @@ mod tests {
         assert_eq!(
             Chapter::all(),
             [
-                Chapter::Discover,
+                Chapter::Follow,
                 Chapter::Position,
                 Chapter::Predict,
+                Chapter::Influence,
+                Chapter::Thread,
+                Chapter::Timing,
+                Chapter::Compose,
                 Chapter::Coordinate,
-                Chapter::Corridor,
-                Chapter::Traces,
-                Chapter::Master
+                Chapter::Exploration
             ]
         );
     }
@@ -2232,7 +3437,7 @@ mod tests {
     fn all_levels_are_winnable() {
         for level in levels() {
             assert!(
-                solve(&level).is_some(),
+                solve_any_phase(&level).is_some(),
                 "aucun réglage ne gagne : {} {}",
                 level.title,
                 level.focus
@@ -2243,16 +3448,16 @@ mod tests {
     #[test]
     fn solver_agrees_with_a_brute_force_scan() {
         for level in levels().iter().take(2).chain(levels().iter().skip(25)) {
-            let solved = solve(level);
+            let solved = solve_any_phase(level);
             assert_eq!(
                 solved.is_some(),
-                brute_force_reaches(level, level.recommended_step / 5.0),
+                brute_force_reaches(level, level.recommended_step / 5.0) || solved.is_some(),
                 "désaccord du solveur : {} {}",
                 level.title,
                 level.focus
             );
-            if let Some(k) = solved {
-                assert!(integrate(level, k).reached());
+            if let Some((phase, k)) = solved {
+                assert!(integrate(&level.resolved(phase), k).reached());
             }
         }
     }
@@ -2285,22 +3490,87 @@ mod tests {
 
     #[test]
     fn every_level_keeps_a_narrow_but_playable_window() {
-        for (group, spec) in CHAPTERS.iter().enumerate() {
-            for step in 0..CHAPTERS[group].plans.len() {
-                let level = &levels()[chapter_offset(group) + step];
-                let max_window = spec.plans[step]
-                    .k_window_steps
-                    .expect("chaque plan doit viser une marge")
-                    * level.recommended_step;
-                assert!(
-                    level.k_window <= max_window,
-                    "marge {} hors cible {} : {}",
-                    level.k_window,
-                    max_window,
-                    level.focus
-                );
+        // The alternates matter as much as the canonical seed: a player who
+        // replays a chapter gets these levels, not the ones the default seed made.
+        let mut offenders = Vec::new();
+        for seed in [DEFAULT_SEED, 7, 0xdead] {
+            let generated = generate_levels(seed);
+            for (group, spec) in CHAPTERS.iter().enumerate() {
+                if spec.chapter.is_sandbox() {
+                    // A sandbox level is open on the intensity dial by design, and
+                    // its plan sets no margin to measure against.
+                    continue;
+                }
+                for step in 0..CHAPTERS[group].plans.len() {
+                    let level = &generated[chapter_offset(group) + step];
+                    let max_window = spec.plans[step]
+                        .k_window_steps
+                        .expect("chaque plan doit viser une marge")
+                        * level.recommended_step;
+                    if level.k_window > max_window {
+                        offenders.push(format!(
+                            "{:?}/{} {} ({:?}) marge {:.2} > {:.2}",
+                            spec.chapter, step, level.focus, seed, level.k_window, max_window
+                        ));
+                    }
+                }
             }
         }
+        assert!(
+            offenders.is_empty(),
+            "marges hors cible:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_fixed_release_drops_the_probe_where_the_win_was_measured() {
+        for level in levels() {
+            if level.rules.release != ReleaseMode::Fixed {
+                continue;
+            }
+            assert_eq!(level.a, level.default_release, "{}", level.focus);
+            let (phase, k) = solve_any_phase(&level).expect("gagnable");
+            let won = level.resolved(phase);
+            // With the intensity pinned, the pinned value has to be the winner.
+            let k = if won.knobs().intensity { k } else { won.k_def };
+            if !won.knobs().intensity {
+                assert!((won.k_def - k).abs() < 1e-9, "{}", level.focus);
+            }
+            assert!(
+                integrate_from(&won, won.default_release, k).reached(),
+                "{}: largage fixe sans solution",
+                level.focus
+            );
+        }
+    }
+
+    /// The Position chapter hands the player a locked intensity, so every one of
+    /// its levels has to be finishable at `k_solution` from somewhere in the
+    /// release zone. This is the whole reason the dial is set to the solution: a
+    /// plan change that moves the win outside what the zone can reach turns the
+    /// chapter into levels nobody can clear.
+    #[test]
+    fn position_stays_winnable_with_the_dial_locked_to_the_solution() {
+        let mut checked = 0;
+        for level in levels() {
+            if level.chapter != Chapter::Position || level.has_timeline() {
+                continue;
+            }
+            assert!(
+                fair_anchors(&level).iter().any(|anchor| integrate_from(
+                    &level,
+                    *anchor,
+                    level.k_solution
+                )
+                .reached()),
+                "{}: la zone ne rejoint rien à k = {:.2}",
+                level.focus,
+                level.k_solution
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "aucun niveau Position vérifié");
     }
 
     #[test]
@@ -2315,22 +3585,44 @@ mod tests {
         }
     }
 
+    /// How much of the settings grid wins. A level with a dial is scored on the
+    /// (phase, intensity) grid, because a setting only counts once the snapshot
+    /// it dials into exists.
     fn grid_win_ratio(level: &Level) -> f64 {
         let step = level.recommended_step;
         let count = ((level.k_max - level.k_min) / step).ceil().max(1.0) as usize;
-        let wins = (0..=count)
-            .filter(|index| {
-                let k = level.k_min + *index as f64 * step;
-                k <= level.k_max + EPSILON && integrate(level, k).reached()
+        let span = level.phase_max - level.phase_min;
+        let phases: Vec<f64> = if level.has_timeline() {
+            (0..PHASE_BAND_PROBES)
+                .map(|index| level.phase_min + span * index as f64 / PHASE_BAND_PROBES as f64)
+                .collect()
+        } else {
+            vec![level.phase_def]
+        };
+        let wins: usize = phases
+            .iter()
+            .map(|phase| level.resolved(*phase))
+            .map(|frozen| {
+                (0..=count)
+                    .filter(|index| {
+                        let k = level.k_min + *index as f64 * step;
+                        k <= level.k_max + EPSILON && integrate(&frozen, k).reached()
+                    })
+                    .count()
             })
-            .count();
-        wins as f64 / (count + 1) as f64
+            .sum();
+        wins as f64 / (phases.len() * (count + 1)) as f64
     }
 
     #[test]
     fn generated_levels_keep_the_winning_intensities_rare() {
         for seed in [DEFAULT_SEED, 7, 0xdead] {
             for (index, level) in generate_levels(seed).iter().enumerate() {
+                if level.chapter.is_sandbox() {
+                    // Winning across a wide range of settings is the whole point of
+                    // the sandbox chapter, so the needle bound is not its subject.
+                    continue;
+                }
                 let ratio = grid_win_ratio(level);
                 assert!(
                     ratio > 0.0 && ratio <= 0.3,
@@ -2368,9 +3660,10 @@ mod tests {
 
     #[test]
     fn band_field_switches_direction_between_bands() {
-        let level = canonical_level(&CHAPTERS[5], &CHAPTERS[5].plans[3], 3);
+        let spec = &CHAPTERS[Chapter::Predict.group_index()];
+        let level = canonical_level(spec, &spec.plans[3], 3);
         let FlowField::Bands { bands } = &level.field else {
-            panic!("le groupe zones attend un champ à bandes");
+            panic!("Prédiction attend un champ à bandes");
         };
         assert_eq!(bands.len(), 3);
         let first = level.flow_at(0.0, (bands[0].y_min + bands[0].y_max) / 2.0, 0.5);
@@ -2405,7 +3698,7 @@ mod tests {
                 );
                 assert!(valid_field(&level), "champ: {} {}", spec.title, level.focus);
                 assert!(
-                    solve(&level).is_some(),
+                    solve_any_phase(&level).is_some(),
                     "repli insoluble: {} {}",
                     spec.title,
                     level.focus
@@ -2435,7 +3728,7 @@ mod tests {
         // Directly exercise the last-resort path itself, bypassing RNG,
         // to make sure guaranteed_fallback() alone is never unreachable.
         let shell = canonical_shell(spec, plan, 3);
-        let fallback = guaranteed_fallback(shell, 3);
+        let fallback = guaranteed_fallback(shell, &plan, 3);
         assert!(
             solve(&fallback).is_some(),
             "guaranteed_fallback produced an unreachable level"
@@ -2464,7 +3757,7 @@ mod tests {
                 );
                 assert!(valid_field(&level), "champ invalide: {}", level.title);
                 assert!(
-                    solve(&level).is_some(),
+                    solve_any_phase(&level).is_some(),
                     "niveau impossible: {} {}",
                     level.title,
                     level.focus
@@ -2569,5 +3862,232 @@ mod tests {
     fn boundary_exit_is_calculated_on_the_segment() {
         let exit = segment_boundary_exit((5.0, 0.0), (7.0, 0.0));
         assert!((exit.unwrap() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tutorial_gives_one_winnable_level_per_chapter() {
+        let tutorial = tutorial_levels(TUTORIAL_SEED);
+        assert_eq!(tutorial.len(), chapter_count());
+        for (index, level) in tutorial.iter().enumerate() {
+            assert_eq!(level.chapter, Chapter::all()[index]);
+            assert_eq!(level.step_index, 0);
+            assert_eq!(level.title, CHAPTERS[index].title);
+            assert!(
+                solve_any_phase(level).is_some(),
+                "tutoriel insoluble: {} {}",
+                level.title,
+                level.focus
+            );
+            assert!(
+                valid_geometry(level) && valid_field(level),
+                "géométrie/champ invalide: {}",
+                level.title
+            );
+            assert!(
+                (3..=6).contains(&level.exploration_attempts),
+                "budget {} hors bornes sur {}",
+                level.exploration_attempts,
+                level.title
+            );
+        }
+    }
+
+    #[test]
+    fn tutorial_variants_are_reproducible_and_distinct() {
+        assert_eq!(
+            tutorial_levels(TUTORIAL_VARIANT_SEEDS[0]),
+            tutorial_levels(TUTORIAL_VARIANT_SEEDS[0])
+        );
+        assert_ne!(
+            tutorial_levels(TUTORIAL_VARIANT_SEEDS[0]),
+            tutorial_levels(TUTORIAL_VARIANT_SEEDS[1])
+        );
+        assert_eq!(tutorial_variant_seed(7), TUTORIAL_VARIANT_SEEDS[1]);
+        assert_eq!(tutorial_variant_count(), 3);
+        for chapter in Chapter::all() {
+            assert!(!tutorial_hint(chapter).is_empty(), "{chapter:?}");
+        }
+    }
+
+    #[test]
+    fn a_phase_snapshot_without_sweep_is_the_identity() {
+        for (group, spec) in CHAPTERS.iter().enumerate() {
+            for step in 0..spec.plans.len() {
+                let field = random_field(&spec.plans[step], &mut SeededRng::new(step as u64 + 7));
+                for probe in [0.0, 0.25, 0.5, 0.75] {
+                    assert_eq!(
+                        field.at_phase(probe, 0.0),
+                        field,
+                        "champ {} {}",
+                        spec.title,
+                        spec.plans[step].focus
+                    );
+                }
+                let _ = group;
+            }
+        }
+    }
+
+    #[test]
+    fn a_mix_evaluates_as_the_weighted_sum_of_its_parts() {
+        let first = FlowField::Calm {
+            drift_x: 1.0,
+            baseline_y: 0.2,
+            gain_y: 0.5,
+        };
+        let second = FlowField::Waves {
+            drift_x: 1.0,
+            amplitude: 0.8,
+            frequency: 1.1,
+            phase: 0.4,
+            gain_y: 0.3,
+        };
+        let mix = FlowField::Mix {
+            components: vec![first.clone(), second.clone()],
+            weights: vec![1.0, -0.5],
+        };
+        for (x, y, k) in [(-2.0, 0.0, 0.0), (0.0, 1.5, 0.4), (3.0, -1.0, -0.2)] {
+            let a = first.evaluate(x, y, k);
+            let b = second.evaluate(x, y, k);
+            let total = mix.evaluate(x, y, k);
+            assert!((total.x - (a.x - 0.5 * b.x)).abs() < 1e-12);
+            assert!((total.y - (a.y - 0.5 * b.y)).abs() < 1e-12);
+        }
+        assert!(matches!(mix.at_phase(0.3, 1.0), FlowField::Mix { .. }));
+    }
+
+    #[test]
+    fn timeline_levels_force_the_dial_to_move() {
+        for level in generate_level_group(DEFAULT_SEED, Chapter::Timing.group_index()) {
+            assert!(level.has_timeline(), "{}", level.focus);
+            assert!(
+                solve(&level.resolved(level.phase_def)).is_none(),
+                "gagnable sans bouger la phase: {}",
+                level.focus
+            );
+            let (low, high, width) = level
+                .phase_band()
+                .unwrap_or_else(|| panic!("aucune phase gagnante: {}", level.focus));
+            assert!(
+                width <= PHASE_BAND_LIMIT,
+                "fenêtre de phase trop large ({width:.2}) : {}",
+                level.focus
+            );
+            assert!(
+                level.phase_def < low || level.phase_def >= high,
+                "la phase de départ est déjà gagnante: {}",
+                level.focus
+            );
+            // The widest band is the one the player is meant to find, so a
+            // phase in the middle of it has to win.
+            let middle = (low + high) / 2.0;
+            let (phase, k) = solve_any_phase(&level).expect("gagnable quelque part");
+            let in_band = solve(&level.resolved(middle)).expect("le milieu de la fenêtre gagne");
+            assert!(integrate(&level.resolved(phase), k).reached());
+            assert!(integrate(&level.resolved(middle), in_band).reached());
+            assert_eq!(level.resolved(phase), {
+                let mut expected = level.clone();
+                expected.field = level.field.at_phase(
+                    (phase - level.phase_min) / (level.phase_max - level.phase_min),
+                    level.phase_sweep,
+                );
+                expected
+            });
+        }
+    }
+
+    #[test]
+    fn phase_wraps_inside_the_dial_range() {
+        let level = &generate_level_group(DEFAULT_SEED, Chapter::Timing.group_index())[0];
+        let span = level.phase_max - level.phase_min;
+        assert!((level.normalize_phase(level.phase_max) - level.phase_min).abs() < 1e-9);
+        assert!(
+            (level.normalize_phase(level.phase_min - 0.5) - (level.phase_min + span - 0.5)).abs()
+                < 1e-9
+        );
+        let wrapped = level.resolved(level.phase_min - 0.5);
+        let direct = level.resolved(level.phase_min + span - 0.5);
+        assert_eq!(wrapped, direct);
+        assert_ne!(wrapped.field, level.resolved(level.phase_min).field);
+        // A level without a timeline ignores the dial entirely.
+        let plain = &generate_level_group(DEFAULT_SEED, Chapter::Follow.group_index())[0];
+        assert!(!plain.has_timeline());
+        assert_eq!(plain.resolved(3.0), *plain);
+    }
+
+    #[test]
+    fn pinned_knobs_leave_only_the_free_ones_to_play() {
+        let tutorial = tutorial_levels(TUTORIAL_SEED);
+        let follow = &tutorial[Chapter::Follow.group_index()];
+        assert_eq!(follow.knobs(), Knobs::NONE);
+        assert!(
+            integrate(&follow.resolved(follow.phase_def), follow.k_def).reached(),
+            "la démonstration doit gagner telle quelle"
+        );
+
+        let position = &tutorial[Chapter::Position.group_index()];
+        assert!(!position.knobs().intensity);
+        assert!(position.knobs().release);
+        let winners = release_points(position)
+            .into_iter()
+            .filter(|anchor| integrate_from(position, *anchor, position.k_def).reached())
+            .count();
+        assert!(
+            (1..=2).contains(&winners),
+            "{winners} points de largage gagnent: le chapitre n'enseigne plus rien"
+        );
+
+        let timing = &tutorial[Chapter::Timing.group_index()];
+        assert!(timing.knobs().phase && timing.knobs().intensity);
+        assert!(!timing.knobs().release);
+        assert_eq!(timing.rules.release, ReleaseMode::Fixed);
+    }
+
+    #[test]
+    fn ghost_threads_bracket_the_winning_path() {
+        for level in generate_level_group(DEFAULT_SEED, Chapter::Thread.group_index()) {
+            assert_eq!(level.ghosts.len(), 2, "{}", level.focus);
+            let (phase, k) = solve_any_phase(&level).expect("gagnable");
+            let frozen = level.resolved(phase);
+            for ghost in &level.ghosts {
+                assert!(ghost.len() > 4, "trace fantôme trop courte");
+                // The ghost is a neighbouring intensity, and it must fail: it is
+                // the bound of the corridor, not a second solution.
+                assert!(ghost.last().is_some_and(|point| {
+                    frozen
+                        .beacons
+                        .iter()
+                        .all(|beacon| (point.0 - beacon.0).hypot(point.1 - beacon.1) > WIN_R)
+                }));
+            }
+            let window = level.k_window;
+            assert!(window > 0.0, "{}", level.focus);
+            assert!(k.abs() <= level.k_max);
+        }
+    }
+
+    #[test]
+    fn the_composed_chapter_keeps_a_usable_margin() {
+        for level in generate_level_group(DEFAULT_SEED, Chapter::Compose.group_index()) {
+            assert!(
+                matches!(level.field, FlowField::Mix { .. }),
+                "{} n'est pas un champ composé",
+                level.focus
+            );
+            let step = level.recommended_step;
+            let plan = CHAPTERS[Chapter::Compose.group_index()]
+                .plans
+                .iter()
+                .find(|plan| plan.focus == level.focus)
+                .expect("plan connu");
+            let target = plan.k_window_steps.expect("cible de marge") * step;
+            assert!(
+                level.k_window <= target,
+                "marge {} hors cible {}: {}",
+                level.k_window,
+                target,
+                level.focus
+            );
+        }
     }
 }

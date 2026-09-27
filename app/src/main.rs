@@ -3,9 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
 use peoplemodeler_core::{
-    chapter_count, chapter_offset, chapter_size, generate_level_group, integrate_from,
-    total_level_count, Chapter, Level, Outcome, ReleaseMode, SimResult, SimulationMode, Vector2,
-    DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX, YMIN,
+    chapter_count, generate_level_group, integrate_from, slot_chapter, slot_count,
+    slot_is_tutorial, slot_offset, slot_size, tutorial_hint, tutorial_level_for, Chapter, Level,
+    Outcome, ReleaseMode, SimResult, SimulationMode, Vector2, Visibility, DEFAULT_SEED, WIN_R,
+    XMAX, XMIN, YMAX, YMIN,
 };
 
 const W: f64 = 640.0;
@@ -15,6 +16,10 @@ const Y_SCALE: f64 = H / (YMAX - YMIN);
 const STEPS: [f64; 6] = [1.0, 0.5, 0.1, 0.05, 0.01, 0.001];
 const HISTORY_LIMIT: usize = 3;
 const HINT_LEN_PX: f64 = 44.0;
+/// The dial is a continuous moment in the field's cycle: enough steps that it
+/// reads as a slider, few enough that the preview stays honest.
+const PHASE_SLIDER_STEPS: usize = 360;
+const SAVE_KEY: &str = "driftline.save.v1";
 
 #[derive(Clone, Debug)]
 struct Attempt {
@@ -22,11 +27,12 @@ struct Attempt {
     result: SimResult,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LevelChip {
     index: usize,
     class: &'static str,
     disabled: bool,
+    label: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -36,6 +42,61 @@ struct LevelProgress {
     attempts: usize,
     solved: bool,
     release: Option<(f64, f64)>,
+}
+
+/// What a returning player gets back. Only the durable facts are saved: the
+/// attempt history lives in the session, it is not a save.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SaveData {
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    variant: Option<usize>,
+    #[serde(default)]
+    progress: Vec<SavedLevel>,
+    #[serde(default)]
+    seen: Vec<bool>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SavedLevel {
+    #[serde(default)]
+    solved: bool,
+    #[serde(default)]
+    release: Option<(f64, f64)>,
+    #[serde(default)]
+    attempts: usize,
+}
+
+fn save_data(seed: u64, variant: usize, progress: &[LevelProgress], seen: &[bool]) -> SaveData {
+    SaveData {
+        seed: Some(seed),
+        variant: Some(variant),
+        progress: progress
+            .iter()
+            .map(|level| SavedLevel {
+                solved: level.solved,
+                release: level.release,
+                attempts: level.attempts,
+            })
+            .collect(),
+        seen: seen.to_vec(),
+    }
+}
+
+async fn read_save() -> Option<SaveData> {
+    let script = format!("return window.localStorage.getItem('{SAVE_KEY}')");
+    let value = dioxus::document::eval(&script).await.ok()?;
+    let text = value.as_str()?;
+    serde_json::from_str(text).ok()
+}
+
+async fn write_save(data: &SaveData) {
+    let Ok(json) = serde_json::to_string(data) else {
+        return;
+    };
+    let script = format!("window.localStorage.setItem('{SAVE_KEY}', {json}); return true;");
+    let _ = dioxus::document::eval(&script).await;
 }
 
 fn main() {
@@ -66,7 +127,9 @@ fn release_of(level: &Level, progress: &LevelProgress) -> (f64, f64) {
 }
 
 fn accepts_release(level: &Level, point: (f64, f64)) -> bool {
-    level.rules.release != ReleaseMode::Fixed && level.rules.zone.contains(point)
+    level.knobs().release
+        && level.rules.release != ReleaseMode::Fixed
+        && level.rules.zone.contains(point)
 }
 
 async fn handle_field_click(
@@ -219,6 +282,7 @@ fn normalize_intensity(value: f64, min: f64, max: f64, step: f64) -> f64 {
 struct LevelSignals {
     level_idx: Signal<usize>,
     k: Signal<f64>,
+    phase: Signal<f64>,
     step_idx: Signal<usize>,
     progress: Signal<Vec<LevelProgress>>,
     animation_visible: Signal<bool>,
@@ -237,40 +301,113 @@ fn replace_levels(
         .set(vec![LevelProgress::default(); level_count]);
     signals.level_idx.set(0);
     if let Some(level) = first_level {
-        signals.k.set(level.k_def);
+        signals.k.set(launch_intensity(&level));
+        signals.phase.set(level.phase_def);
         signals.step_idx.set(step_index(level.recommended_step));
     }
     signals.animation_visible.set(false);
 }
 
-fn open_level(levels: Signal<Vec<Level>>, mut signals: LevelSignals, index: usize) {
-    if index >= unlocked_count(&(signals.progress)(), levels().len()) {
+fn open_level(
+    levels: Signal<Vec<Level>>,
+    mut signals: LevelSignals,
+    mut tutorial_seen: Signal<Vec<bool>>,
+    index: usize,
+) {
+    if index >= unlocked_count(&(signals.progress)(), &(tutorial_seen)(), levels().len()) {
         return;
     }
     let Some(level) = levels().get(index).cloned() else {
         return;
     };
+    if slot_is_tutorial(index) {
+        mark_tutorial_seen(&mut tutorial_seen, index);
+    }
     signals.level_idx.set(index);
-    signals.k.set(level.k_def);
+    signals.k.set(launch_intensity(&level));
+    signals.phase.set(level.phase_def);
     signals.step_idx.set(step_index(level.recommended_step));
     signals.animation_visible.set(false);
+}
+
+/// Opening a chapter's teaching level is what unlocks the rest of the chapter.
+fn mark_tutorial_seen(seen: &mut Signal<Vec<bool>>, index: usize) {
+    let mut next = seen();
+    let chapter = slot_chapter(index);
+    if next.len() < chapter_count() {
+        next.resize(chapter_count(), false);
+    }
+    if next.get(chapter) == Some(&true) {
+        return;
+    }
+    if let Some(entry) = next.get_mut(chapter) {
+        *entry = true;
+    }
+    seen.set(next);
 }
 
 fn append_group(
     mut all_levels: Signal<Vec<Level>>,
     mut signals: LevelSignals,
+    mut tutorial_seen: Signal<Vec<bool>>,
     seed: u64,
     group: usize,
+    variant: usize,
 ) {
     let mut levels = all_levels();
-    levels.extend(generate_level_group(seed, group));
+    levels.extend(chapter_slots(seed, group, variant));
     all_levels.set(levels);
     let mut progress = (signals.progress)();
-    progress.resize(
-        progress.len() + chapter_size(group),
-        LevelProgress::default(),
-    );
+    progress.resize(progress.len() + slot_size(group), LevelProgress::default());
     signals.progress.set(progress);
+    let mut seen = tutorial_seen();
+    if seen.len() < chapter_count() {
+        seen.resize(chapter_count(), false);
+    }
+    tutorial_seen.set(seen);
+}
+
+/// Re-rolls the loaded tutorials for a new variant. The real-game levels are
+/// untouched: only the teaching slot of every loaded chapter is rebuilt, and
+/// the player is sent back to the first slot to see it.
+fn reroll_variant(
+    mut all_levels: Signal<Vec<Level>>,
+    mut signals: LevelSignals,
+    mut tutorial_seen: Signal<Vec<bool>>,
+    mut tutorial_variant: Signal<usize>,
+    variant: usize,
+) {
+    let loaded = all_levels().len();
+    let mut levels = all_levels();
+    for chapter in 0..chapter_count() {
+        let slot = slot_offset(chapter);
+        if slot >= loaded {
+            break;
+        }
+        levels[slot] = tutorial_level_for(Chapter::all()[chapter], variant);
+    }
+    all_levels.set(levels);
+    let mut seen = tutorial_seen();
+    seen.resize(chapter_count(), false);
+    seen.fill(false);
+    seen[0] = true;
+    tutorial_seen.set(seen);
+    let mut progress = (signals.progress)();
+    for chapter in 0..chapter_count() {
+        let slot = slot_offset(chapter);
+        if slot < progress.len() {
+            progress[slot] = LevelProgress::default();
+        }
+    }
+    signals.progress.set(progress);
+    signals.level_idx.set(0);
+    if let Some(level) = all_levels().first().cloned() {
+        signals.k.set(launch_intensity(&level));
+        signals.phase.set(level.phase_def);
+        signals.step_idx.set(step_index(level.recommended_step));
+    }
+    signals.animation_visible.set(false);
+    tutorial_variant.set(variant);
 }
 
 fn format_seed(seed: u64) -> String {
@@ -304,6 +441,25 @@ fn copy_seed(seed: u64) {
     });
 }
 
+/// The Position chapter asks where to release, so its intensity is shown but not
+/// driven. The level still leaves the dial live: this is a lock on the control,
+/// not a change to what the generator publishes.
+fn intensity_editable(level: &Level) -> bool {
+    level.knobs().intensity && level.chapter != Chapter::Position
+}
+
+/// The intensity a probe is dropped at. A dial the player cannot move is set to
+/// the intensity the level was solved at rather than to the default the dial
+/// starts from: on a chapter with a free intensity those are two different
+/// values, and launching at the default is a level nobody can win.
+fn launch_intensity(level: &Level) -> f64 {
+    if intensity_editable(level) {
+        level.k_def
+    } else {
+        level.k_solution
+    }
+}
+
 fn history_limit(mode: SimulationMode) -> usize {
     match mode {
         SimulationMode::Laboratory => HISTORY_LIMIT,
@@ -312,21 +468,35 @@ fn history_limit(mode: SimulationMode) -> usize {
 }
 
 fn should_show_vectors(mode: SimulationMode, chapter: Chapter) -> bool {
-    mode == SimulationMode::Laboratory || chapter == Chapter::Discover
+    mode == SimulationMode::Laboratory || chapter == Chapter::Follow
 }
 
-fn chapter_index_of(level_index: usize) -> usize {
-    (0..chapter_count())
-        .find(|group| level_index < chapter_offset(*group) + chapter_size(*group))
-        .unwrap_or_else(|| chapter_count() - 1)
+/// The play slots of one chapter: its teaching level first, then its
+/// real-game levels. Same seed, so a chapter is reproducible from its seed.
+fn chapter_slots(seed: u64, group: usize, variant: usize) -> Vec<Level> {
+    let mut levels = vec![tutorial_level_for(Chapter::all()[group], variant)];
+    levels.extend(generate_level_group(seed, group));
+    levels
 }
 
 fn solved_prefix(progress: &[LevelProgress]) -> usize {
     progress.iter().take_while(|level| level.solved).count()
 }
 
-fn unlocked_count(progress: &[LevelProgress], loaded: usize) -> usize {
-    (solved_prefix(progress) + 1).min(loaded)
+/// A slot is playable when the run of solved levels reaches it, or once its
+/// chapter's teaching level has been opened. The lesson is the way in, never a
+/// lock: skipping it costs nothing but the badge.
+fn slot_unlocked(progress: &[LevelProgress], seen: &[bool], index: usize, loaded: usize) -> bool {
+    if index >= loaded {
+        return false;
+    }
+    index < solved_prefix(progress) + 1 || seen.get(slot_chapter(index)).copied().unwrap_or(false)
+}
+
+fn unlocked_count(progress: &[LevelProgress], seen: &[bool], loaded: usize) -> usize {
+    (0..loaded)
+        .find(|index| !slot_unlocked(progress, seen, *index, loaded))
+        .unwrap_or(loaded)
 }
 
 fn level_button_class(active: bool, unlocked: bool, solved: bool) -> &'static str {
@@ -480,24 +650,28 @@ fn closest_message(result: &SimResult) -> String {
 
 #[component]
 fn App() -> Element {
-    let all_levels = use_signal(|| generate_level_group(DEFAULT_SEED, 0));
-    let initial_k = all_levels()[0].k_def;
+    let all_levels = use_signal(|| chapter_slots(DEFAULT_SEED, 0, 0));
+    let initial_k = launch_intensity(&all_levels()[0]);
     let initial_step = all_levels()[0].recommended_step;
-    let total_levels = total_level_count();
+    let total_levels = slot_count();
     let level_idx = use_signal(|| 0usize);
-    let mut mode = use_signal(|| SimulationMode::Exploration);
     let mut k = use_signal(|| initial_k);
+    let mut phase = use_signal(|| all_levels()[0].phase_def);
     let mut step_idx = use_signal(|| step_index(initial_step));
-    let mut progress = use_signal(|| vec![LevelProgress::default(); chapter_size(0)]);
+    let mut progress = use_signal(|| vec![LevelProgress::default(); slot_size(0)]);
+    let mut tutorial_seen = use_signal(|| vec![false; chapter_count()]);
+    let mut tutorial_variant = use_signal(|| 0usize);
     let mut show_levels = use_signal(|| false);
     let mut animation_id = use_signal(|| 0usize);
     let mut animation_visible = use_signal(|| false);
     let mut active_seed = use_signal(|| DEFAULT_SEED);
     let mut copy_status = use_signal(String::new);
     let mut entropy_loaded = use_signal(|| false);
+    let mut restored = use_signal(|| false);
     let level_signals = LevelSignals {
         level_idx,
         k,
+        phase,
         step_idx,
         progress,
         animation_visible,
@@ -519,34 +693,93 @@ fn App() -> Element {
         }
         entropy_loaded.set(true);
         spawn(async move {
-            let next_seed = entropy_seed().await;
-            let next_levels = generate_level_group(next_seed, 0);
+            let save = read_save().await;
+            let (next_seed, next_variant) = match save.as_ref() {
+                Some(save) => (
+                    save.seed.filter(|seed| *seed != 0).unwrap_or(DEFAULT_SEED),
+                    save.variant.unwrap_or(0),
+                ),
+                None => (entropy_seed().await, 0),
+            };
+            let next_levels = chapter_slots(next_seed, 0, next_variant);
+            let mut next_seen = match save.as_ref() {
+                Some(save) if save.seen.len() == chapter_count() => save.seen.clone(),
+                _ => vec![false; chapter_count()],
+            };
+            // The first slot is the first teaching level: the run starts inside it.
+            next_seen[0] = true;
+            let mut next_progress = vec![LevelProgress::default(); next_levels.len()];
+            if let Some(save) = save {
+                for (entry, saved) in next_progress.iter_mut().zip(save.progress) {
+                    entry.solved = saved.solved;
+                    entry.release = saved.release;
+                    entry.attempts = saved.attempts;
+                }
+            }
             active_seed.set(next_seed);
+            tutorial_variant.set(next_variant);
+            tutorial_seen.set(next_seen);
             copy_status.set(String::new());
             replace_levels(all_levels, level_signals, next_levels);
+            progress.set(next_progress);
+            restored.set(true);
+        });
+    });
+
+    // Durable state is written back on every change; the payload is a few
+    // hundred bytes, so there is nothing to debounce. It waits for the restore
+    // to finish first: writing the empty default over a real save would be the
+    // one bug a player could never recover from.
+    use_effect(move || {
+        if !restored() {
+            return;
+        }
+        let data = save_data(
+            active_seed(),
+            tutorial_variant(),
+            &progress(),
+            &tutorial_seen(),
+        );
+        spawn(async move {
+            write_save(&data).await;
         });
     });
 
     use_effect(move || {
         let loaded = all_levels().len();
-        let solved = solved_prefix(&progress());
-        if loaded < total_levels && solved + 1 >= loaded {
-            let group = chapter_index_of(loaded);
+        let reached = unlocked_count(&progress(), &tutorial_seen(), loaded);
+        if loaded < total_levels && reached >= loaded {
+            let group = slot_chapter(loaded);
             let seed = active_seed();
+            let variant = tutorial_variant();
             spawn(async move {
-                append_group(all_levels, level_signals, seed, group);
+                append_group(
+                    all_levels,
+                    level_signals,
+                    tutorial_seen,
+                    seed,
+                    group,
+                    variant,
+                );
             });
         }
     });
 
     let levels_snapshot = all_levels();
     let current_level_idx = level_idx();
-    let current = levels_snapshot[current_level_idx].clone();
+    let base_level = levels_snapshot[current_level_idx].clone();
+    // The dial freezes the field: everything below simulates and draws the
+    // snapshot the player dialled into, never the live field.
+    let current = base_level.resolved(phase());
+    let knobs = current.knobs();
+    let intensity_editable = intensity_editable(&current);
     let launch_level = current.clone();
     let clickable_level = current.clone();
-    let current_mode = mode();
+    let current_mode = base_level.chapter.mode();
     let current_step = STEPS[step_idx()];
     let current_progress = progress()[current_level_idx].clone();
+    let is_tutorial = slot_is_tutorial(current_level_idx);
+    let blind = matches!(current.rules.visibility, Visibility::BlindStart { .. });
     let release = release_of(&current, &current_progress);
     let preview = integrate_from(&current, release, k());
     let description = if current_mode == SimulationMode::Exploration {
@@ -576,7 +809,22 @@ fn App() -> Element {
                 Vec::new()
             }
         });
-    let path_d = path_to_svg(&shown_points);
+    // A hidden trajectory shows only the part the player has earned: a blind
+    // start reveals the run as it flies, and the rest of the path once the
+    // beacon has been found.
+    let revealed = if blind && has_launched {
+        current.rules.visibility.shown_points(shown_points.len())
+    } else {
+        shown_points.len()
+    };
+    let reveal_beacons = !blind || has_launched;
+    let shown_path_d = path_to_svg(&shown_points[..revealed.min(shown_points.len())]);
+    let blind_path_d = path_to_svg(&shown_points[revealed.min(shown_points.len())..]);
+    let ghost_paths: Vec<String> = base_level
+        .ghosts
+        .iter()
+        .map(|ghost| path_to_svg(ghost))
+        .collect();
     let history_snapshot = current_progress.history;
     let history_paths: Vec<(String, String, bool)> = history_snapshot
         .iter()
@@ -633,16 +881,17 @@ fn App() -> Element {
         .map(|result| result.visited)
         .unwrap_or(0);
     let progress_snapshot = progress();
-    let unlocked = unlocked_count(&progress_snapshot, levels_snapshot.len());
+    let seen_snapshot = tutorial_seen();
+    let unlocked = unlocked_count(&progress_snapshot, &seen_snapshot, levels_snapshot.len());
     let can_go_previous = current_level_idx > 0;
     let can_go_next = current_level_idx + 1 < unlocked;
     let level_groups: Vec<(String, Vec<LevelChip>)> = (0..chapter_count())
         .filter_map(|group| {
-            let first = chapter_offset(group);
+            let first = slot_offset(group);
             if first >= levels_snapshot.len() {
                 return None;
             }
-            let last = (first + chapter_size(group)).min(levels_snapshot.len());
+            let last = (first + slot_size(group)).min(levels_snapshot.len());
             let chips = (first..last)
                 .map(|index| LevelChip {
                     index,
@@ -654,6 +903,11 @@ fn App() -> Element {
                             .is_some_and(|level| level.solved),
                     ),
                     disabled: index >= unlocked,
+                    label: if slot_is_tutorial(index) {
+                        "T".to_string()
+                    } else {
+                        (index + 1).to_string()
+                    },
                 })
                 .collect();
             Some((levels_snapshot[first].chapter.title().to_string(), chips))
@@ -667,15 +921,14 @@ fn App() -> Element {
     } else {
         String::new()
     };
-    let mode_value = if current_mode == SimulationMode::Exploration {
-        "exploration"
-    } else {
-        "laboratory"
-    };
     let lab_goal = if current.beacons.len() > 1 {
         "Atteindre toutes les balises"
     } else {
         "Atteindre la balise"
+    };
+    let mode_label = match current_mode {
+        SimulationMode::Laboratory => "Laboratoire",
+        SimulationMode::Exploration => "Exploration",
     };
     let mode_hint = match (
         current_mode,
@@ -689,6 +942,47 @@ fn App() -> Element {
         "Historique d'exploration"
     } else {
         "Essais précédents"
+    };
+    let tutorial_solved = current_progress.solved;
+    let variant_label = ["A", "B", "C"]
+        .get(tutorial_variant().min(2))
+        .copied()
+        .unwrap_or("A");
+    let phase_span = base_level.phase_max - base_level.phase_min;
+    let phase_step = if phase_span > 0.0 {
+        phase_span / PHASE_SLIDER_STEPS as f64
+    } else {
+        0.0
+    };
+    let phase_readout = if phase_span > 0.0 {
+        format!(
+            "{:.0} % du cycle",
+            (phase() - base_level.phase_min) / phase_span * 100.0
+        )
+    } else {
+        String::new()
+    };
+    // Nothing to dial: the level has one moment, and showing a dead slider
+    // would be a lie about what the level asks for.
+    let show_dial = base_level.has_timeline();
+    let pinned_knobs = [
+        (!intensity_editable).then_some("intensité"),
+        (!knobs.release).then_some("largage"),
+        (!knobs.phase).then_some("phase"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<&str>>()
+    .join(" · ");
+    let pinned_label = if pinned_knobs.is_empty() {
+        String::new()
+    } else {
+        format!("fixé : {pinned_knobs}")
+    };
+    let launch_label = if knobs.intensity {
+        "Larguer la sonde"
+    } else {
+        "Voir la démonstration"
     };
 
     rsx! {
@@ -708,13 +1002,24 @@ fn App() -> Element {
                         disabled: !can_go_previous,
                         onclick: move |_| {
                             if current_level_idx > 0 {
-                                open_level(all_levels, level_signals, current_level_idx - 1);
+                                open_level(
+                                    all_levels,
+                                    level_signals,
+                                    tutorial_seen,
+                                    current_level_idx - 1,
+                                );
                             }
                         },
                         "‹ Précédente"
                     }
                     div { class: "level-heading",
-                        span { class: "level-index", "Zone {current_level_idx + 1} / {total_levels}" }
+                        span { class: "level-index",
+                            if is_tutorial {
+                                "Tutoriel {current.chapter.group_index() + 1} · variante {variant_label}"
+                            } else {
+                                "Zone {current_level_idx + 1} / {total_levels}"
+                            }
+                        }
                         span { class: "level-family", "Chapitre {current.chapter.group_index() + 1} · {current.chapter.title()} · {current.focus} ({current.step_index + 1}/{current.chapter.size()})" }
                     }
                     button {
@@ -723,7 +1028,12 @@ fn App() -> Element {
                         disabled: !can_go_next,
                         onclick: move |_| {
                             if can_go_next {
-                                open_level(all_levels, level_signals, current_level_idx + 1);
+                                open_level(
+                                    all_levels,
+                                    level_signals,
+                                    tutorial_seen,
+                                    current_level_idx + 1,
+                                );
                             }
                         },
                         "Suivante ›"
@@ -750,9 +1060,14 @@ fn App() -> Element {
                                             class: chip.class,
                                             disabled: chip.disabled,
                                             onclick: move |_| {
-                                                open_level(all_levels, level_signals, chip.index);
+                                                open_level(
+                                                    all_levels,
+                                                    level_signals,
+                                                    tutorial_seen,
+                                                    chip.index,
+                                                );
                                             },
-                                            "{chip.index + 1}"
+                                            "{chip.label}"
                                         }
                                     }
                                 }
@@ -760,67 +1075,19 @@ fn App() -> Element {
                         }
                     }
                 }
-                div { class: "mode-row",
-                    label { "Mode" }
-                    select {
-                        class: "mode-select",
-                        value: mode_value,
-                        onchange: move |event| {
-                            let next_mode = match event.value().as_str() {
-                                "exploration" => SimulationMode::Exploration,
-                                _ => SimulationMode::Laboratory,
-                            };
-                            mode.set(next_mode);
-                            let reset_attempts = next_mode == SimulationMode::Laboratory;
-                            let mut levels = progress();
-                            for level in levels.iter_mut() {
-                                level.history.clear();
-                                level.active_attempt = None;
-                                if reset_attempts {
-                                    level.attempts = 0;
-                                }
-                            }
-                            progress.set(levels);
-                            animation_visible.set(false);
-                        },
-                        option { value: "laboratory", "Laboratoire" }
-                        option { value: "exploration", "Exploration" }
-                    }
-                    span { class: "mode-hint", "{mode_hint}" }
-                }
-                div { class: "seed-row",
-                    button {
-                        r#type: "button",
-                        class: "action small-button",
-                        onclick: move |_| {
-                            spawn(async move {
-                                let mut next_seed = entropy_seed().await;
-                                if next_seed == active_seed() {
-                                    next_seed = next_seed.wrapping_add(1);
-                                }
-                                let next_levels = generate_level_group(next_seed, 0);
-                                active_seed.set(next_seed);
-                                copy_status.set(String::new());
-                                replace_levels(all_levels, level_signals, next_levels);
-                            });
-                        },
-                        "Nouvelle zone"
-                    }
-                    button {
-                        r#type: "button",
-                        class: "ghost small-button",
-                        onclick: move |_| {
-                            let seed = active_seed();
-                            copy_status.set(format!("Graine copiée : {}.", format_seed(seed)));
-                            copy_seed(seed);
-                        },
-                        "Copier la graine"
-                    }
-                    if !copy_status().is_empty() {
-                        span { class: "seed-status", "{copy_status()}" }
+                if is_tutorial {
+                    div { class: "tutorial-banner",
+                        span { class: "tutorial-badge",
+                            if tutorial_solved { "Tutoriel ✓" } else { "Tutoriel" }
+                        }
+                        span { class: "tutorial-hint", "{tutorial_hint(current.chapter)}" }
+                        span { class: "tutorial-gate", "Tu peux passer : ce tutoriel n'est pas obligatoire." }
                     }
                 }
                 div { class: "desc", "{current.title} — {description}" }
+                if !pinned_label.is_empty() {
+                    div { class: "knob-note", "{pinned_label}" }
+                }
 
                 svg {
                     view_box: "0 0 {W} {H}", class: "field-svg",
@@ -911,7 +1178,18 @@ fn App() -> Element {
                         r: if current.rules.release == ReleaseMode::Fixed { "6" } else { "7" },
                         class: "point-a release-handle",
                     }
-                    for (index, beacon) in current.beacons.iter().enumerate() {
+                    if !reveal_beacons && !current.beacons.is_empty() {
+                        text {
+                            x: "16", y: "26", class: "blind-note",
+                            "balise cachée · la trajectoire se révèle en vol",
+                        }
+                    }
+                    for (index, beacon) in current
+                        .beacons
+                        .iter()
+                        .enumerate()
+                        .filter(|_| reveal_beacons)
+                    {
                         ellipse {
                             key: "beacon-{index}",
                             cx: "{map_x(beacon.0):.2}", cy: "{map_y(beacon.1):.2}",
@@ -933,6 +1211,13 @@ fn App() -> Element {
                             }
                         }
                     }
+                    for (index, ghost) in ghost_paths.iter().enumerate() {
+                        path {
+                            key: "ghost-{index}",
+                            d: "{ghost}",
+                            class: "path ghost-path",
+                        }
+                    }
                     for (index, (history_path, _, _)) in history_paths.iter().enumerate() {
                         path {
                             key: "history-{index}",
@@ -940,9 +1225,15 @@ fn App() -> Element {
                             class: "path history-path",
                         }
                     }
+                    if !blind_path_d.is_empty() {
+                        path {
+                            d: "{blind_path_d}",
+                            class: "path blind-path",
+                        }
+                    }
                     path {
                         path_length: "1",
-                        d: "{path_d}",
+                        d: "{shown_path_d}",
                         class: path_class,
                     }
                     if let Some(closest) = closest_marker {
@@ -968,12 +1259,82 @@ fn App() -> Element {
                     }
                 }
 
+                div { class: "mode-row",
+                    label { "Mode" }
+                    // The mode follows the chapter, so this is a reading of the
+                    // level and not a switch.
+                    span { class: "mode-select", "{mode_label}" }
+                    span { class: "mode-hint", "{mode_hint}" }
+                }
+
+                div { class: "seed-row",
+                    button {
+                        r#type: "button",
+                        class: "action small-button",
+                        onclick: move |_| {
+                            spawn(async move {
+                                let mut next_seed = entropy_seed().await;
+                                if next_seed == active_seed() {
+                                    next_seed = next_seed.wrapping_add(1);
+                                }
+                                let variant = tutorial_variant();
+                                let next_levels = chapter_slots(next_seed, 0, variant);
+                                active_seed.set(next_seed);
+                                copy_status.set(String::new());
+                                tutorial_seen.set(vec![false; chapter_count()]);
+                                replace_levels(all_levels, level_signals, next_levels);
+                            });
+                        },
+                        "Nouvelle zone"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost small-button",
+                        onclick: move |_| {
+                            let seed = active_seed();
+                            copy_status.set(format!("Graine copiée : {}.", format_seed(seed)));
+                            copy_seed(seed);
+                        },
+                        "Copier la graine"
+                    }
+                    label { class: "variant-label", "Tutoriel" }
+                    select {
+                        class: "step-select",
+                        value: "{variant_label}",
+                        onchange: move |event| {
+                            let Some(variant) = ["A", "B", "C"]
+                                .iter()
+                                .position(|label| *label == event.value())
+                            else {
+                                return;
+                            };
+                            reroll_variant(
+                                all_levels,
+                                level_signals,
+                                tutorial_seen,
+                                tutorial_variant,
+                                variant,
+                            );
+                        },
+                        for (index, label) in ["A", "B", "C"].iter().enumerate() {
+                            option {
+                                key: "variant-{index}",
+                                value: "{label}",
+                                "variante {label}"
+                            }
+                        }
+                    }
+                    if !copy_status().is_empty() {
+                        span { class: "seed-status", "{copy_status()}" }
+                    }
+                }
                 div { class: "controls",
                     label { "Intensité du courant" }
                     div { class: "stepper",
                         button {
                             r#type: "button",
                             class: "step-button",
+                            disabled: !intensity_editable,
                             onclick: move |_| {
                                 let next = normalize_intensity(
                                     k() - current_step,
@@ -991,6 +1352,7 @@ fn App() -> Element {
                         input {
                             r#type: "number",
                             class: "intensity-input",
+                            disabled: !intensity_editable,
                             min: "{current.k_min}",
                             max: "{current.k_max}",
                             step: "{current_step}",
@@ -1013,6 +1375,7 @@ fn App() -> Element {
                         button {
                             r#type: "button",
                             class: "step-button",
+                            disabled: !intensity_editable,
                             onclick: move |_| {
                                 let next = normalize_intensity(
                                     k() + current_step,
@@ -1036,6 +1399,7 @@ fn App() -> Element {
                     }
                     select {
                         class: "step-select",
+                        disabled: !intensity_editable,
                         value: "{format_intensity(current_step, current_step)}",
                         onchange: move |event| {
                             if let Some(index) = event
@@ -1072,6 +1436,7 @@ fn App() -> Element {
                     input {
                         r#type: "range",
                         class: "intensity-range",
+                        disabled: !intensity_editable,
                         min: "{current.k_min}",
                         max: "{current.k_max}",
                         step: "{current_step}",
@@ -1090,6 +1455,36 @@ fn App() -> Element {
                                 k.set(next);
                             }
                         },
+                    }
+                }
+
+                if show_dial {
+                    div { class: "controls",
+                        div { class: "step-heading",
+                            label { class: "step-label", "Phase du champ" }
+                            span { class: "window-hint", "{phase_readout}" }
+                        }
+                        input {
+                            r#type: "range",
+                            class: "intensity-range phase-range",
+                            min: "{base_level.phase_min}",
+                            max: "{base_level.phase_max}",
+                            step: "{phase_step}",
+                            value: "{phase()}",
+                            disabled: !knobs.phase,
+                            oninput: move |event| {
+                                if let Ok(value) = event.value().parse::<f64>() {
+                                    if (value - phase()).abs() > f64::EPSILON {
+                                        archive_active_attempt(
+                                            &mut progress,
+                                            current_level_idx,
+                                            current_mode,
+                                        );
+                                    }
+                                    phase.set(value);
+                                }
+                            },
+                        }
                     }
                 }
 
@@ -1125,7 +1520,7 @@ fn App() -> Element {
                             }
                             progress.set(levels);
                         },
-                        "Larguer la sonde"
+                        "{launch_label}"
                     }
                     button {
                         class: "ghost",
@@ -1192,6 +1587,12 @@ fn App() -> Element {
                         span { span { class: "dot dot-b" } " Référence" }
                         span { span { class: "dot dot-o" } " Astéroïde" }
                     }
+                    if !ghost_paths.is_empty() {
+                        span { span { class: "dot dot-g" } " Fils voisins (échouent)" }
+                    }
+                    if blind && !reveal_beacons {
+                        span { span { class: "dot dot-c" } " Balise cachée" }
+                    }
                     if closest_marker.is_some() {
                         span { span { class: "dot dot-c" } " Passage le plus proche" }
                     }
@@ -1249,6 +1650,7 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .direction-hint{stroke:#4ade80;stroke-width:2.4;stroke-linecap:round}
 .hint-arrow-head{fill:#4ade80}
 .closest-point{fill:var(--closest);stroke:var(--bg);stroke-width:2}
+.dot-g{background:var(--accent2)}
 .closest-direction-hint{stroke:var(--closest);stroke-width:2.4;stroke-linecap:round}
 .closest-hint-arrow-head{fill:var(--closest)}
 .collision-point{fill:var(--danger);stroke:#fff;stroke-width:2}
@@ -1256,6 +1658,18 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .active-path{stroke-dasharray:1;stroke-dashoffset:1;animation:draw-path 1.2s ease-out forwards}
 .diagnostic-point{opacity:0;animation:reveal-point .1s ease-out 1.1s forwards}
 .history-path{stroke:var(--sub);stroke-width:1.6;stroke-dasharray:5 6;opacity:.55}
+.ghost-path{stroke:var(--accent2);stroke-width:1.6;stroke-dasharray:2 5;opacity:.5}
+.blind-path{stroke:var(--sub);stroke-width:1.4;stroke-dasharray:3 6;opacity:.4}
+.blind-note{fill:var(--sub);font-size:12px;letter-spacing:.4px}
+.tutorial-banner{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 2px;
+  padding:10px 12px;border:1px solid var(--accent);border-radius:8px;background:rgba(94,227,201,.08)}
+.tutorial-badge{font-size:11px;letter-spacing:1.4px;text-transform:uppercase;color:var(--accent);
+  border:1px solid var(--accent);border-radius:999px;padding:2px 8px}
+.tutorial-hint{flex:1 1 240px;color:var(--ink)}
+.tutorial-gate{color:var(--sub);font-size:12px}
+.knob-note{color:var(--sub);font-size:12px;margin:2px 0 6px}
+.variant-label{color:var(--sub);font-size:12px}
+.phase-range{accent-color:var(--accent2)}
 .controls{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap}
 .controls label{font-size:.85rem;color:var(--sub)}
 .controls>label:first-child{min-width:140px}
@@ -1297,6 +1711,7 @@ h1{font-size:1.3rem;margin:0 0 4px}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peoplemodeler_core::{total_level_count, Knobs};
 
     fn attempt(k: f64) -> Attempt {
         Attempt {
@@ -1360,7 +1775,7 @@ mod tests {
     fn only_the_first_chapter_teaches_the_field_vectors() {
         assert!(should_show_vectors(
             SimulationMode::Exploration,
-            Chapter::Discover
+            Chapter::Follow
         ));
         for chapter in Chapter::all().iter().skip(1) {
             assert!(
@@ -1373,26 +1788,99 @@ mod tests {
 
     #[test]
     fn zones_unlock_one_at_a_time() {
-        let mut progress = vec![LevelProgress::default(); total_level_count()];
-        assert_eq!(unlocked_count(&progress, progress.len()), 1);
+        let loaded = slot_count();
+        let seen = vec![false; chapter_count()];
+        let mut progress = vec![LevelProgress::default(); loaded];
+        assert_eq!(unlocked_count(&progress, &seen, loaded), 1);
         progress[0].solved = true;
-        assert_eq!(unlocked_count(&progress, progress.len()), 2);
+        assert_eq!(unlocked_count(&progress, &seen, loaded), 2);
         progress[2].solved = true;
-        assert_eq!(unlocked_count(&progress, progress.len()), 2);
+        assert_eq!(unlocked_count(&progress, &seen, loaded), 2);
         progress[1].solved = true;
-        assert_eq!(unlocked_count(&progress, progress.len()), 4);
+        assert_eq!(unlocked_count(&progress, &seen, loaded), 4);
+    }
+
+    #[test]
+    fn opening_a_tutorial_unlocks_the_chapter_without_solving_it() {
+        let loaded = slot_count();
+        let door = slot_offset(1);
+        assert_eq!(door, slot_size(0));
+        let mut progress = vec![LevelProgress::default(); loaded];
+        let mut seen = vec![false; chapter_count()];
+        // Solving chapter 1 lands the player on chapter 2's teaching level: it
+        // is the door, and it is always reachable.
+        for level in progress.iter_mut().take(door) {
+            level.solved = true;
+        }
+        assert!(slot_unlocked(&progress, &seen, door, loaded));
+        // The real levels behind it stay shut until the lesson is met.
+        assert!(!slot_unlocked(&progress, &seen, door + 1, loaded));
+        // Skipping it is allowed: opening the tutorial is the whole price.
+        seen[1] = true;
+        assert!(slot_unlocked(&progress, &seen, door, loaded));
+        assert!(slot_unlocked(&progress, &seen, door + 1, loaded));
+        // Chapter 3 has not been met, so its door is still shut.
+        assert!(!slot_unlocked(&progress, &seen, slot_offset(2), loaded));
+    }
+
+    #[test]
+    fn a_tutorial_slot_is_the_head_of_its_chapter() {
+        for chapter in 0..chapter_count() {
+            assert!(slot_is_tutorial(slot_offset(chapter)));
+            assert!(!slot_is_tutorial(slot_offset(chapter) + 1));
+            assert_eq!(slot_chapter(slot_offset(chapter)), chapter);
+        }
+        assert_eq!(slot_count(), total_level_count() + chapter_count());
+    }
+
+    #[test]
+    fn a_chapter_opens_with_its_teaching_level() {
+        let slots = chapter_slots(DEFAULT_SEED, 0, 0);
+        assert_eq!(slots.len(), slot_size(0));
+        let teaching = &slots[0];
+        assert_eq!(teaching.chapter, Chapter::Follow);
+        assert_eq!(teaching.step_index, 0);
+        // The teaching level is a demonstration: nothing to set.
+        assert_eq!(teaching.knobs(), Knobs::NONE);
+        assert!(integrate_from(teaching, teaching.default_release, teaching.k_def).reached());
+        for (index, level) in slots.iter().enumerate().skip(1) {
+            assert_eq!(level.chapter, Chapter::Follow);
+            assert_eq!(level.step_index, index - 1);
+            assert!(level.knobs() != Knobs::NONE);
+        }
+    }
+
+    #[test]
+    fn the_save_round_trips_the_durable_facts() {
+        let mut progress = vec![LevelProgress::default(); 3];
+        progress[0].solved = true;
+        progress[1].release = Some((-2.5, 1.25));
+        progress[2].attempts = 4;
+        let seen = vec![true, false, true];
+        let data = save_data(0xABCD, 1, &progress, &seen);
+        let json = serde_json::to_string(&data).expect("serialisable");
+        let back: SaveData = serde_json::from_str(&json).expect("reversible");
+        assert_eq!(back.seed, Some(0xABCD));
+        assert_eq!(back.variant, Some(1));
+        assert!(back.progress[0].solved);
+        assert_eq!(back.progress[1].release, Some((-2.5, 1.25)));
+        assert_eq!(back.progress[2].attempts, 4);
+        assert_eq!(back.seen, seen);
+        // A save from an older build has to load, not fail.
+        let empty: SaveData = serde_json::from_str("{}").expect("defaults");
+        assert!(empty.progress.is_empty());
+        assert!(empty.seen.is_empty());
     }
 
     #[test]
     fn unlock_stops_at_the_loaded_levels() {
-        let mut progress = vec![LevelProgress::default(); chapter_size(0)];
-        for level in progress.iter_mut().take(chapter_size(0) - 1) {
+        let loaded = slot_size(0);
+        let seen = vec![false; chapter_count()];
+        let mut progress = vec![LevelProgress::default(); loaded];
+        for level in progress.iter_mut().take(loaded - 1) {
             level.solved = true;
         }
-        assert_eq!(
-            unlocked_count(&progress, chapter_size(0) - 1),
-            chapter_size(0) - 1
-        );
+        assert_eq!(unlocked_count(&progress, &seen, loaded - 1), loaded - 1);
     }
 
     #[test]
@@ -1423,7 +1911,7 @@ mod tests {
             title: "test",
             desc: "test",
             focus: "test",
-            chapter: Chapter::Discover,
+            chapter: Chapter::Follow,
             rules: peoplemodeler_core::LevelRules::default(),
             step_index: 0,
             field: peoplemodeler_core::FlowField::Calm {
@@ -1434,6 +1922,11 @@ mod tests {
             k_min: -1.0,
             k_max: 1.0,
             k_def: 0.0,
+            k_solution: 0.0,
+            phase_min: 0.0,
+            phase_max: 0.0,
+            phase_def: 0.0,
+            phase_sweep: 1.0,
             recommended_step: 0.5,
             exploration_attempts: 1,
             k_window: 0.0,
@@ -1443,6 +1936,74 @@ mod tests {
             ghosts: Vec::new(),
             beacons: Vec::new(),
             obstacles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_position_chapter_locks_the_intensity() {
+        let levels: Vec<Level> = (0..chapter_count())
+            .flat_map(|group| chapter_slots(DEFAULT_SEED, group, 0))
+            .collect();
+        let position: Vec<&Level> = levels
+            .iter()
+            .filter(|level| level.chapter == Chapter::Position)
+            .collect();
+        assert!(!position.is_empty(), "aucun niveau de Position");
+        for level in position {
+            assert!(
+                !intensity_editable(level),
+                "l'intensité reste éditable sur {}",
+                level.focus
+            );
+            // Locked means locked at the intensity the level was solved at: the
+            // default the dial starts from is not a winning setting here.
+            assert_eq!(
+                launch_intensity(level),
+                level.k_solution,
+                "lancement à la mauvaise intensité sur {}",
+                level.focus
+            );
+        }
+        // The lock is the chapter's, not the generator's: another chapter that
+        // leaves the dial live must still let the player move it.
+        let other: Vec<&Level> = levels
+            .iter()
+            .filter(|level| {
+                level.chapter != Chapter::Position
+                    && level.knobs().intensity
+                    && !level.chapter.is_sandbox()
+            })
+            .collect();
+        assert!(!other.is_empty(), "aucun autre chapitre à intensité libre");
+        for level in other {
+            assert!(
+                intensity_editable(level),
+                "intensité bloquée sur {}",
+                level.focus
+            );
+            assert_eq!(
+                launch_intensity(level),
+                level.k_def,
+                "lancement hors du réglage par défaut sur {}",
+                level.focus
+            );
+        }
+    }
+
+    #[test]
+    fn the_mode_follows_the_chapter() {
+        assert_eq!(
+            Chapter::Exploration.mode(),
+            SimulationMode::Exploration,
+            "le chapitre sandbox doit tourner en Exploration"
+        );
+        for chapter in Chapter::all() {
+            let expected = if chapter == Chapter::Exploration {
+                SimulationMode::Exploration
+            } else {
+                SimulationMode::Laboratory
+            };
+            assert_eq!(chapter.mode(), expected, "{:?}", chapter);
         }
     }
 
