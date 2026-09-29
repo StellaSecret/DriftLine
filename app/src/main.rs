@@ -5,8 +5,8 @@ use dioxus::prelude::*;
 use peoplemodeler_core::{
     chapter_count, generate_level_group, integrate_from, slot_chapter, slot_count,
     slot_is_tutorial, slot_offset, slot_size, tutorial_hint, tutorial_level_for, Chapter, Level,
-    Outcome, ReleaseMode, SimResult, SimulationMode, Vector2, Visibility, DEFAULT_SEED, WIN_R,
-    XMAX, XMIN, YMAX, YMIN,
+    Outcome, ReleaseMode, SimResult, Vector2, Visibility, DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX,
+    YMIN,
 };
 
 const W: f64 = 640.0;
@@ -15,7 +15,6 @@ const X_SCALE: f64 = W / (XMAX - XMIN);
 const Y_SCALE: f64 = H / (YMAX - YMIN);
 const STEPS: [f64; 6] = [1.0, 0.5, 0.1, 0.05, 0.01, 0.001];
 const HISTORY_LIMIT: usize = 3;
-const HINT_LEN_PX: f64 = 44.0;
 /// The dial is a continuous moment in the field's cycle: enough steps that it
 /// reads as a slider, few enough that the preview stays honest.
 const PHASE_SLIDER_STEPS: usize = 360;
@@ -39,7 +38,6 @@ struct LevelChip {
 struct LevelProgress {
     history: Vec<Attempt>,
     active_attempt: Option<Attempt>,
-    attempts: usize,
     solved: bool,
     release: Option<(f64, f64)>,
 }
@@ -64,8 +62,6 @@ struct SavedLevel {
     solved: bool,
     #[serde(default)]
     release: Option<(f64, f64)>,
-    #[serde(default)]
-    attempts: usize,
 }
 
 fn save_data(seed: u64, variant: usize, progress: &[LevelProgress], seen: &[bool]) -> SaveData {
@@ -77,7 +73,6 @@ fn save_data(seed: u64, variant: usize, progress: &[LevelProgress], seen: &[bool
             .map(|level| SavedLevel {
                 solved: level.solved,
                 release: level.release,
-                attempts: level.attempts,
             })
             .collect(),
         seen: seen.to_vec(),
@@ -222,28 +217,6 @@ fn vector_endpoints(level: &Level, x: f64, y: f64, k: f64) -> Option<(f64, f64, 
         map_x(x + ux * 0.28),
         map_y(y + uy * 0.28),
     ))
-}
-
-fn launch_heading(level: &Level, a: (f64, f64), k: f64) -> (f64, f64, f64, f64) {
-    let Vector2 { x: vx, y: vy } = level.flow_at(a.0, a.1, k);
-    let length = Vector2 { x: vx, y: vy }.length();
-    let (ux, uy) = if length <= f64::EPSILON {
-        (1.0, 0.0)
-    } else {
-        (vx / length, vy / length)
-    };
-    let (sx, sy) = (map_x(a.0), map_y(a.1));
-    let (dx, dy) = (map_x(a.0 + ux) - sx, map_y(a.1 + uy) - sy);
-    let length = (dx * dx + dy * dy).sqrt();
-    if length <= f64::EPSILON {
-        return (sx, sy, sx + HINT_LEN_PX, sy);
-    }
-    (
-        sx,
-        sy,
-        sx + dx / length * HINT_LEN_PX,
-        sy + dy / length * HINT_LEN_PX,
-    )
 }
 
 fn step_index(step: f64) -> usize {
@@ -460,17 +433,6 @@ fn launch_intensity(level: &Level) -> f64 {
     }
 }
 
-fn history_limit(mode: SimulationMode) -> usize {
-    match mode {
-        SimulationMode::Laboratory => HISTORY_LIMIT,
-        SimulationMode::Exploration => usize::MAX,
-    }
-}
-
-fn should_show_vectors(mode: SimulationMode, chapter: Chapter) -> bool {
-    mode == SimulationMode::Laboratory || chapter == Chapter::Follow
-}
-
 /// The play slots of one chapter: its teaching level first, then its
 /// real-game levels. Same seed, so a chapter is reproducible from its seed.
 fn chapter_slots(seed: u64, group: usize, variant: usize) -> Vec<Level> {
@@ -511,128 +473,82 @@ fn level_button_class(active: bool, unlocked: bool, solved: bool) -> &'static st
     }
 }
 
-fn push_attempt(history: &mut Vec<Attempt>, attempt: Attempt, limit: usize) {
-    if limit != usize::MAX && history.len() >= limit {
+fn push_attempt(history: &mut Vec<Attempt>, attempt: Attempt) {
+    if history.len() >= HISTORY_LIMIT {
         history.remove(0);
     }
     history.push(attempt);
 }
 
-fn archive_active_attempt(
-    progress: &mut Signal<Vec<LevelProgress>>,
-    level_idx: usize,
-    mode: SimulationMode,
-) {
+fn archive_active_attempt(progress: &mut Signal<Vec<LevelProgress>>, level_idx: usize) {
     let mut levels = progress();
     if let Some(level) = levels.get_mut(level_idx) {
         if let Some(attempt) = level.active_attempt.take() {
-            push_attempt(&mut level.history, attempt, history_limit(mode));
+            push_attempt(&mut level.history, attempt);
         }
     }
     progress.set(levels);
 }
 
-fn reset_level_progress(
-    progress: &mut Signal<Vec<LevelProgress>>,
-    level_idx: usize,
-    reset_attempts: bool,
-) {
+fn reset_level_progress(progress: &mut Signal<Vec<LevelProgress>>, level_idx: usize) {
     let mut levels = progress();
     if let Some(level) = levels.get_mut(level_idx) {
         level.history.clear();
         level.active_attempt = None;
-        if reset_attempts {
-            level.attempts = 0;
-        }
     }
     progress.set(levels);
 }
 
-fn exploration_blocked(mode: SimulationMode, level: &Level, progress: &LevelProgress) -> bool {
-    mode == SimulationMode::Exploration && progress.attempts >= level.exploration_attempts
-}
-
-fn result_message(
-    result: &SimResult,
-    mode: SimulationMode,
-    beacons_total: usize,
-) -> (String, bool) {
+fn result_message(result: &SimResult, beacons_total: usize) -> (String, bool) {
     let progress_prefix = if beacons_total > 1 && result.visited > 0 {
         format!("{} balise(s) sur {}. ", result.visited, beacons_total)
     } else {
         String::new()
     };
-    match mode {
-        SimulationMode::Exploration => match result.outcome {
-            Outcome::Reached => (
-                format!(
-                    "{progress_prefix}Parcours réussi : la sonde a touché {} balise(s). Zone suivante débloquée.",
-                    beacons_total
-                ),
-                true,
-            ),
-            Outcome::Collision { obstacle, .. } => (
-                format!(
-                    "{progress_prefix}La sonde a percuté l'astéroïde {}. {}",
-                    obstacle + 1,
-                    closest_message(result)
-                ),
-                false,
-            ),
-            Outcome::NumericalFailure => (
-                "Le courant n'a pas pu être calculé. Réinitialise la simulation.".to_string(),
-                false,
-            ),
-            _ => (
-                format!("Exploration: parcours terminé. {}", closest_message(result)),
-                false,
-            ),
-        },
-        SimulationMode::Laboratory => match result.outcome {
-            Outcome::Reached => {
-                if beacons_total > 1 {
-                    (
-                        format!("La sonde a touché les {beacons_total} balises."),
-                        true,
-                    )
-                } else {
-                    ("La sonde a atteint la balise.".to_string(), true)
-                }
+    match result.outcome {
+        Outcome::Reached => {
+            if beacons_total > 1 {
+                (
+                    format!("La sonde a touché les {beacons_total} balises."),
+                    true,
+                )
+            } else {
+                ("La sonde a atteint la balise.".to_string(), true)
             }
-            Outcome::Collision { obstacle, .. } => (
-                format!(
-                    "La sonde a percuté l'astéroïde {}. Le point rouge indique l'impact.",
-                    obstacle + 1
-                ),
-                false,
+        }
+        Outcome::Collision { obstacle, .. } => (
+            format!(
+                "La sonde a percuté l'astéroïde {}. Le point rouge indique l'impact.",
+                obstacle + 1
             ),
-            Outcome::LeftField { .. } => (
-                format!(
-                    "{progress_prefix}La sonde a quitté la zone. {}",
-                    closest_message(result)
-                ),
-                false,
+            false,
+        ),
+        Outcome::LeftField { .. } => (
+            format!(
+                "{progress_prefix}La sonde a quitté la zone. {}",
+                closest_message(result)
             ),
-            Outcome::TimeLimit => (
-                format!(
-                    "{progress_prefix}La sonde a circulé trop longtemps. {}",
-                    closest_message(result)
-                ),
-                false,
+            false,
+        ),
+        Outcome::TimeLimit => (
+            format!(
+                "{progress_prefix}La sonde a circulé trop longtemps. {}",
+                closest_message(result)
             ),
-            Outcome::NumericalFailure => (
-                "Le courant n'a pas pu être calculé. Réinitialise la simulation.".to_string(),
-                false,
-            ),
-        },
+            false,
+        ),
+        Outcome::NumericalFailure => (
+            "Le courant n'a pas pu être calculé. Réinitialise la simulation.".to_string(),
+            false,
+        ),
     }
 }
 
-fn attempt_status(mode: SimulationMode, won: bool) -> &'static str {
-    match (mode, won) {
-        (_, true) => "succès",
-        (SimulationMode::Exploration, false) => "terminé",
-        (SimulationMode::Laboratory, false) => "échec",
+fn attempt_status(won: bool) -> &'static str {
+    if won {
+        "succès"
+    } else {
+        "échec"
     }
 }
 
@@ -713,7 +629,6 @@ fn App() -> Element {
                 for (entry, saved) in next_progress.iter_mut().zip(save.progress) {
                     entry.solved = saved.solved;
                     entry.release = saved.release;
-                    entry.attempts = saved.attempts;
                 }
             }
             active_seed.set(next_seed);
@@ -775,40 +690,22 @@ fn App() -> Element {
     let intensity_editable = intensity_editable(&current);
     let launch_level = current.clone();
     let clickable_level = current.clone();
-    let current_mode = base_level.chapter.mode();
     let current_step = STEPS[step_idx()];
     let current_progress = progress()[current_level_idx].clone();
     let is_tutorial = slot_is_tutorial(current_level_idx);
     let blind = matches!(current.rules.visibility, Visibility::BlindStart { .. });
     let release = release_of(&current, &current_progress);
     let preview = integrate_from(&current, release, k());
-    let description = if current_mode == SimulationMode::Exploration {
-        format!("Exploration libre — {}", current.desc)
-    } else {
-        current.desc.to_string()
-    };
-    let run_blocked = exploration_blocked(current_mode, &current, &current_progress);
+    let description = current.desc.to_string();
     let active_result = current_progress
         .active_attempt
         .as_ref()
         .map(|attempt| attempt.result.clone());
-    let show_preview = should_show_vectors(current_mode, current.chapter);
     let has_launched = active_result.is_some();
-    let direction_hint = if !show_preview && !has_launched {
-        Some(launch_heading(&current, release, k()))
-    } else {
-        None
-    };
     let shown_points = active_result
         .as_ref()
         .map(|result| result.points.clone())
-        .unwrap_or_else(|| {
-            if show_preview {
-                preview.points.clone()
-            } else {
-                Vec::new()
-            }
-        });
+        .unwrap_or_else(|| preview.points.clone());
     // A hidden trajectory shows only the part the player has earned: a blind
     // start reveals the run as it flies, and the rest of the path once the
     // beacon has been found.
@@ -843,23 +740,13 @@ fn App() -> Element {
             result.closest
         }
     });
-    // Exploration hides the field and the launched path, but leaving the
-    // player with only a bare distance number after a miss gave no way to
-    // adjust intentionally. This shows the actual local current at the
-    // closest-approach point, once per failed attempt — a real clue, not a
-    // full reveal of the field.
-    let closest_direction_hint = if current_mode == SimulationMode::Exploration {
-        closest_marker.map(|closest| launch_heading(&current, closest.point, k()))
-    } else {
-        None
-    };
     let collision_point = match active_result.as_ref().map(|result| result.outcome) {
         Some(Outcome::Collision { point, .. }) => Some(point),
         _ => None,
     };
     let active_message = active_result
         .as_ref()
-        .map(|result| result_message(result, current_mode, current.beacons.len()));
+        .map(|result| result_message(result, current.beacons.len()));
     let path_class = if animation_visible() && active_result.is_some() {
         "path active-path"
     } else {
@@ -914,8 +801,6 @@ fn App() -> Element {
         })
         .collect();
     let show_levels_menu = show_levels();
-    let remaining_attempts =
-        current.exploration_attempts - current_progress.attempts.min(current.exploration_attempts);
     let window_hint = if current.k_window > 0.0 {
         format!("marge mesurée ±{:.2}", current.k_window)
     } else {
@@ -925,23 +810,6 @@ fn App() -> Element {
         "Atteindre toutes les balises"
     } else {
         "Atteindre la balise"
-    };
-    let mode_label = match current_mode {
-        SimulationMode::Laboratory => "Laboratoire",
-        SimulationMode::Exploration => "Exploration",
-    };
-    let mode_hint = match (
-        current_mode,
-        should_show_vectors(current_mode, current.chapter),
-    ) {
-        (SimulationMode::Laboratory, _) => format!("{lab_goal} · vecteurs actifs"),
-        (SimulationMode::Exploration, true) => "Libre · vecteurs tutoriel".to_string(),
-        (SimulationMode::Exploration, false) => "Libre · vecteurs masqués".to_string(),
-    };
-    let history_title = if current_mode == SimulationMode::Exploration {
-        "Historique d'exploration"
-    } else {
-        "Essais précédents"
     };
     let tutorial_solved = current_progress.solved;
     let variant_label = ["A", "B", "C"]
@@ -1084,7 +952,7 @@ fn App() -> Element {
                         span { class: "tutorial-gate", "Tu peux passer : ce tutoriel n'est pas obligatoire." }
                     }
                 }
-                div { class: "desc", "{current.title} — {description}" }
+                div { class: "desc", "{current.title} — {description} · {lab_goal}" }
                 if !pinned_label.is_empty() {
                     div { class: "knob-note", "{pinned_label}" }
                 }
@@ -1110,40 +978,16 @@ fn App() -> Element {
                             orient: "auto",
                             path { d: "M 0 0 L 10 5 L 0 10 z", class: "arrow-head" }
                         }
-                        marker {
-                            id: "hint-arrow",
-                            view_box: "0 0 10 10",
-                            ref_x: "8",
-                            ref_y: "5",
-                            marker_width: "5",
-                            marker_height: "5",
-                            orient: "auto",
-                            path { d: "M 0 0 L 10 5 L 0 10 z", class: "hint-arrow-head" }
-                        }
-                        marker {
-                            id: "hint-arrow-closest",
-                            view_box: "0 0 10 10",
-                            ref_x: "8",
-                            ref_y: "5",
-                            marker_width: "5",
-                            marker_height: "5",
-                            orient: "auto",
-                            path { d: "M 0 0 L 10 5 L 0 10 z", class: "closest-hint-arrow-head" }
-                        }
                     }
-                    if should_show_vectors(current_mode, current.chapter) {
-                        for gx in field_grid_x() {
-                            for gy in field_grid_y() {
-                                if let Some((x1, y1, x2, y2)) =
-                                    vector_endpoints(&current, gx, gy, k())
-                                {
-                                    line {
-                                        key: "{gx}-{gy}",
-                                        x1: "{x1:.2}", y1: "{y1:.2}",
-                                        x2: "{x2:.2}", y2: "{y2:.2}",
-                                        class: "arrow",
-                                        marker_end: "url(#flow-arrow)",
-                                    }
+                    for gx in field_grid_x() {
+                        for gy in field_grid_y() {
+                            if let Some((x1, y1, x2, y2)) = vector_endpoints(&current, gx, gy, k()) {
+                                line {
+                                    key: "{gx}-{gy}",
+                                    x1: "{x1:.2}", y1: "{y1:.2}",
+                                    x2: "{x2:.2}", y2: "{y2:.2}",
+                                    class: "arrow",
+                                    marker_end: "url(#flow-arrow)",
                                 }
                             }
                         }
@@ -1154,14 +998,6 @@ fn App() -> Element {
                             cx: "{map_x(obstacle.x):.2}", cy: "{map_y(obstacle.y):.2}",
                             rx: "{(obstacle.r * X_SCALE):.2}", ry: "{(obstacle.r * Y_SCALE):.2}",
                             class: "obstacle",
-                        }
-                    }
-                    if let Some((sx, sy, ex, ey)) = direction_hint {
-                        line {
-                            x1: "{sx:.2}", y1: "{sy:.2}",
-                            x2: "{ex:.2}", y2: "{ey:.2}",
-                            class: "direction-hint",
-                            marker_end: "url(#hint-arrow)",
                         }
                     }
                     if current.rules.release != ReleaseMode::Fixed {
@@ -1196,10 +1032,8 @@ fn App() -> Element {
                             rx: "{(WIN_R * X_SCALE):.2}", ry: "{(WIN_R * Y_SCALE):.2}",
                             class: if index < visited_beacons {
                                 "point-b beacon-done"
-                            } else if current_mode == SimulationMode::Laboratory {
-                                "point-b"
                             } else {
-                                "point-b reference-point"
+                                "point-b"
                             },
                         }
                         if beacons_total > 1 {
@@ -1243,28 +1077,12 @@ fn App() -> Element {
                             r: "6", class: closest_class,
                         }
                     }
-                    if let Some((sx, sy, ex, ey)) = closest_direction_hint {
-                        line {
-                            x1: "{sx:.2}", y1: "{sy:.2}",
-                            x2: "{ex:.2}", y2: "{ey:.2}",
-                            class: "closest-direction-hint",
-                            marker_end: "url(#hint-arrow-closest)",
-                        }
-                    }
                     if let Some(point) = collision_point {
                         circle {
                             cx: "{map_x(point.0):.2}", cy: "{map_y(point.1):.2}",
                             r: "6", class: collision_class,
                         }
                     }
-                }
-
-                div { class: "mode-row",
-                    label { "Mode" }
-                    // The mode follows the chapter, so this is a reading of the
-                    // level and not a switch.
-                    span { class: "mode-select", "{mode_label}" }
-                    span { class: "mode-hint", "{mode_hint}" }
                 }
 
                 div { class: "seed-row",
@@ -1343,7 +1161,7 @@ fn App() -> Element {
                                     current_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut progress, current_level_idx, current_mode);
+                                    archive_active_attempt(&mut progress, current_level_idx);
                                 }
                                 k.set(next);
                             },
@@ -1366,7 +1184,7 @@ fn App() -> Element {
                                         current_step,
                                     );
                                     if (next - k()).abs() > f64::EPSILON {
-                                        archive_active_attempt(&mut progress, current_level_idx, current_mode);
+                                        archive_active_attempt(&mut progress, current_level_idx);
                                     }
                                     k.set(next);
                                 }
@@ -1384,7 +1202,7 @@ fn App() -> Element {
                                     current_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut progress, current_level_idx, current_mode);
+                                    archive_active_attempt(&mut progress, current_level_idx);
                                 }
                                 k.set(next);
                             },
@@ -1393,7 +1211,7 @@ fn App() -> Element {
                     }
                     div { class: "step-heading",
                         label { class: "step-label", "Pas" }
-                        if current.k_window > 0.0 && current_mode == SimulationMode::Laboratory {
+                        if current.k_window > 0.0 {
                             span { class: "window-hint", "{window_hint}" }
                         }
                     }
@@ -1420,7 +1238,7 @@ fn App() -> Element {
                                     next_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut progress, current_level_idx, current_mode);
+                                    archive_active_attempt(&mut progress, current_level_idx);
                                 }
                                 k.set(next);
                                 step_idx.set(index);
@@ -1450,7 +1268,7 @@ fn App() -> Element {
                                     current_step,
                                 );
                                 if (next - k()).abs() > f64::EPSILON {
-                                    archive_active_attempt(&mut progress, current_level_idx, current_mode);
+                                    archive_active_attempt(&mut progress, current_level_idx);
                                 }
                                 k.set(next);
                             }
@@ -1478,7 +1296,6 @@ fn App() -> Element {
                                         archive_active_attempt(
                                             &mut progress,
                                             current_level_idx,
-                                            current_mode,
                                         );
                                     }
                                     phase.set(value);
@@ -1491,7 +1308,6 @@ fn App() -> Element {
                 div { class: "btnrow",
                     button {
                         class: "action",
-                        disabled: run_blocked,
                         onclick: move |_| {
                             let launch_k = normalize_intensity(
                                 k(),
@@ -1504,16 +1320,13 @@ fn App() -> Element {
                             let won = result.reached();
                             animation_visible.set(false);
                             animation_id.set(animation_id() + 1);
-                            archive_active_attempt(&mut progress, current_level_idx, current_mode);
+                            archive_active_attempt(&mut progress, current_level_idx);
                             let mut levels = progress();
                             if let Some(level) = levels.get_mut(current_level_idx) {
                                 level.active_attempt = Some(Attempt {
                                     k: launch_k,
                                     result,
                                 });
-                                if current_mode == SimulationMode::Exploration {
-                                    level.attempts += 1;
-                                }
                                 if won {
                                     level.solved = true;
                                 }
@@ -1525,7 +1338,7 @@ fn App() -> Element {
                     button {
                         class: "ghost",
                         onclick: move |_| {
-                            reset_level_progress(&mut progress, current_level_idx, true);
+                            reset_level_progress(&mut progress, current_level_idx);
                             let mut levels = progress();
                             if let Some(entry) = levels.get_mut(current_level_idx) {
                                 entry.release = None;
@@ -1535,35 +1348,18 @@ fn App() -> Element {
                         },
                         "Réinitialiser"
                     }
-                    if current_mode == SimulationMode::Exploration {
-                        span { class: "budget",
-                            "Tentatives restantes : {remaining_attempts}/{current.exploration_attempts}"
-                        }
-                    }
-                }
-
-                if run_blocked {
-                    div { class: "msg fail",
-                        "Budget d'exploration épuisé pour cette zone. Passe en Laboratoire ou réinitialise la zone."
-                    }
                 }
 
                 if let Some((text, won)) = active_message {
                     div {
-                        class: if won {
-                            "msg win"
-                        } else if current_mode == SimulationMode::Exploration {
-                            "msg explore"
-                        } else {
-                            "msg fail"
-                        },
+                        class: if won { "msg win" } else { "msg fail" },
                         "{text}"
                     }
                 }
 
                 if !history_paths.is_empty() {
                     div { class: "history",
-                        span { class: "history-title", "{history_title}" }
+                        span { class: "history-title", "Essais précédents" }
                         for (index, (_, label, won)) in history_paths.iter().enumerate() {
                             span {
                                 key: "history-label-{index}",
@@ -1572,7 +1368,8 @@ fn App() -> Element {
                                 } else {
                                     "history-entry"
                                 },
-                                "intensité {label} · {attempt_status(current_mode, *won)}"
+                                "intensité {label} · {attempt_status(*won)}"
+
                             }
                         }
                     }
@@ -1581,12 +1378,7 @@ fn App() -> Element {
                 div { class: "legend",
                     span { span { class: "dot dot-a" } " Largage" }
                     span { span { class: "dot dot-b" } " Balise" }
-                    if current_mode == SimulationMode::Laboratory {
-                        span { span { class: "dot dot-o" } " Astéroïde" }
-                    } else {
-                        span { span { class: "dot dot-b" } " Référence" }
-                        span { span { class: "dot dot-o" } " Astéroïde" }
-                    }
+                    span { span { class: "dot dot-o" } " Astéroïde" }
                     if !ghost_paths.is_empty() {
                         span { span { class: "dot dot-g" } " Fils voisins (échouent)" }
                     }
@@ -1628,10 +1420,6 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .levels-group button.open{color:var(--ink)}
 .levels-group button.locked{opacity:.35;cursor:not-allowed}
 .levels-group button.active{background:var(--accent);color:#04231d;border-color:var(--accent);font-weight:600}
-.mode-row{display:flex;align-items:center;gap:9px;margin-bottom:10px;flex-wrap:wrap}
-.mode-row label{font-size:.85rem;color:var(--sub)}
-.mode-select{height:32px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);padding:0 8px}
-.mode-hint{font-size:.78rem;color:var(--sub)}
 .seed-row{display:flex;align-items:center;gap:7px;margin-bottom:10px;flex-wrap:wrap}
 .small-button{padding:7px 10px;font-size:.78rem}
 .seed-status{font-size:.76rem;color:var(--accent)}
@@ -1646,13 +1434,8 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .beacon-done{fill:rgba(94,227,201,.16);stroke:var(--accent)}
 .beacon-label{fill:var(--ink);font-size:11px;font-weight:600;paint-order:stroke;stroke:var(--bg);stroke-width:2px}
 .point-b{fill:var(--danger)}
-.reference-point{opacity:.35;stroke-dasharray:3 4}
-.direction-hint{stroke:#4ade80;stroke-width:2.4;stroke-linecap:round}
-.hint-arrow-head{fill:#4ade80}
 .closest-point{fill:var(--closest);stroke:var(--bg);stroke-width:2}
 .dot-g{background:var(--accent2)}
-.closest-direction-hint{stroke:var(--closest);stroke-width:2.4;stroke-linecap:round}
-.closest-hint-arrow-head{fill:var(--closest)}
 .collision-point{fill:var(--danger);stroke:#fff;stroke-width:2}
 .path{fill:none;stroke:var(--accent);stroke-width:2.4}
 .active-path{stroke-dasharray:1;stroke-dashoffset:1;animation:draw-path 1.2s ease-out forwards}
@@ -1680,7 +1463,6 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .intensity-input:focus,.step-select:focus{outline:2px solid var(--accent);outline-offset:-2px}
 .step-heading{display:flex;flex-direction:column;gap:2px}
 .window-hint{font-size:.68rem;color:var(--closest)}
-.budget{font-size:.78rem;color:var(--sub);align-self:center}
 .step-label{margin-left:auto!important}
 .step-select{height:34px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);padding:0 7px}
 .intensity-range{flex:1 0 100%;min-width:140px;accent-color:var(--accent)}
@@ -1690,7 +1472,6 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .ghost{background:transparent;border:1px solid var(--line);color:var(--ink);padding:9px 16px;border-radius:9px;cursor:pointer}
 .msg{margin-top:10px;font-size:.9rem;font-weight:600;line-height:1.45}
 .msg.win{color:var(--accent)}
-.msg.explore{color:var(--accent2)}
 .msg.fail{color:var(--danger)}
 .history{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:.76rem;color:var(--sub)}
 .history-title{font-weight:600;color:var(--ink)}
@@ -1736,54 +1517,11 @@ mod tests {
     fn history_keeps_only_three_attempts() {
         let mut history = Vec::new();
         for k in 0..5 {
-            push_attempt(
-                &mut history,
-                attempt(k as f64),
-                history_limit(SimulationMode::Laboratory),
-            );
+            push_attempt(&mut history, attempt(k as f64));
         }
         assert_eq!(history.len(), HISTORY_LIMIT);
         assert_eq!(history[0].k, 2.0);
         assert_eq!(history[2].k, 4.0);
-    }
-
-    #[test]
-    fn exploration_history_has_no_limit() {
-        let mut history = Vec::new();
-        for k in 0..5 {
-            push_attempt(
-                &mut history,
-                attempt(k as f64),
-                history_limit(SimulationMode::Exploration),
-            );
-        }
-        assert_eq!(history.len(), 5);
-    }
-
-    #[test]
-    fn laboratory_always_shows_the_field_vectors() {
-        for chapter in Chapter::all() {
-            assert!(
-                should_show_vectors(SimulationMode::Laboratory, chapter),
-                "{}",
-                chapter.title()
-            );
-        }
-    }
-
-    #[test]
-    fn only_the_first_chapter_teaches_the_field_vectors() {
-        assert!(should_show_vectors(
-            SimulationMode::Exploration,
-            Chapter::Follow
-        ));
-        for chapter in Chapter::all().iter().skip(1) {
-            assert!(
-                !should_show_vectors(SimulationMode::Exploration, *chapter),
-                "{}",
-                chapter.title()
-            );
-        }
     }
 
     #[test]
@@ -1855,7 +1593,6 @@ mod tests {
         let mut progress = vec![LevelProgress::default(); 3];
         progress[0].solved = true;
         progress[1].release = Some((-2.5, 1.25));
-        progress[2].attempts = 4;
         let seen = vec![true, false, true];
         let data = save_data(0xABCD, 1, &progress, &seen);
         let json = serde_json::to_string(&data).expect("serialisable");
@@ -1864,7 +1601,6 @@ mod tests {
         assert_eq!(back.variant, Some(1));
         assert!(back.progress[0].solved);
         assert_eq!(back.progress[1].release, Some((-2.5, 1.25)));
-        assert_eq!(back.progress[2].attempts, 4);
         assert_eq!(back.seen, seen);
         // A save from an older build has to load, not fail.
         let empty: SaveData = serde_json::from_str("{}").expect("defaults");
@@ -1899,10 +1635,10 @@ mod tests {
             closest: None,
             visited: 2,
         };
-        let (message, won) = result_message(&result, SimulationMode::Laboratory, 3);
+        let (message, won) = result_message(&result, 3);
         assert!(!won);
         assert!(message.starts_with("2 balise(s) sur 3."));
-        let (_, won) = result_message(&result, SimulationMode::Laboratory, 1);
+        let (_, won) = result_message(&result, 1);
         assert!(!won);
     }
 
@@ -1928,7 +1664,6 @@ mod tests {
             phase_def: 0.0,
             phase_sweep: 1.0,
             recommended_step: 0.5,
-            exploration_attempts: 1,
             k_window: 0.0,
             a: (-4.5, 0.0),
             default_release: (-4.5, 0.0),
@@ -1968,11 +1703,7 @@ mod tests {
         // leaves the dial live must still let the player move it.
         let other: Vec<&Level> = levels
             .iter()
-            .filter(|level| {
-                level.chapter != Chapter::Position
-                    && level.knobs().intensity
-                    && !level.chapter.is_sandbox()
-            })
+            .filter(|level| level.chapter != Chapter::Position && level.knobs().intensity)
             .collect();
         assert!(!other.is_empty(), "aucun autre chapitre à intensité libre");
         for level in other {
@@ -1991,73 +1722,10 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_follows_the_chapter() {
-        assert_eq!(
-            Chapter::Exploration.mode(),
-            SimulationMode::Exploration,
-            "le chapitre sandbox doit tourner en Exploration"
-        );
-        for chapter in Chapter::all() {
-            let expected = if chapter == Chapter::Exploration {
-                SimulationMode::Exploration
-            } else {
-                SimulationMode::Laboratory
-            };
-            assert_eq!(chapter.mode(), expected, "{:?}", chapter);
-        }
-    }
-
-    #[test]
-    fn launch_heading_follows_the_flow() {
-        let level = calm_test_level();
-        let (sx, sy, ex, ey) = launch_heading(&level, level.a, 0.5);
-        let flow = level.flow_at(level.a.0, level.a.1, 0.5);
-        let length = flow.length();
-        let (ux, uy) = (flow.x / length, flow.y / length);
-        let (px, py) = (
-            map_x(level.a.0 + ux) - map_x(level.a.0),
-            map_y(level.a.1 + uy) - map_y(level.a.1),
-        );
-        let plength = (px * px + py * py).sqrt();
-        let (dx, dy) = (ex - sx, ey - sy);
-        let dlength = (dx * dx + dy * dy).sqrt();
-        assert!((dlength - HINT_LEN_PX).abs() < 1e-9);
-        assert!(((sy - map_y(level.a.1)).abs()) < 1e-9);
-        assert!((dx / dlength - px / plength).abs() < 1e-9);
-        assert!((dy / dlength - py / plength).abs() < 1e-9);
-    }
-
-    #[test]
-    fn launch_heading_moves_with_the_intensity() {
-        let level = calm_test_level();
-        let (_, _, ex_low, ey_low) = launch_heading(&level, level.a, 0.0);
-        let (_, _, ex_high, ey_high) = launch_heading(&level, level.a, 1.0);
-        assert!((ex_low - ex_high).abs() > 1.0 || (ey_low - ey_high).abs() > 1.0);
-    }
-
-    #[test]
     fn seeds_are_sixteen_hex_digits() {
         let seed = 0x1234_5678_9ABC_DEF0;
         assert_eq!(format_seed(seed), "123456789abcdef0");
         assert_eq!(format_seed(1), "0000000000000001");
-    }
-
-    #[test]
-    fn exploration_wins_report_success() {
-        let result = SimResult {
-            points: vec![(0.0, 0.0)],
-            outcome: Outcome::Reached,
-            closest: None,
-            visited: 2,
-        };
-        let (message, won) = result_message(&result, SimulationMode::Exploration, 2);
-        assert!(won);
-        assert!(message.contains("Parcours réussi"));
-        assert_eq!(attempt_status(SimulationMode::Exploration, true), "succès");
-        assert_eq!(
-            attempt_status(SimulationMode::Exploration, false),
-            "terminé"
-        );
     }
 
     #[test]

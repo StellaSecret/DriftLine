@@ -21,12 +21,6 @@ const REFINE_MULTIPLE: f64 = 2.0;
 
 pub type Point = (f64, f64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SimulationMode {
-    Laboratory,
-    Exploration,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub min: Point,
@@ -176,43 +170,26 @@ pub struct Probe {
 pub enum Chapter {
     Follow,
     Position,
-    Predict,
     Influence,
+    Predict,
     Thread,
     Timing,
     Compose,
     Coordinate,
-    Exploration,
 }
 
 impl Chapter {
-    pub fn all() -> [Chapter; 9] {
+    pub fn all() -> [Chapter; 8] {
         [
             Chapter::Follow,
             Chapter::Position,
-            Chapter::Predict,
             Chapter::Influence,
+            Chapter::Predict,
             Chapter::Thread,
             Chapter::Timing,
             Chapter::Compose,
             Chapter::Coordinate,
-            Chapter::Exploration,
         ]
-    }
-
-    /// The mode a chapter runs in. Exploration is a chapter of its own, so the
-    /// mode follows the chapter instead of being a global switch.
-    pub fn mode(self) -> SimulationMode {
-        match self {
-            Chapter::Exploration => SimulationMode::Exploration,
-            _ => SimulationMode::Laboratory,
-        }
-    }
-
-    /// A sandbox chapter: every axis stays open, so it promises no narrow
-    /// window. The laboratory chapters are the ones that are tuned to a needle.
-    pub fn is_sandbox(self) -> bool {
-        matches!(self, Chapter::Exploration)
     }
 
     pub fn group_index(self) -> usize {
@@ -517,7 +494,6 @@ pub struct Level {
     pub phase_def: f64,
     pub phase_sweep: f64,
     pub recommended_step: f64,
-    pub exploration_attempts: usize,
     pub k_window: f64,
     pub a: Point,
     pub default_release: Point,
@@ -633,7 +609,6 @@ struct LevelPlan {
     gain: f64,
     wavelength: f64,
     k_window_steps: Option<f64>,
-    exploration_attempts: usize,
     release: ReleaseMode,
     zone: Rect,
     visibility: Visibility,
@@ -660,7 +635,6 @@ impl LevelPlan {
             gain: 1.0,
             wavelength: 1.0,
             k_window_steps: None,
-            exploration_attempts: 3,
             release: ReleaseMode::Fixed,
             zone: Rect::new((0.0, 0.0), (0.0, 0.0)),
             visibility: Visibility::Full,
@@ -694,11 +668,6 @@ impl LevelPlan {
         self
     }
 
-    const fn beacons(mut self, count: usize) -> Self {
-        self.beacons = count;
-        self
-    }
-
     const fn gain(mut self, gain: f64) -> Self {
         self.gain = gain;
         self
@@ -709,18 +678,8 @@ impl LevelPlan {
         self
     }
 
-    const fn attempts(mut self, count: usize) -> Self {
-        self.exploration_attempts = count;
-        self
-    }
-
     const fn focus(mut self, focus: &'static str) -> Self {
         self.focus = focus;
-        self
-    }
-
-    const fn release(mut self, mode: ReleaseMode) -> Self {
-        self.release = mode;
         self
     }
 
@@ -788,17 +747,14 @@ struct TutorialSpec {
 const FOLLOW_PLANS: [LevelPlan; 3] = [
     LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
         .knobs(Knobs::INTENSITY)
-        .attempts(3)
         .window(3.0)
         .focus("dérive pure"),
     LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
         .knobs(Knobs::INTENSITY)
-        .attempts(3)
         .window(3.0)
         .focus("dérive inclinée"),
     LevelPlan::new(FieldKind::Calm, 2.0, 0.05)
         .knobs(Knobs::INTENSITY)
-        .attempts(4)
         .gain(1.5)
         .window(4.0)
         .focus("courant penché"),
@@ -808,21 +764,18 @@ const INFLUENCE_PLANS: [LevelPlan; 3] = [
     LevelPlan::new(FieldKind::Retention, 1.0, 0.05)
         .knobs(Knobs::INTENSITY)
         .obstacles(1, 0.5, 0.7)
-        .attempts(4)
         .gain(2.0)
         .window(5.0)
         .focus("hauteur d'équilibre"),
     LevelPlan::new(FieldKind::Retention, 2.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.5, 0.8)
-        .attempts(4)
         .gain(3.0)
         .window(6.0)
         .focus("équilibre mobile"),
     LevelPlan::new(FieldKind::Retention, 3.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.45, 0.75)
-        .attempts(5)
         .gain(3.0)
         .window(7.0)
         .focus("contre-courant"),
@@ -831,14 +784,12 @@ const INFLUENCE_PLANS: [LevelPlan; 3] = [
 const POSITION_PLANS: [LevelPlan; 5] = [
     LevelPlan::new(FieldKind::Vortex, 1.5, 0.02)
         .obstacles(1, 0.5, 0.8)
-        .attempts(3)
         .gain(5.0)
         .window(8.0)
         .zone(1.2, 2.0)
         .focus("rotation simple"),
     LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
         .obstacles(1, 0.45, 0.75)
-        .attempts(3)
         .gain(5.0)
         .window(8.0)
         .zone(1.2, 2.0)
@@ -846,20 +797,17 @@ const POSITION_PLANS: [LevelPlan; 5] = [
     LevelPlan::new(FieldKind::Opposed, 1.5, 0.05)
         .gain(5.0)
         .obstacles(1, 0.45, 0.7)
-        .attempts(3)
         .window(3.0)
         .zone(1.2, 2.0)
         .focus("deux moitiés"),
     LevelPlan::new(FieldKind::Opposed, 2.0, 0.05)
         .obstacles(2, 0.4, 0.65)
-        .attempts(3)
         .window(3.0)
         .zone(1.2, 2.0)
         .focus("séparation haute"),
     LevelPlan::new(FieldKind::Opposed, 2.5, 0.02)
         .gain(5.0)
         .obstacles(2, 0.4, 0.7)
-        .attempts(4)
         .window(3.0)
         .zone(1.2, 2.0)
         .focus("séparation basse"),
@@ -868,14 +816,12 @@ const POSITION_PLANS: [LevelPlan; 5] = [
 const PREDICT_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Calm, 1.0, 0.01)
         .obstacles(1, 0.4, 0.6)
-        .attempts(3)
         .gain(1.5)
         .window(3.0)
         .blind(0.35)
         .focus("marge large"),
     LevelPlan::new(FieldKind::Waves, 0.8, 0.01)
         .obstacles(1, 0.4, 0.6)
-        .attempts(3)
         .gain(2.0)
         .window(4.0)
         .blind(0.3)
@@ -883,7 +829,6 @@ const PREDICT_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Bands, 0.6, 0.01)
         .bands(2)
         .obstacles(1, 0.35, 0.55)
-        .attempts(4)
         .gain(2.5)
         .window(3.0)
         .blind(0.3)
@@ -891,7 +836,6 @@ const PREDICT_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Bands, 0.5, 0.01)
         .bands(3)
         .obstacles(2, 0.35, 0.55)
-        .attempts(4)
         .gain(3.0)
         .window(2.0)
         .blind(0.25)
@@ -902,21 +846,18 @@ const COORDINATE_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
         .obstacles(1, 0.45, 0.7)
         .probes(2)
-        .attempts(4)
         .window(2.0)
         .zone(1.0, 1.6)
         .focus("deux balises"),
     LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
         .obstacles(1, 0.45, 0.7)
         .probes(2)
-        .attempts(4)
         .window(2.0)
         .zone(1.0, 1.6)
         .focus("deux balises en houle"),
     LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
         .obstacles(1, 0.4, 0.65)
         .probes(3)
-        .attempts(5)
         .gain(5.0)
         .window(10.0)
         .zone(1.0, 1.6)
@@ -924,7 +865,6 @@ const COORDINATE_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Opposed, 3.0, 0.02)
         .obstacles(2, 0.4, 0.65)
         .probes(4)
-        .attempts(6)
         .gain(3.0)
         .window(3.0)
         .zone(1.0, 1.6)
@@ -934,14 +874,12 @@ const COORDINATE_PLANS: [LevelPlan; 4] = [
 const THREAD_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
         .obstacles(1, 0.45, 0.7)
-        .attempts(3)
         .window(3.0)
         .zone(0.8, 2.0)
         .ghosts()
         .focus("houle douce"),
     LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
         .obstacles(1, 0.45, 0.75)
-        .attempts(3)
         .window(3.0)
         .zone(0.8, 2.0)
         .ghosts()
@@ -949,7 +887,6 @@ const THREAD_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Bands, 1.5, 0.05)
         .bands(2)
         .obstacles(1, 0.45, 0.7)
-        .attempts(4)
         .window(3.0)
         .zone(0.8, 2.0)
         .ghosts()
@@ -957,7 +894,6 @@ const THREAD_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Bands, 2.0, 0.02)
         .bands(2)
         .obstacles(2, 0.4, 0.7)
-        .attempts(4)
         .window(5.0)
         .zone(0.8, 2.0)
         .ghosts()
@@ -972,7 +908,6 @@ const TIMING_PLANS: [LevelPlan; 4] = [
         .knobs(Knobs::PHASE_INTENSITY)
         .timeline()
         .wavelength(4.0)
-        .attempts(4)
         .window(4.0)
         .focus("crête de houle"),
     LevelPlan::new(FieldKind::Waves, 2.0, 0.02)
@@ -980,7 +915,6 @@ const TIMING_PLANS: [LevelPlan; 4] = [
         .timeline()
         .wavelength(5.0)
         .obstacles(1, 0.4, 0.6)
-        .attempts(4)
         .gain(1.5)
         .window(5.0)
         .focus("deux crêtes"),
@@ -988,14 +922,12 @@ const TIMING_PLANS: [LevelPlan; 4] = [
         .bands(2)
         .knobs(Knobs::PHASE_INTENSITY)
         .timeline()
-        .attempts(4)
         .window(5.0)
         .focus("bandes décalées"),
     LevelPlan::new(FieldKind::Opposed, 2.0, 0.05)
         .knobs(Knobs::PHASE_INTENSITY)
         .timeline()
         .obstacles(1, 0.4, 0.6)
-        .attempts(5)
         .window(4.0)
         .focus("frontière qui bouge"),
 ];
@@ -1005,63 +937,29 @@ const TIMING_PLANS: [LevelPlan; 4] = [
 const COMPOSE_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
         .knobs(Knobs::INTENSITY)
-        .attempts(4)
         .window(10.0)
         .focus("houle et rappel"),
     LevelPlan::new(FieldKind::Compose, 2.5, 0.05)
         .knobs(Knobs::INTENSITY)
         .obstacles(1, 0.4, 0.6)
-        .attempts(4)
         .window(10.0)
         .focus("deux forces"),
     LevelPlan::new(FieldKind::Compose, 3.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.4, 0.65)
-        .attempts(5)
         .gain(2.0)
         .window(12.0)
         .focus("trois forces"),
     LevelPlan::new(FieldKind::Compose, 3.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.35, 0.6)
-        .attempts(5)
         .window(14.0)
         .focus("champ dense"),
 ];
 
-/// The sandbox plans carry no window target: an open level is one that can be
-/// won across a wide range of settings, and rejecting the wide ones would throw
-/// away exactly what the chapter is for.
-const EXPLORATION_PLANS: [LevelPlan; 4] = [
-    LevelPlan::new(FieldKind::Calm, 2.0, 0.05)
-        .knobs(Knobs::ALL)
-        .release(ReleaseMode::Zone)
-        .zone(2.0, 2.6)
-        .attempts(4)
-        .focus("page blanche"),
-    LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
-        .knobs(Knobs::ALL)
-        .release(ReleaseMode::Zone)
-        .zone(2.0, 2.6)
-        .attempts(4)
-        .focus("vague libre"),
-    LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
-        .knobs(Knobs::ALL)
-        .release(ReleaseMode::Zone)
-        .zone(1.8, 2.4)
-        .obstacles(1, 0.4, 0.6)
-        .attempts(5)
-        .focus("melange libre"),
-    LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
-        .knobs(Knobs::ALL)
-        .release(ReleaseMode::Zone)
-        .zone(1.8, 2.4)
-        .obstacles(1, 0.45, 0.7)
-        .attempts(5)
-        .focus("tourbillon ouvert"),
-];
-
-const CHAPTERS: [ChapterSpec; 9] = [
+/// Every plan is tuned to a needle: each one names the window it is measured
+/// against, and the gates below hold every chapter to that target.
+const CHAPTERS: [ChapterSpec; 8] = [
     ChapterSpec {
         chapter: Chapter::Follow,
         title: "Suivi",
@@ -1071,7 +969,6 @@ const CHAPTERS: [ChapterSpec; 9] = [
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
                 .knobs(Knobs::NONE)
-                .attempts(5)
                 .window(3.0)
                 .focus("observer le courant"),
             hint: "Le champ ne bouge pas. Largue la sonde et suis la trace jusqu'à la balise.",
@@ -1086,28 +983,10 @@ const CHAPTERS: [ChapterSpec; 9] = [
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Vortex, 1.5, 0.05)
                 .knobs(Knobs::RELEASE)
-                .attempts(5)
                 .window(6.0)
                 .zone(1.2, 2.0)
                 .focus("point de départ"),
             hint: "Clique dans la zone verte pour déplacer le largage, puis observe la trajectoire.",
-        },
-    },
-    ChapterSpec {
-        chapter: Chapter::Predict,
-        title: "Prédiction",
-        question: "Où larguer quand le chemin se cache ?",
-        desc: "Seul le premier tronçon est annoncé : le reste du trajet se prévoit.",
-        plans: &PREDICT_PLANS,
-        tutorial: TutorialSpec {
-            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
-                .knobs(Knobs::RELEASE)
-                .attempts(5)
-                .window(5.0)
-                .zone(1.0, 1.6)
-                .blind(0.3)
-                .focus("premier tronçon"),
-            hint: "La trajectoire n'apparaît qu'au départ : le reste se déduit du courant.",
         },
     },
     ChapterSpec {
@@ -1119,11 +998,26 @@ const CHAPTERS: [ChapterSpec; 9] = [
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Retention, 1.5, 0.05)
                 .knobs(Knobs::INTENSITY)
-                .attempts(5)
                 .gain(2.0)
                 .window(5.0)
                 .focus("réglage de l'intensité"),
             hint: "Sans les vecteurs, l'intensité reste la seule variable : teste, compare, garde la meilleure.",
+        },
+    },
+    ChapterSpec {
+        chapter: Chapter::Predict,
+        title: "Prédiction",
+        question: "Où larguer quand le chemin se cache ?",
+        desc: "Seul le premier tronçon est annoncé : le reste du trajet se prévoit.",
+        plans: &PREDICT_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
+                .knobs(Knobs::RELEASE)
+                .window(5.0)
+                .zone(1.0, 1.6)
+                .blind(0.3)
+                .focus("premier tronçon"),
+            hint: "La trajectoire n'apparaît qu'au départ : le reste se déduit du courant.",
         },
     },
     ChapterSpec {
@@ -1135,7 +1029,6 @@ const CHAPTERS: [ChapterSpec; 9] = [
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
                 .knobs(Knobs::RELEASE_INTENSITY)
-                .attempts(5)
                 .window(4.0)
                 .zone(0.8, 2.0)
                 .ghosts()
@@ -1154,7 +1047,6 @@ const CHAPTERS: [ChapterSpec; 9] = [
                 .knobs(Knobs::PHASE_INTENSITY)
                 .wavelength(6.0)
                 .timeline()
-                .attempts(6)
                 .window(5.0)
                 .focus("instant de lancement"),
             hint: "Le curseur de phase fige le courant. Fais-le glisser : la crête change la dérive.",
@@ -1169,7 +1061,6 @@ const CHAPTERS: [ChapterSpec; 9] = [
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
                 .knobs(Knobs::INTENSITY)
-                .attempts(5)
                 .window(12.0)
                 .focus("champ composé"),
             hint: "Deux courants superposés : l'intensité règle les deux d'un coup.",
@@ -1184,28 +1075,11 @@ const CHAPTERS: [ChapterSpec; 9] = [
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
                 .knobs(Knobs::RELEASE_INTENSITY)
-                .attempts(5)
                 .window(4.0)
                 .zone(1.0, 1.6)
                 .probes(2)
                 .focus("deux sondes"),
             hint: "Une seule intensité pour les deux sondes : chaque balise doit être touchée.",
-        },
-    },
-    ChapterSpec {
-        chapter: Chapter::Exploration,
-        title: "Exploration",
-        question: "Que donne un réglage au hasard ?",
-        desc: "Aucun chapitre ne filtre ici : on largue où on veut, on règle à volonté, et on regarde ce que ça donne.",
-        plans: &EXPLORATION_PLANS,
-        tutorial: TutorialSpec {
-            plan: LevelPlan::new(FieldKind::Calm, 2.0, 0.05)
-                .knobs(Knobs::ALL)
-                .release(ReleaseMode::Zone)
-                .attempts(5)
-                .zone(2.0, 2.6)
-                .focus("bac a sable"),
-            hint: "Ici il n'y a pas de bonne réponse. Essaie un réglage, change-le, et regarde la trajectoire changer.",
         },
     },
 ];
@@ -1394,7 +1268,6 @@ fn shell_level(spec: &ChapterSpec, plan: &LevelPlan, field: FlowField) -> Level 
         phase_def: if timeline { PHASE_DEF } else { 0.0 },
         phase_sweep: if timeline { TIMING_SWEEP } else { 0.0 },
         recommended_step: plan.step,
-        exploration_attempts: plan.exploration_attempts,
         k_window: 0.0,
         a: anchor,
         default_release: anchor,
@@ -2511,7 +2384,7 @@ fn canonical_level(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> L
         }
     }
     FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    guaranteed_fallback(shell, &plan, step_index)
+    guaranteed_fallback(shell, plan, step_index)
 }
 
 /// Absolute last resort when every generation pass has failed. The previous
@@ -3329,10 +3202,6 @@ pub fn integrate_route(level: &Level, start: Point, target: Point, k: f64) -> Si
     )
 }
 
-pub fn integrate_with_mode(level: &Level, k: f64, _mode: SimulationMode) -> SimResult {
-    integrate_from(level, level.a, k)
-}
-
 pub fn release_points(level: &Level) -> Vec<Point> {
     release_anchors(level)
 }
@@ -3386,7 +3255,6 @@ mod tests {
             phase_def: 0.0,
             phase_sweep: 0.0,
             recommended_step: 0.01,
-            exploration_attempts: 3,
             k_window: 0.0,
             a: (0.0, 0.0),
             default_release: (0.0, 0.0),
@@ -3422,13 +3290,12 @@ mod tests {
             [
                 Chapter::Follow,
                 Chapter::Position,
-                Chapter::Predict,
                 Chapter::Influence,
+                Chapter::Predict,
                 Chapter::Thread,
                 Chapter::Timing,
                 Chapter::Compose,
-                Chapter::Coordinate,
-                Chapter::Exploration
+                Chapter::Coordinate
             ]
         );
     }
@@ -3463,32 +3330,6 @@ mod tests {
     }
 
     #[test]
-    fn exploration_budgets_grow_with_difficulty() {
-        let levels = levels();
-        for level in &levels {
-            assert!(
-                (3..=6).contains(&level.exploration_attempts),
-                "budget {} hors bornes sur {}",
-                level.exploration_attempts,
-                level.focus
-            );
-        }
-        for group in 0..chapter_count() {
-            let budgets: Vec<usize> = levels
-                [chapter_offset(group)..chapter_offset(group) + chapter_size(group)]
-                .iter()
-                .map(|level| level.exploration_attempts)
-                .collect();
-            assert!(
-                budgets.windows(2).all(|pair| pair[0] <= pair[1]),
-                "budgets décroissants dans {:?}: {:?}",
-                CHAPTERS[group].title,
-                budgets
-            );
-        }
-    }
-
-    #[test]
     fn every_level_keeps_a_narrow_but_playable_window() {
         // The alternates matter as much as the canonical seed: a player who
         // replays a chapter gets these levels, not the ones the default seed made.
@@ -3496,11 +3337,6 @@ mod tests {
         for seed in [DEFAULT_SEED, 7, 0xdead] {
             let generated = generate_levels(seed);
             for (group, spec) in CHAPTERS.iter().enumerate() {
-                if spec.chapter.is_sandbox() {
-                    // A sandbox level is open on the intensity dial by design, and
-                    // its plan sets no margin to measure against.
-                    continue;
-                }
                 for step in 0..CHAPTERS[group].plans.len() {
                     let level = &generated[chapter_offset(group) + step];
                     let max_window = spec.plans[step]
@@ -3618,11 +3454,6 @@ mod tests {
     fn generated_levels_keep_the_winning_intensities_rare() {
         for seed in [DEFAULT_SEED, 7, 0xdead] {
             for (index, level) in generate_levels(seed).iter().enumerate() {
-                if level.chapter.is_sandbox() {
-                    // Winning across a wide range of settings is the whole point of
-                    // the sandbox chapter, so the needle bound is not its subject.
-                    continue;
-                }
                 let ratio = grid_win_ratio(level);
                 assert!(
                     ratio > 0.0 && ratio <= 0.3,
@@ -3728,7 +3559,7 @@ mod tests {
         // Directly exercise the last-resort path itself, bypassing RNG,
         // to make sure guaranteed_fallback() alone is never unreachable.
         let shell = canonical_shell(spec, plan, 3);
-        let fallback = guaranteed_fallback(shell, &plan, 3);
+        let fallback = guaranteed_fallback(shell, plan, 3);
         assert!(
             solve(&fallback).is_some(),
             "guaranteed_fallback produced an unreachable level"
@@ -3797,38 +3628,37 @@ mod tests {
     }
 
     #[test]
-    fn exploration_counts_the_beacons_and_stops_on_obstacles() {
+    fn a_probe_counts_the_beacons_and_stops_on_obstacles() {
         let mut level = calm_level(vec![(1.0, 0.0), (2.0, 0.0)]);
         level.obstacles = vec![Obstacle {
             x: 0.01,
             y: 0.0,
             r: 0.1,
         }];
-        let result = integrate_with_mode(&level, 0.0, SimulationMode::Exploration);
+        let result = integrate_from(&level, level.a, 0.0);
         assert!(!result.reached());
         assert!(result.collided());
-        let laboratory = integrate_with_mode(&level, 0.0, SimulationMode::Laboratory);
-        assert!(matches!(laboratory.outcome, Outcome::Collision { .. }));
+        assert!(matches!(result.outcome, Outcome::Collision { .. }));
     }
 
     #[test]
-    fn exploration_visits_every_beacon_around_obstacles() {
+    fn a_probe_visits_every_beacon_around_obstacles() {
         let mut level = calm_level(vec![(1.0, 0.0), (2.0, 0.0)]);
         level.obstacles = vec![Obstacle {
             x: 1.0,
             y: 0.9,
             r: 0.1,
         }];
-        let result = integrate_with_mode(&level, 0.0, SimulationMode::Exploration);
+        let result = integrate_from(&level, level.a, 0.0);
         assert!(result.reached());
         assert!(!result.collided());
         assert_eq!(result.visited, 2);
     }
 
     #[test]
-    fn exploration_reports_partial_beacon_runs() {
+    fn a_probe_reports_partial_beacon_runs() {
         let level = calm_level(vec![(1.0, 0.0), (1.0, 4.0)]);
-        let result = integrate_with_mode(&level, 0.0, SimulationMode::Exploration);
+        let result = integrate_from(&level, level.a, 0.0);
         assert!(!result.reached());
         assert_eq!(result.visited, 1);
         assert!(matches!(result.outcome, Outcome::LeftField { .. }));
@@ -3881,12 +3711,6 @@ mod tests {
             assert!(
                 valid_geometry(level) && valid_field(level),
                 "géométrie/champ invalide: {}",
-                level.title
-            );
-            assert!(
-                (3..=6).contains(&level.exploration_attempts),
-                "budget {} hors bornes sur {}",
-                level.exploration_attempts,
                 level.title
             );
         }
