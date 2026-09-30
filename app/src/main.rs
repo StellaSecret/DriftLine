@@ -5,7 +5,8 @@ use dioxus::prelude::*;
 use peoplemodeler_core::{
     chapter_count, generate_level_group, integrate_from, slot_chapter, slot_count,
     slot_is_tutorial, slot_offset, slot_size, tutorial_hint, tutorial_level_for, Chapter, Level,
-    Outcome, ReleaseMode, SimResult, Vector2, DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX, YMIN,
+    Outcome, ReleaseMode, SimResult, TraceRule, Vector2, DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX,
+    YMIN,
 };
 
 const W: f64 = 640.0;
@@ -749,6 +750,26 @@ fn App() -> Element {
             )
         })
         .collect();
+    // A level that keeps its options leaves every tried intensity on the dial,
+    // so a response the player cannot read off the field can still be bracketed
+    // on purpose instead of re-guessed. The span is the level's own range, so
+    // a tick always sits where that number was actually set.
+    let trace_ticks: Vec<(f64, bool)> = if current.rules.traces == TraceRule::KeepOptions {
+        let span = current.k_max - current.k_min;
+        history_snapshot
+            .iter()
+            .map(|attempt| {
+                let offset = if span > 0.0 {
+                    (attempt.k - current.k_min) / span * 100.0
+                } else {
+                    0.0
+                };
+                (offset.clamp(0.0, 100.0), attempt.result.reached())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let closest_marker = active_result.as_ref().and_then(|result| {
         if result.reached() {
             None
@@ -1303,6 +1324,24 @@ fn App() -> Element {
                             }
                         },
                     }
+                    if !trace_ticks.is_empty() {
+                        div { class: "trace-scale",
+                            span { class: "trace-label", "essais gardés" }
+                            div { class: "trace-track",
+                                for (index, (offset, reached)) in trace_ticks.iter().enumerate() {
+                                    div {
+                                        key: "trace-{index}",
+                                        class: if *reached {
+                                            "trace-tick won"
+                                        } else {
+                                            "trace-tick"
+                                        },
+                                        style: "left:{offset}%",
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if show_dial {
@@ -1473,6 +1512,13 @@ h1{font-size:1.3rem;margin:0 0 4px}
 .ghost-path{stroke:var(--accent2);stroke-width:1.6;stroke-dasharray:2 5;opacity:.5}
 .blind-path{stroke:var(--sub);stroke-width:1.4;stroke-dasharray:3 6;opacity:.4}
 .blind-note{fill:var(--sub);font-size:12px;letter-spacing:.4px}
+.trace-scale{display:flex;align-items:center;gap:8px;flex:1 0 100%;min-width:140px;margin-top:2px}
+.trace-label{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--sub);
+  white-space:nowrap}
+.trace-track{position:relative;flex:1;height:9px;border-bottom:1px solid var(--line)}
+.trace-tick{position:absolute;bottom:0;width:2px;height:6px;background:var(--sub);
+  transform:translateX(-1px);opacity:.75}
+.trace-tick.won{background:var(--accent);height:9px}
 .tutorial-banner{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 2px;
   padding:10px 12px;border:1px solid var(--accent);border-radius:8px;background:rgba(94,227,201,.08)}
 .tutorial-badge{font-size:11px;letter-spacing:1.4px;text-transform:uppercase;color:var(--accent);

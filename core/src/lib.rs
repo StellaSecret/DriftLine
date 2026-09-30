@@ -1019,23 +1019,27 @@ const TIMING_PLANS: [LevelPlan; 4] = [
 const COMPOSE_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
         .knobs(Knobs::INTENSITY)
-        .window(10.0)
+        .window(6.0)
+        .traces()
         .focus("houle et rappel"),
     LevelPlan::new(FieldKind::Compose, 2.5, 0.05)
         .knobs(Knobs::INTENSITY)
         .obstacles(1, 0.4, 0.6)
-        .window(10.0)
+        .window(6.0)
+        .traces()
         .focus("deux forces"),
     LevelPlan::new(FieldKind::Compose, 3.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.4, 0.65)
         .gain(2.0)
-        .window(12.0)
+        .window(7.0)
+        .traces()
         .focus("trois forces"),
     LevelPlan::new(FieldKind::Compose, 3.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.35, 0.6)
-        .window(14.0)
+        .window(8.0)
+        .traces()
         .focus("champ dense"),
 ];
 
@@ -1141,14 +1145,15 @@ const CHAPTERS: [ChapterSpec; 8] = [
         chapter: Chapter::Compose,
         title: "Composition",
         question: "Comment lire un courant composé ?",
-        desc: "Plusieurs composantes se superposent : l'intensité agit sur leur mélange.",
+        desc: "Deux courants se superposent : une houle qui berce le début du trajet et un rappel qui l'aplatit. L'intensité fixe la ligne de fond, et chaque essai reste marqué sur le dial — la réponse est entre deux essais, pas à un bout.",
         plans: &COMPOSE_PLANS,
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
                 .knobs(Knobs::INTENSITY)
-                .window(12.0)
+                .window(6.0)
+                .traces()
                 .focus("champ composé"),
-            hint: "Deux courants superposés : l'intensité règle les deux d'un coup.",
+            hint: "Le courant est la somme de deux effets. Encadre la zone gagnante avec deux essais : la réponse est entre eux.",
         },
     },
     ChapterSpec {
@@ -1304,7 +1309,15 @@ fn canonical_field(plan: &LevelPlan) -> FlowField {
                     gain_y: 0.7 * gain,
                 },
             ],
-            weights: vec![1.0, -0.6],
+            // Both currents are weighted the same way round on purpose. A
+            // negative weight does not merely oppose the second component, it
+            // flips the sign of its restoring term too, so the pull that is
+            // meant to settle the path turns into one that throws it out of the
+            // field and leaves the intensity almost no authority. Adding them
+            // instead gives a field the player has to take apart: a swell that
+            // rocks the early path, a recall that damps it, and an intensity
+            // that sets the baseline they ride on.
+            weights: vec![0.55, 0.45],
         },
     }
 }
@@ -1441,7 +1454,7 @@ fn random_field(plan: &LevelPlan, rng: &mut SeededRng) -> FlowField {
             );
             FlowField::Mix {
                 components: vec![first, second],
-                weights: vec![1.0, rng.range(-0.9, -0.4)],
+                weights: vec![0.55, rng.range(0.35, 0.6)],
             }
         }
     }
@@ -3543,6 +3556,89 @@ mod tests {
                     failed_before && failed_after && seen_win,
                     "{} (graine {seed:x}) n'a pas d'optimum intérieur",
                     level.focus
+                );
+            }
+        }
+    }
+
+    /// Composition promises two things its copy relies on: that the dial is
+    /// what the level is played with, and that its answer is a plain interval
+    /// to bracket. Both were false at once — the mix weighted its restoring
+    /// component negatively, which flipped the sign of the pull as well as the
+    /// push, so on most seeds the path did not move at all when the dial did.
+    #[test]
+    fn the_compose_chapter_response_is_worth_bracketing() {
+        for seed in [DEFAULT_SEED, 7, 0xdead] {
+            for level in generate_level_group(seed, Chapter::Compose.group_index()) {
+                let step = level.recommended_step;
+                // A probe point every run is guaranteed to cross, so the family
+                // is compared at the same place even when a run leaves the
+                // field before reaching its beacon.
+                let probe_x = level.a.0 + 1.0;
+                let height = |k: f64| {
+                    integrate(&level, k)
+                        .points
+                        .iter()
+                        .find(|point| point.0 >= probe_x)
+                        .map_or(0.0, |point| point.1)
+                };
+
+                let spread = (height(level.k_min.max(0.0)) - height(level.k_max)).abs();
+                assert!(
+                    spread > WIN_R,
+                    "{} (graine {seed:x}) ne bouge que de {spread:.3} sur tout le dial",
+                    level.focus
+                );
+
+                // Bracketing is only sound while the answer is one run of
+                // settings, so the winning intensities have to be contiguous.
+                let mut winning: Vec<bool> = Vec::new();
+                let mut k = level.k_min;
+                while k <= level.k_max + 1e-9 {
+                    winning.push(integrate(&level, k).reached());
+                    k += step;
+                }
+                let runs = winning
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &hit)| hit)
+                    .map(|(i, _)| i)
+                    .fold((0usize, None), |(count, prev), i| match prev {
+                        Some(p) if p + 1 == i => (count, Some(i)),
+                        _ => (count + 1, Some(i)),
+                    })
+                    .0;
+                assert_eq!(
+                    runs, 1,
+                    "{} (graine {seed:x}) a {runs} bandes gagnantes: l'encadrement mentirait",
+                    level.focus
+                );
+            }
+        }
+    }
+
+    /// Composition is the one chapter that keeps its options: the tick marks
+    /// under the dial are the mechanic, not a decoration, so the plans and the
+    /// teaching level have to ask for them.
+    #[test]
+    fn only_composition_keeps_its_options() {
+        let compose = &CHAPTERS[Chapter::Compose.group_index()];
+        assert!(compose
+            .plans
+            .iter()
+            .all(|plan| plan.traces == TraceRule::KeepOptions));
+        assert_eq!(compose.tutorial.plan.traces, TraceRule::KeepOptions);
+        for chapter in Chapter::all() {
+            if chapter == Chapter::Compose {
+                continue;
+            }
+            let other = &CHAPTERS[chapter.group_index()];
+            for plan in other.plans {
+                assert_eq!(
+                    plan.traces,
+                    TraceRule::None,
+                    "{} ne doit pas garder ses options",
+                    other.title
                 );
             }
         }
