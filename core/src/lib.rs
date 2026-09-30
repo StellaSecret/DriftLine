@@ -74,10 +74,21 @@ pub enum Visibility {
     BlindStart {
         fraction: f64,
     },
-    /// The current field is shown but its trajectory is not. The player reads
-    /// the vectors and commits to a drift; the path only appears once the probe
-    /// has run, so the flow has to be understood rather than traced.
-    Hidden,
+    /// Nothing of the current run is shown before the launch; all of it is
+    /// shown afterwards. The two flags say what the level still leaves the
+    /// player, because they are independent questions:
+    ///
+    /// `vectors` is whether the field stays legible. With it, the drift can be
+    /// read off the arrows and one careful look is enough. Without it, the only
+    /// evidence is what past runs left behind.
+    ///
+    /// `records` is whether those past runs stay on the map. It is the
+    /// difference between guessing blind every time and measuring the response
+    /// across a history of attempts.
+    Hidden {
+        vectors: bool,
+        records: bool,
+    },
 }
 
 impl Visibility {
@@ -91,8 +102,8 @@ impl Visibility {
                 wanted.clamp(2, total.max(2))
             }
             Visibility::BlindStart { .. } => total,
-            Visibility::Hidden if launched => total,
-            Visibility::Hidden => 0,
+            Visibility::Hidden { .. } if launched => total,
+            Visibility::Hidden { .. } => 0,
         }
     }
 
@@ -111,11 +122,21 @@ impl Visibility {
         matches!(self, Visibility::BlindStart { .. })
     }
 
-    /// Whether earlier attempts stay on the map. A hidden path teaches by
-    /// deduction, so a drawn answer from a past run would give the next one
-    /// away; its marks stay, its trajectories go.
+    /// Whether earlier attempts stay on the map. Only a level that hides its
+    /// records forbids them, since a drawn answer from a past run would give
+    /// the next one away; their marks stay either way.
     pub fn keeps_recorded_paths(self) -> bool {
-        !matches!(self, Visibility::Hidden)
+        !matches!(self, Visibility::Hidden { records: false, .. })
+    }
+
+    /// Whether the field itself is drawn as a vector grid. Hiding it leaves the
+    /// intensity as the only handle on a current the player cannot read, so the
+    /// response has to be measured from run to run instead of looked up.
+    pub fn shows_field_vectors(self) -> bool {
+        match self {
+            Visibility::Full | Visibility::BlindStart { .. } => true,
+            Visibility::Hidden { vectors, .. } => vectors,
+        }
     }
 }
 
@@ -727,8 +748,25 @@ impl LevelPlan {
         self
     }
 
+    /// Nothing of the run is shown before the launch, but the field stays
+    /// legible and past runs are forgotten: the drift is read off the arrows
+    /// and nothing is carried over from the last attempt.
     const fn hidden(mut self) -> Self {
-        self.visibility = Visibility::Hidden;
+        self.visibility = Visibility::Hidden {
+            vectors: true,
+            records: false,
+        };
+        self
+    }
+
+    /// Nothing of the run is shown before the launch, the field is not legible,
+    /// and past runs stay on the map. With no arrows to read and nothing to
+    /// carry over, the response can only be measured from one run to the next.
+    const fn unlit_field(mut self) -> Self {
+        self.visibility = Visibility::Hidden {
+            vectors: false,
+            records: true,
+        };
         self
     }
 
@@ -807,18 +845,21 @@ const INFLUENCE_PLANS: [LevelPlan; 3] = [
         .obstacles(1, 0.5, 0.7)
         .gain(2.0)
         .window(5.0)
+        .unlit_field()
         .focus("hauteur d'équilibre"),
     LevelPlan::new(FieldKind::Retention, 2.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.5, 0.8)
         .gain(3.0)
         .window(6.0)
+        .unlit_field()
         .focus("équilibre mobile"),
     LevelPlan::new(FieldKind::Retention, 3.0, 0.02)
         .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.45, 0.75)
         .gain(3.0)
         .window(7.0)
+        .unlit_field()
         .focus("contre-courant"),
 ];
 
@@ -1035,7 +1076,7 @@ const CHAPTERS: [ChapterSpec; 8] = [
         chapter: Chapter::Detect,
         title: "Détection",
         question: "Où larguer quand le chemin se cache ?",
-        desc: "Seul le premier tronçon est annoncé : le reste du trajet se prévoit.",
+        desc: "Seul le premier tronçon est annoncé, et la balise reste invisible tant qu'aucun essai n'est derrière toi : le premier largage est un pari.",
         plans: &DETECT_PLANS,
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
@@ -1044,22 +1085,24 @@ const CHAPTERS: [ChapterSpec; 8] = [
                 .zone(1.0, 1.6)
                 .blind(0.3)
                 .focus("premier tronçon"),
-            hint: "La trajectoire n'apparaît qu'au départ : le reste se déduit du courant.",
+            hint: "Rien n'est tracé avant le départ, et la balise est cachée : choisis, puis regarde où la sonde va vraiment. Au second essai tu la verras.",
         },
     },
     ChapterSpec {
         chapter: Chapter::Influence,
         title: "Influence",
         question: "Quelle intensité ouvre le passage ?",
-        desc: "Les vecteurs sont masqués : la seule mesure est l'effet de l'intensité sur la dérive.",
+        desc: "Les flèches sont retirées et tes essais restent tracés. L'intensité n'a pas de « plus c'est fort » : les deux extrêmes échouent, et la bonne valeur se trouve entre eux.",
         plans: &INFLUENCE_PLANS,
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Retention, 1.5, 0.05)
                 .knobs(Knobs::INTENSITY)
+                .obstacles(1, 0.5, 0.7)
                 .gain(2.0)
                 .window(5.0)
+                .unlit_field()
                 .focus("réglage de l'intensité"),
-            hint: "Sans les vecteurs, l'intensité reste la seule variable : teste, compare, garde la meilleure.",
+            hint: "Sans flèches, une trace est une mesure. Essaie un extrême, puis l'autre : la solution est dans l'espace entre eux, pas au bout.",
         },
     },
     ChapterSpec {
@@ -3463,6 +3506,48 @@ mod tests {
         }
     }
 
+    /// Influence promises an interior optimum: the intensity has a band that
+    /// wins and a failure on either side of it, so the answer is found by
+    /// bracketing rather than by pushing toward an extreme. That is the lesson
+    /// its copy states, so it is checked here rather than left to drift.
+    #[test]
+    fn the_influence_chapter_really_does_have_an_interior_optimum() {
+        fn wins(outcome: Outcome) -> bool {
+            matches!(outcome, Outcome::Reached)
+        }
+        for seed in [DEFAULT_SEED, 7, 0xdead] {
+            for level in generate_level_group(seed, Chapter::Influence.group_index()) {
+                let step = level.recommended_step;
+                let mut k = level.k_min;
+                let mut seen_win = false;
+                let mut failed_before = false;
+                let mut failed_after = false;
+                while k <= level.k_max + 1e-9 {
+                    if wins(integrate(&level, k).outcome) {
+                        if failed_before {
+                            seen_win = true;
+                        }
+                        failed_after = false;
+                    } else {
+                        if seen_win {
+                            failed_after = true;
+                        } else {
+                            failed_before = true;
+                        }
+                    }
+                    k += step;
+                }
+                // A win that starts at the lowest intensity, or that never stops
+                // winning, would make "both extremes fail" a lie in the copy.
+                assert!(
+                    failed_before && failed_after && seen_win,
+                    "{} (graine {seed:x}) n'a pas d'optimum intérieur",
+                    level.focus
+                );
+            }
+        }
+    }
+
     /// How much of the settings grid wins. A level with a dial is scored on the
     /// (phase, intensity) grid, because a setting only counts once the snapshot
     /// it dials into exists.
@@ -3961,15 +4046,44 @@ mod tests {
 
     #[test]
     fn a_hidden_path_shows_nothing_until_the_probe_has_run() {
-        let hidden = Visibility::Hidden;
-        assert_eq!(hidden.shown_points(40, false), 0);
-        assert_eq!(hidden.shown_points(40, true), 40);
-        // The beacon is the one thing a predicted drift has to aim at, so a
-        // hidden path names it even while the path stays back.
-        assert!(hidden.reveals_beacon_before_launch());
-        // Nothing trails in flight, and a past answer would spoil the lesson.
-        assert!(!hidden.draws_in_flight_tail());
-        assert!(!hidden.keeps_recorded_paths());
+        for hidden in [
+            Visibility::Hidden {
+                vectors: true,
+                records: false,
+            },
+            Visibility::Hidden {
+                vectors: false,
+                records: true,
+            },
+        ] {
+            assert_eq!(hidden.shown_points(40, false), 0);
+            assert_eq!(hidden.shown_points(40, true), 40);
+            // The beacon is the one thing a predicted drift has to aim at, so a
+            // hidden path names it even while the path stays back.
+            assert!(hidden.reveals_beacon_before_launch());
+            // Nothing trails in flight: there is no tail to give away.
+            assert!(!hidden.draws_in_flight_tail());
+        }
+    }
+
+    #[test]
+    fn hiding_the_path_and_hiding_the_record_are_separate_choices() {
+        let forgetful = Visibility::Hidden {
+            vectors: true,
+            records: false,
+        };
+        // Legible field, no path, and a past answer would spoil the lesson.
+        assert!(forgetful.shows_field_vectors());
+        assert!(!forgetful.keeps_recorded_paths());
+
+        let measured = Visibility::Hidden {
+            vectors: false,
+            records: true,
+        };
+        // No field to read and nothing to carry over, so the response can only
+        // be measured from one run to the next.
+        assert!(!measured.shows_field_vectors());
+        assert!(measured.keeps_recorded_paths());
     }
 
     #[test]
@@ -3980,6 +4094,7 @@ mod tests {
         assert!(!blind.reveals_beacon_before_launch());
         assert!(blind.draws_in_flight_tail());
         assert!(blind.keeps_recorded_paths());
+        assert!(blind.shows_field_vectors());
 
         let full = Visibility::Full;
         assert_eq!(full.shown_points(40, false), 40);
@@ -3987,31 +4102,51 @@ mod tests {
         assert!(full.reveals_beacon_before_launch());
         assert!(!full.draws_in_flight_tail());
         assert!(full.keeps_recorded_paths());
+        assert!(full.shows_field_vectors());
     }
 
     #[test]
-    fn the_predict_chapter_teaches_from_the_vectors_alone() {
-        let spec = &CHAPTERS[Chapter::Predict.group_index()];
-        assert!(spec
+    fn each_path_chapter_keeps_its_own_visibility() {
+        let forgetful = Visibility::Hidden {
+            vectors: true,
+            records: false,
+        };
+        let measured = Visibility::Hidden {
+            vectors: false,
+            records: true,
+        };
+
+        let predict = &CHAPTERS[Chapter::Predict.group_index()];
+        assert!(predict
             .plans
             .iter()
-            .all(|plan| plan.visibility == Visibility::Hidden));
-        assert_eq!(spec.tutorial.plan.visibility, Visibility::Hidden);
-        // The other path lessons keep their own reveal, so "hidden" stays the
-        // one thing this chapter teaches.
+            .all(|plan| plan.visibility == forgetful));
+        assert_eq!(predict.tutorial.plan.visibility, forgetful);
+
+        // Influence is the mirror image: same hidden path, but the field is
+        // gone and the runs stay, so the two chapters read the current by
+        // opposite means.
+        let influence = &CHAPTERS[Chapter::Influence.group_index()];
+        assert!(influence
+            .plans
+            .iter()
+            .all(|plan| plan.visibility == measured));
+        assert_eq!(influence.tutorial.plan.visibility, measured);
+
+        // Every other chapter keeps a full or blind path, so a hidden one stays
+        // the mark of these two lessons and never leaks into a third.
         for chapter in Chapter::all() {
-            if chapter == Chapter::Predict {
+            if matches!(chapter, Chapter::Predict | Chapter::Influence) {
                 continue;
             }
             let other = &CHAPTERS[chapter.group_index()];
-            assert!(
-                other
-                    .plans
-                    .iter()
-                    .all(|plan| plan.visibility != Visibility::Hidden),
-                "{} ne doit pas masquer sa trajectoire",
-                other.title
-            );
+            for plan in other.plans {
+                assert!(
+                    !matches!(plan.visibility, Visibility::Hidden { .. }),
+                    "{} ne doit pas masquer sa trajectoire",
+                    other.title
+                );
+            }
         }
     }
 }

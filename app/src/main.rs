@@ -711,7 +711,13 @@ fn App() -> Element {
     let revealed = visibility
         .shown_points(shown_points.len(), has_launched)
         .min(shown_points.len());
-    let reveal_beacons = visibility.reveals_beacon_before_launch() || has_launched;
+    // A blind start keeps the beacon back while the player is aiming, so the
+    // first launch is a real bet. The player sees it while the probe is in
+    // flight, and it stays known from then on: what was measured counts as
+    // remembered, so only the attempt that has to be guessed is the first one.
+    let reveal_beacons = visibility.reveals_beacon_before_launch()
+        || has_launched
+        || !current_progress.history.is_empty();
     let shown_path_d = path_to_svg(&shown_points[..revealed]);
     // Only a blind start trails a faint remainder; a hidden path has no tail to
     // give away, so nothing is drawn in flight.
@@ -989,15 +995,17 @@ fn App() -> Element {
                             path { d: "M 0 0 L 10 5 L 0 10 z", class: "arrow-head" }
                         }
                     }
-                    for gx in field_grid_x() {
-                        for gy in field_grid_y() {
-                            if let Some((x1, y1, x2, y2)) = vector_endpoints(&current, gx, gy, k()) {
-                                line {
-                                    key: "{gx}-{gy}",
-                                    x1: "{x1:.2}", y1: "{y1:.2}",
-                                    x2: "{x2:.2}", y2: "{y2:.2}",
-                                    class: "arrow",
-                                    marker_end: "url(#flow-arrow)",
+                    if visibility.shows_field_vectors() {
+                        for gx in field_grid_x() {
+                            for gy in field_grid_y() {
+                                if let Some((x1, y1, x2, y2)) = vector_endpoints(&current, gx, gy, k()) {
+                                    line {
+                                        key: "{gx}-{gy}",
+                                        x1: "{x1:.2}", y1: "{y1:.2}",
+                                        x2: "{x2:.2}", y2: "{y2:.2}",
+                                        class: "arrow",
+                                        marker_end: "url(#flow-arrow)",
+                                    }
                                 }
                             }
                         }
