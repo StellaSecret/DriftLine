@@ -71,18 +71,51 @@ pub enum ReleaseMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Visibility {
     Full,
-    BlindStart { fraction: f64 },
+    BlindStart {
+        fraction: f64,
+    },
+    /// The current field is shown but its trajectory is not. The player reads
+    /// the vectors and commits to a drift; the path only appears once the probe
+    /// has run, so the flow has to be understood rather than traced.
+    Hidden,
 }
 
 impl Visibility {
-    pub fn shown_points(self, total: usize) -> usize {
+    /// How many points of a `total`-long run the player may see, given whether
+    /// the probe has already been released on this attempt.
+    pub fn shown_points(self, total: usize, launched: bool) -> usize {
         match self {
             Visibility::Full => total,
-            Visibility::BlindStart { fraction } => {
+            Visibility::BlindStart { fraction } if launched => {
                 let wanted = (total as f64 * fraction.clamp(0.0, 1.0)).round() as usize;
                 wanted.clamp(2, total.max(2))
             }
+            Visibility::BlindStart { .. } => total,
+            Visibility::Hidden if launched => total,
+            Visibility::Hidden => 0,
         }
+    }
+
+    /// Whether the target is named while the player is still aiming. A blind
+    /// start keeps the beacon back so the landing point has to be deduced; a
+    /// hidden path names its beacon openly, since that beacon is the one thing
+    /// the predicted drift has to reach.
+    pub fn reveals_beacon_before_launch(self) -> bool {
+        !matches!(self, Visibility::BlindStart { .. })
+    }
+
+    /// Whether the run is drawn as it flies, trailing a faint remainder that
+    /// only completes at the beacon. A hidden path draws nothing in flight: it
+    /// has no tail to reveal because it never showed its head.
+    pub fn draws_in_flight_tail(self) -> bool {
+        matches!(self, Visibility::BlindStart { .. })
+    }
+
+    /// Whether earlier attempts stay on the map. A hidden path teaches by
+    /// deduction, so a drawn answer from a past run would give the next one
+    /// away; its marks stay, its trajectories go.
+    pub fn keeps_recorded_paths(self) -> bool {
+        !matches!(self, Visibility::Hidden)
     }
 }
 
@@ -168,10 +201,10 @@ pub struct Probe {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Chapter {
-    Follow,
     Position,
-    Influence,
     Predict,
+    Detect,
+    Influence,
     Thread,
     Timing,
     Compose,
@@ -181,10 +214,10 @@ pub enum Chapter {
 impl Chapter {
     pub fn all() -> [Chapter; 8] {
         [
-            Chapter::Follow,
             Chapter::Position,
-            Chapter::Influence,
             Chapter::Predict,
+            Chapter::Detect,
+            Chapter::Influence,
             Chapter::Thread,
             Chapter::Timing,
             Chapter::Compose,
@@ -694,6 +727,11 @@ impl LevelPlan {
         self
     }
 
+    const fn hidden(mut self) -> Self {
+        self.visibility = Visibility::Hidden;
+        self
+    }
+
     const fn corridor(mut self) -> Self {
         self.corridor = true;
         self
@@ -744,19 +782,22 @@ struct TutorialSpec {
     hint: &'static str,
 }
 
-const FOLLOW_PLANS: [LevelPlan; 3] = [
+const PREDICT_PLANS: [LevelPlan; 3] = [
     LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
         .knobs(Knobs::INTENSITY)
         .window(3.0)
+        .hidden()
         .focus("dérive pure"),
     LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
         .knobs(Knobs::INTENSITY)
         .window(3.0)
+        .hidden()
         .focus("dérive inclinée"),
     LevelPlan::new(FieldKind::Calm, 2.0, 0.05)
         .knobs(Knobs::INTENSITY)
         .gain(1.5)
         .window(4.0)
+        .hidden()
         .focus("courant penché"),
 ];
 
@@ -813,7 +854,7 @@ const POSITION_PLANS: [LevelPlan; 5] = [
         .focus("séparation basse"),
 ];
 
-const PREDICT_PLANS: [LevelPlan; 4] = [
+const DETECT_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Calm, 1.0, 0.01)
         .obstacles(1, 0.4, 0.6)
         .gain(1.5)
@@ -961,20 +1002,6 @@ const COMPOSE_PLANS: [LevelPlan; 4] = [
 /// against, and the gates below hold every chapter to that target.
 const CHAPTERS: [ChapterSpec; 8] = [
     ChapterSpec {
-        chapter: Chapter::Follow,
-        title: "Suivi",
-        question: "Que fait le courant ?",
-        desc: "Le champ est fixe et montré en permanence : règle l'intensité et regarde où la sonde dérive.",
-        plans: &FOLLOW_PLANS,
-        tutorial: TutorialSpec {
-            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
-                .knobs(Knobs::NONE)
-                .window(3.0)
-                .focus("observer le courant"),
-            hint: "Le champ ne bouge pas. Largue la sonde et suis la trace jusqu'à la balise.",
-        },
-    },
-    ChapterSpec {
         chapter: Chapter::Position,
         title: "Position",
         question: "Où larguer ?",
@@ -990,6 +1017,37 @@ const CHAPTERS: [ChapterSpec; 8] = [
         },
     },
     ChapterSpec {
+        chapter: Chapter::Predict,
+        title: "Prédiction",
+        question: "Où va dériver la sonde ?",
+        desc: "Le champ est montré, sa trajectoire non : lis les vecteurs et prévois la dérive.",
+        plans: &PREDICT_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
+                .knobs(Knobs::NONE)
+                .window(3.0)
+                .hidden()
+                .focus("dérive prévue"),
+            hint: "Aucun tracé avant le largage : suis les flèches, puis laisse la sonde te dire si tu avais raison.",
+        },
+    },
+    ChapterSpec {
+        chapter: Chapter::Detect,
+        title: "Détection",
+        question: "Où larguer quand le chemin se cache ?",
+        desc: "Seul le premier tronçon est annoncé : le reste du trajet se prévoit.",
+        plans: &DETECT_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
+                .knobs(Knobs::RELEASE)
+                .window(5.0)
+                .zone(1.0, 1.6)
+                .blind(0.3)
+                .focus("premier tronçon"),
+            hint: "La trajectoire n'apparaît qu'au départ : le reste se déduit du courant.",
+        },
+    },
+    ChapterSpec {
         chapter: Chapter::Influence,
         title: "Influence",
         question: "Quelle intensité ouvre le passage ?",
@@ -1002,22 +1060,6 @@ const CHAPTERS: [ChapterSpec; 8] = [
                 .window(5.0)
                 .focus("réglage de l'intensité"),
             hint: "Sans les vecteurs, l'intensité reste la seule variable : teste, compare, garde la meilleure.",
-        },
-    },
-    ChapterSpec {
-        chapter: Chapter::Predict,
-        title: "Prédiction",
-        question: "Où larguer quand le chemin se cache ?",
-        desc: "Seul le premier tronçon est annoncé : le reste du trajet se prévoit.",
-        plans: &PREDICT_PLANS,
-        tutorial: TutorialSpec {
-            plan: LevelPlan::new(FieldKind::Calm, 1.0, 0.05)
-                .knobs(Knobs::RELEASE)
-                .window(5.0)
-                .zone(1.0, 1.6)
-                .blind(0.3)
-                .focus("premier tronçon"),
-            hint: "La trajectoire n'apparaît qu'au départ : le reste se déduit du courant.",
         },
     },
     ChapterSpec {
@@ -3238,7 +3280,7 @@ mod tests {
             title: "Test",
             desc: "",
             focus: "",
-            chapter: Chapter::Follow,
+            chapter: Chapter::Predict,
             rules: LevelRules::default(),
             step_index: 0,
             field: FlowField::Calm {
@@ -3288,10 +3330,10 @@ mod tests {
         assert_eq!(
             Chapter::all(),
             [
-                Chapter::Follow,
                 Chapter::Position,
-                Chapter::Influence,
                 Chapter::Predict,
+                Chapter::Detect,
+                Chapter::Influence,
                 Chapter::Thread,
                 Chapter::Timing,
                 Chapter::Compose,
@@ -3491,7 +3533,7 @@ mod tests {
 
     #[test]
     fn band_field_switches_direction_between_bands() {
-        let spec = &CHAPTERS[Chapter::Predict.group_index()];
+        let spec = &CHAPTERS[Chapter::Detect.group_index()];
         let level = canonical_level(spec, &spec.plans[3], 3);
         let FlowField::Bands { bands } = &level.field else {
             panic!("Prédiction attend un champ à bandes");
@@ -3544,7 +3586,7 @@ mod tests {
         // étroites") produced an unreachable level under some seeds. This
         // exercises the exact plan whether it's satisfied by procedural
         // generation or falls through to canonical_level/guaranteed_fallback.
-        let spec = &CHAPTERS[Chapter::Predict.group_index()];
+        let spec = &CHAPTERS[Chapter::Detect.group_index()];
         let plan = &spec.plans[3];
         assert_eq!(plan.focus, "bandes étroites");
 
@@ -3599,7 +3641,8 @@ mod tests {
 
     #[test]
     fn opposed_field_reverses_vertical_current() {
-        let level = canonical_level(&CHAPTERS[1], &CHAPTERS[1].plans[2], 2);
+        let spec = &CHAPTERS[Chapter::Position.group_index()];
+        let level = canonical_level(spec, &spec.plans[2], 2);
         let below = level.flow_at(0.0, -0.1, 0.0);
         let above = level.flow_at(0.0, 0.1, 0.0);
         assert!(below.y < 0.0);
@@ -3682,7 +3725,8 @@ mod tests {
 
     #[test]
     fn rk4_preserves_a_constant_field() {
-        let level = canonical_level(&CHAPTERS[0], &CHAPTERS[0].plans[0], 0);
+        let spec = &CHAPTERS[Chapter::Predict.group_index()];
+        let level = canonical_level(spec, &spec.plans[0], 0);
         let point = rk4(&level, (0.0, 0.0), 0.5, 0.1);
         assert!((point.0 - 0.1).abs() < 1e-12);
         assert!((point.1 - 0.05).abs() < 1e-12);
@@ -3834,7 +3878,7 @@ mod tests {
         assert_eq!(wrapped, direct);
         assert_ne!(wrapped.field, level.resolved(level.phase_min).field);
         // A level without a timeline ignores the dial entirely.
-        let plain = &generate_level_group(DEFAULT_SEED, Chapter::Follow.group_index())[0];
+        let plain = &generate_level_group(DEFAULT_SEED, Chapter::Predict.group_index())[0];
         assert!(!plain.has_timeline());
         assert_eq!(plain.resolved(3.0), *plain);
     }
@@ -3842,7 +3886,7 @@ mod tests {
     #[test]
     fn pinned_knobs_leave_only_the_free_ones_to_play() {
         let tutorial = tutorial_levels(TUTORIAL_SEED);
-        let follow = &tutorial[Chapter::Follow.group_index()];
+        let follow = &tutorial[Chapter::Predict.group_index()];
         assert_eq!(follow.knobs(), Knobs::NONE);
         assert!(
             integrate(&follow.resolved(follow.phase_def), follow.k_def).reached(),
@@ -3911,6 +3955,62 @@ mod tests {
                 level.k_window,
                 target,
                 level.focus
+            );
+        }
+    }
+
+    #[test]
+    fn a_hidden_path_shows_nothing_until_the_probe_has_run() {
+        let hidden = Visibility::Hidden;
+        assert_eq!(hidden.shown_points(40, false), 0);
+        assert_eq!(hidden.shown_points(40, true), 40);
+        // The beacon is the one thing a predicted drift has to aim at, so a
+        // hidden path names it even while the path stays back.
+        assert!(hidden.reveals_beacon_before_launch());
+        // Nothing trails in flight, and a past answer would spoil the lesson.
+        assert!(!hidden.draws_in_flight_tail());
+        assert!(!hidden.keeps_recorded_paths());
+    }
+
+    #[test]
+    fn a_blind_start_keeps_its_own_rules() {
+        let blind = Visibility::BlindStart { fraction: 0.3 };
+        assert_eq!(blind.shown_points(40, false), 40);
+        assert_eq!(blind.shown_points(40, true), 12);
+        assert!(!blind.reveals_beacon_before_launch());
+        assert!(blind.draws_in_flight_tail());
+        assert!(blind.keeps_recorded_paths());
+
+        let full = Visibility::Full;
+        assert_eq!(full.shown_points(40, false), 40);
+        assert_eq!(full.shown_points(40, true), 40);
+        assert!(full.reveals_beacon_before_launch());
+        assert!(!full.draws_in_flight_tail());
+        assert!(full.keeps_recorded_paths());
+    }
+
+    #[test]
+    fn the_predict_chapter_teaches_from_the_vectors_alone() {
+        let spec = &CHAPTERS[Chapter::Predict.group_index()];
+        assert!(spec
+            .plans
+            .iter()
+            .all(|plan| plan.visibility == Visibility::Hidden));
+        assert_eq!(spec.tutorial.plan.visibility, Visibility::Hidden);
+        // The other path lessons keep their own reveal, so "hidden" stays the
+        // one thing this chapter teaches.
+        for chapter in Chapter::all() {
+            if chapter == Chapter::Predict {
+                continue;
+            }
+            let other = &CHAPTERS[chapter.group_index()];
+            assert!(
+                other
+                    .plans
+                    .iter()
+                    .all(|plan| plan.visibility != Visibility::Hidden),
+                "{} ne doit pas masquer sa trajectoire",
+                other.title
             );
         }
     }

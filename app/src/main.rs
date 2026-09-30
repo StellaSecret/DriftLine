@@ -5,8 +5,7 @@ use dioxus::prelude::*;
 use peoplemodeler_core::{
     chapter_count, generate_level_group, integrate_from, slot_chapter, slot_count,
     slot_is_tutorial, slot_offset, slot_size, tutorial_hint, tutorial_level_for, Chapter, Level,
-    Outcome, ReleaseMode, SimResult, Vector2, Visibility, DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX,
-    YMIN,
+    Outcome, ReleaseMode, SimResult, Vector2, DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX, YMIN,
 };
 
 const W: f64 = 640.0;
@@ -693,7 +692,7 @@ fn App() -> Element {
     let current_step = STEPS[step_idx()];
     let current_progress = progress()[current_level_idx].clone();
     let is_tutorial = slot_is_tutorial(current_level_idx);
-    let blind = matches!(current.rules.visibility, Visibility::BlindStart { .. });
+    let visibility = current.rules.visibility;
     let release = release_of(&current, &current_progress);
     let preview = integrate_from(&current, release, k());
     let description = current.desc.to_string();
@@ -707,27 +706,38 @@ fn App() -> Element {
         .map(|result| result.points.clone())
         .unwrap_or_else(|| preview.points.clone());
     // A hidden trajectory shows only the part the player has earned: a blind
-    // start reveals the run as it flies, and the rest of the path once the
-    // beacon has been found.
-    let revealed = if blind && has_launched {
-        current.rules.visibility.shown_points(shown_points.len())
+    // start reveals the run as it flies, a hidden path shows nothing until the
+    // probe has run at all, and both complete once the beacon has been found.
+    let revealed = visibility
+        .shown_points(shown_points.len(), has_launched)
+        .min(shown_points.len());
+    let reveal_beacons = visibility.reveals_beacon_before_launch() || has_launched;
+    let shown_path_d = path_to_svg(&shown_points[..revealed]);
+    // Only a blind start trails a faint remainder; a hidden path has no tail to
+    // give away, so nothing is drawn in flight.
+    let blind_path_d = if visibility.draws_in_flight_tail() {
+        path_to_svg(&shown_points[revealed..])
     } else {
-        shown_points.len()
+        String::new()
     };
-    let reveal_beacons = !blind || has_launched;
-    let shown_path_d = path_to_svg(&shown_points[..revealed.min(shown_points.len())]);
-    let blind_path_d = path_to_svg(&shown_points[revealed.min(shown_points.len())..]);
     let ghost_paths: Vec<String> = base_level
         .ghosts
         .iter()
         .map(|ghost| path_to_svg(ghost))
         .collect();
+    // A hidden path would spoil its own lesson: earlier trajectories are
+    // dropped while their marks stay, so each attempt is read off the field.
+    let keep_history_paths = visibility.keeps_recorded_paths();
     let history_snapshot = current_progress.history;
     let history_paths: Vec<(String, String, bool)> = history_snapshot
         .iter()
         .map(|attempt| {
             (
-                path_to_svg(&attempt.result.points),
+                if keep_history_paths {
+                    path_to_svg(&attempt.result.points)
+                } else {
+                    String::new()
+                },
                 format_intensity(attempt.k, *STEPS.last().unwrap()),
                 attempt.result.reached(),
             )
@@ -1014,10 +1024,19 @@ fn App() -> Element {
                         r: if current.rules.release == ReleaseMode::Fixed { "6" } else { "7" },
                         class: "point-a release-handle",
                     }
-                    if !reveal_beacons && !current.beacons.is_empty() {
+                    if !visibility.reveals_beacon_before_launch()
+                        && !reveal_beacons
+                        && !current.beacons.is_empty()
+                    {
                         text {
                             x: "16", y: "26", class: "blind-note",
                             "balise cachée · la trajectoire se révèle en vol",
+                        }
+                    }
+                    if !visibility.keeps_recorded_paths() && !has_launched {
+                        text {
+                            x: "16", y: "26", class: "blind-note",
+                            "trajectoire cachée · les flèches suffisent",
                         }
                     }
                     for (index, beacon) in current
@@ -1053,10 +1072,12 @@ fn App() -> Element {
                         }
                     }
                     for (index, (history_path, _, _)) in history_paths.iter().enumerate() {
-                        path {
-                            key: "history-{index}",
-                            d: "{history_path}",
-                            class: "path history-path",
+                        if !history_path.is_empty() {
+                            path {
+                                key: "history-{index}",
+                                d: "{history_path}",
+                                class: "path history-path",
+                            }
                         }
                     }
                     if !blind_path_d.is_empty() {
@@ -1382,7 +1403,7 @@ fn App() -> Element {
                     if !ghost_paths.is_empty() {
                         span { span { class: "dot dot-g" } " Fils voisins (échouent)" }
                     }
-                    if blind && !reveal_beacons {
+                    if !visibility.reveals_beacon_before_launch() && !reveal_beacons {
                         span { span { class: "dot dot-c" } " Balise cachée" }
                     }
                     if closest_marker.is_some() {
@@ -1573,16 +1594,14 @@ mod tests {
 
     #[test]
     fn a_chapter_opens_with_its_teaching_level() {
+        let chapter = Chapter::all()[0];
         let slots = chapter_slots(DEFAULT_SEED, 0, 0);
         assert_eq!(slots.len(), slot_size(0));
         let teaching = &slots[0];
-        assert_eq!(teaching.chapter, Chapter::Follow);
+        assert_eq!(teaching.chapter, chapter);
         assert_eq!(teaching.step_index, 0);
-        // The teaching level is a demonstration: nothing to set.
-        assert_eq!(teaching.knobs(), Knobs::NONE);
-        assert!(integrate_from(teaching, teaching.default_release, teaching.k_def).reached());
         for (index, level) in slots.iter().enumerate().skip(1) {
-            assert_eq!(level.chapter, Chapter::Follow);
+            assert_eq!(level.chapter, chapter);
             assert_eq!(level.step_index, index - 1);
             assert!(level.knobs() != Knobs::NONE);
         }
@@ -1647,7 +1666,7 @@ mod tests {
             title: "test",
             desc: "test",
             focus: "test",
-            chapter: Chapter::Follow,
+            chapter: Chapter::Predict,
             rules: peoplemodeler_core::LevelRules::default(),
             step_index: 0,
             field: peoplemodeler_core::FlowField::Calm {
