@@ -65,7 +65,6 @@ impl Rect {
 pub enum ReleaseMode {
     Fixed,
     Zone,
-    PerProbe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -194,9 +193,7 @@ pub struct LevelRules {
     pub release: ReleaseMode,
     pub zone: Rect,
     pub visibility: Visibility,
-    pub corridor: bool,
     pub traces: TraceRule,
-    pub probes: usize,
     pub knobs: Knobs,
 }
 
@@ -206,18 +203,10 @@ impl Default for LevelRules {
             release: ReleaseMode::Fixed,
             zone: Rect::new((0.0, 0.0), (0.0, 0.0)),
             visibility: Visibility::Full,
-            corridor: false,
             traces: TraceRule::None,
-            probes: 1,
             knobs: Knobs::ALL,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Probe {
-    pub start: Point,
-    pub target: Point,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -551,7 +540,6 @@ pub struct Level {
     pub k_window: f64,
     pub a: Point,
     pub default_release: Point,
-    pub probes: Vec<Probe>,
     pub ghosts: Vec<Vec<Point>>,
     pub beacons: Vec<Point>,
     pub obstacles: Vec<Obstacle>,
@@ -568,30 +556,6 @@ impl Level {
 
     pub fn global_index(&self) -> usize {
         chapter_offset(self.group_index()) + self.step_index + 1
-    }
-
-    pub fn launch_points(&self) -> Vec<Point> {
-        if self.rules.probes > 1 {
-            self.probes.iter().map(|probe| probe.start).collect()
-        } else {
-            vec![self.a]
-        }
-    }
-
-    pub fn targets(&self) -> Vec<Point> {
-        if self.rules.probes > 1 {
-            self.probes.iter().map(|probe| probe.target).collect()
-        } else {
-            self.beacons.clone()
-        }
-    }
-
-    pub fn is_won(&self, result: &SimResult) -> bool {
-        if self.rules.probes > 1 {
-            result.visited == self.rules.probes
-        } else {
-            result.reached()
-        }
     }
 
     pub fn knobs(&self) -> Knobs {
@@ -666,9 +630,7 @@ struct LevelPlan {
     release: ReleaseMode,
     zone: Rect,
     visibility: Visibility,
-    corridor: bool,
     traces: TraceRule,
-    probes: usize,
     knobs: Knobs,
     timeline: bool,
     ghosts: bool,
@@ -692,9 +654,7 @@ impl LevelPlan {
             release: ReleaseMode::Fixed,
             zone: Rect::new((0.0, 0.0), (0.0, 0.0)),
             visibility: Visibility::Full,
-            corridor: false,
             traces: TraceRule::None,
-            probes: 1,
             knobs: Knobs::ALL,
             timeline: false,
             ghosts: false,
@@ -770,18 +730,12 @@ impl LevelPlan {
         self
     }
 
-    const fn corridor(mut self) -> Self {
-        self.corridor = true;
-        self
-    }
-
     const fn traces(mut self) -> Self {
         self.traces = TraceRule::KeepOptions;
         self
     }
 
-    const fn probes(mut self, count: usize) -> Self {
-        self.probes = count;
+    const fn beacons(mut self, count: usize) -> Self {
         self.beacons = count;
         self
     }
@@ -927,26 +881,26 @@ const DETECT_PLANS: [LevelPlan; 4] = [
 const COORDINATE_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
         .obstacles(1, 0.45, 0.7)
-        .probes(2)
+        .beacons(2)
         .window(2.0)
         .zone(1.0, 1.6)
         .focus("deux balises"),
     LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
         .obstacles(1, 0.45, 0.7)
-        .probes(2)
+        .beacons(2)
         .window(2.0)
         .zone(1.0, 1.6)
         .focus("deux balises en houle"),
     LevelPlan::new(FieldKind::Vortex, 2.0, 0.02)
         .obstacles(1, 0.4, 0.65)
-        .probes(3)
+        .beacons(3)
         .gain(5.0)
         .window(10.0)
         .zone(1.0, 1.6)
         .focus("trois balises"),
     LevelPlan::new(FieldKind::Opposed, 3.0, 0.02)
         .obstacles(2, 0.4, 0.65)
-        .probes(4)
+        .beacons(4)
         .gain(3.0)
         .window(3.0)
         .zone(1.0, 1.6)
@@ -1167,7 +1121,7 @@ const CHAPTERS: [ChapterSpec; 8] = [
                 .knobs(Knobs::RELEASE_INTENSITY)
                 .window(4.0)
                 .zone(1.0, 1.6)
-                .probes(2)
+                .beacons(2)
                 .focus("deux balises"),
             hint: "Une seule sonde doit toucher les deux balises dans le même lancer : l'intensité fixe l'ordre, le point de départ fixe la route.",
         },
@@ -1350,9 +1304,7 @@ fn shell_level(spec: &ChapterSpec, plan: &LevelPlan, field: FlowField) -> Level 
             release: plan.release,
             zone: plan.zone,
             visibility: plan.visibility,
-            corridor: plan.corridor,
             traces: plan.traces,
-            probes: plan.probes,
             knobs: plan.knobs,
         },
         step_index: 0,
@@ -1369,10 +1321,6 @@ fn shell_level(spec: &ChapterSpec, plan: &LevelPlan, field: FlowField) -> Level 
         k_window: 0.0,
         a: anchor,
         default_release: anchor,
-        probes: vec![Probe {
-            start: anchor,
-            target: anchor,
-        }],
         ghosts: Vec::new(),
         beacons: Vec::new(),
         obstacles: Vec::new(),
@@ -2536,15 +2484,14 @@ fn guaranteed_fallback(shell: Level, plan: &LevelPlan, step_index: usize) -> Lev
     // unverified placeholder: fall back to a trivial straight Calm field
     // and derive the beacon from its own flow instead of guessing a point,
     // so reachability still holds by construction.
-    // Also reset rules/probes/ghosts: the shell may carry probe, corridor or
-    // trace state that would be inconsistent with a single fixed beacon.
+    // Also reset rules and ghosts: the shell may carry trace state that
+    // would be inconsistent with a single fixed beacon.
     level.field = FlowField::Calm {
         drift_x: 1.0,
         baseline_y: 0.0,
         gain_y: 1.0,
     };
     level.rules = LevelRules::default();
-    level.probes = Vec::new();
     level.ghosts = Vec::new();
     level.a = (-5.0, 0.0);
     level.default_release = level.a;
@@ -3304,14 +3251,6 @@ pub fn release_points(level: &Level) -> Vec<Point> {
     release_anchors(level)
 }
 
-pub fn route_won(level: &Level, result: &SimResult) -> bool {
-    if level.rules.probes > 1 {
-        result.visited == level.rules.probes
-    } else {
-        result.reached()
-    }
-}
-
 fn coarse_distance(level: &Level, start: Point, targets: &[Point], k: f64) -> f64 {
     integrate_advanced(level, start, targets, k, Mode::Fast, false)
         .closest
@@ -3356,10 +3295,6 @@ mod tests {
             k_window: 0.0,
             a: (0.0, 0.0),
             default_release: (0.0, 0.0),
-            probes: vec![Probe {
-                start: (0.0, 0.0),
-                target: (0.0, 0.0),
-            }],
             ghosts: Vec::new(),
             beacons,
             obstacles: Vec::new(),
@@ -3706,21 +3641,6 @@ mod tests {
         for level in generate_level_group(DEFAULT_SEED, Chapter::Coordinate.group_index()) {
             assert!(level.beacons.len() >= 2);
             let k = solve(&level).expect("les balises multiples doivent rester solubles");
-            let result = integrate(&level, k);
-            assert!(result.reached());
-            assert_eq!(result.visited, level.beacons.len());
-        }
-    }
-
-    #[test]
-    fn coordination_is_one_launch_through_every_beacon() {
-        for level in generate_level_group(DEFAULT_SEED, Chapter::Coordinate.group_index()) {
-            assert!(level.rules.probes > 1);
-            // The chapter's copy promises one probe and one trajectory. The
-            // vestigial `Probe` list would quietly turn that into one launch
-            // per target, so the shape is pinned here rather than assumed.
-            assert_eq!(level.launch_points().len(), 1);
-            let k = solve(&level).expect("le fil doit rester nouable");
             let result = integrate(&level, k);
             assert!(result.reached());
             assert_eq!(result.visited, level.beacons.len());

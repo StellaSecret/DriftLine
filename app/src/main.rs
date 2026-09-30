@@ -1740,7 +1740,6 @@ mod tests {
             k_window: 0.0,
             a: (-4.5, 0.0),
             default_release: (-4.5, 0.0),
-            probes: Vec::new(),
             ghosts: Vec::new(),
             beacons: Vec::new(),
             obstacles: Vec::new(),
