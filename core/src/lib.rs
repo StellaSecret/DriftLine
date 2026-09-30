@@ -1159,8 +1159,8 @@ const CHAPTERS: [ChapterSpec; 8] = [
     ChapterSpec {
         chapter: Chapter::Coordinate,
         title: "Coordination",
-        question: "Où lancer chaque sonde ?",
-        desc: "Toutes les sondes partagent le même courant et la même intensité, chacune vise sa balise.",
+        question: "Par où faire passer la sonde ?",
+        desc: "Une seule sonde, une seule trajectoire, et pourtant plusieurs balises : il faut la faire traverser toutes les cibles d'un même mouvement, avant qu'elle ne quitte le champ.",
         plans: &COORDINATE_PLANS,
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Calm, 1.5, 0.05)
@@ -1168,8 +1168,8 @@ const CHAPTERS: [ChapterSpec; 8] = [
                 .window(4.0)
                 .zone(1.0, 1.6)
                 .probes(2)
-                .focus("deux sondes"),
-            hint: "Une seule intensité pour les deux sondes : chaque balise doit être touchée.",
+                .focus("deux balises"),
+            hint: "Une seule sonde doit toucher les deux balises dans le même lancer : l'intensité fixe l'ordre, le point de départ fixe la route.",
         },
     },
 ];
@@ -3706,6 +3706,21 @@ mod tests {
         for level in generate_level_group(DEFAULT_SEED, Chapter::Coordinate.group_index()) {
             assert!(level.beacons.len() >= 2);
             let k = solve(&level).expect("les balises multiples doivent rester solubles");
+            let result = integrate(&level, k);
+            assert!(result.reached());
+            assert_eq!(result.visited, level.beacons.len());
+        }
+    }
+
+    #[test]
+    fn coordination_is_one_launch_through_every_beacon() {
+        for level in generate_level_group(DEFAULT_SEED, Chapter::Coordinate.group_index()) {
+            assert!(level.rules.probes > 1);
+            // The chapter's copy promises one probe and one trajectory. The
+            // vestigial `Probe` list would quietly turn that into one launch
+            // per target, so the shape is pinned here rather than assumed.
+            assert_eq!(level.launch_points().len(), 1);
+            let k = solve(&level).expect("le fil doit rester nouable");
             let result = integrate(&level, k);
             assert!(result.reached());
             assert_eq!(result.visited, level.beacons.len());
