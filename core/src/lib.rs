@@ -176,6 +176,11 @@ impl Knobs {
         release: true,
         phase: false,
     };
+    pub const PHASE: Self = Self {
+        intensity: false,
+        release: false,
+        phase: true,
+    };
     pub const PHASE_INTENSITY: Self = Self {
         intensity: true,
         release: false,
@@ -941,13 +946,13 @@ const THREAD_PLANS: [LevelPlan; 4] = [
 /// exists, but only over a narrow slice of the timeline.
 const TIMING_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
-        .knobs(Knobs::PHASE_INTENSITY)
+        .knobs(Knobs::PHASE)
         .timeline()
         .wavelength(4.0)
         .window(4.0)
         .focus("crête de houle"),
     LevelPlan::new(FieldKind::Waves, 2.0, 0.02)
-        .knobs(Knobs::PHASE_INTENSITY)
+        .knobs(Knobs::PHASE)
         .timeline()
         .wavelength(5.0)
         .obstacles(1, 0.4, 0.6)
@@ -956,12 +961,12 @@ const TIMING_PLANS: [LevelPlan; 4] = [
         .focus("deux crêtes"),
     LevelPlan::new(FieldKind::Bands, 1.5, 0.05)
         .bands(2)
-        .knobs(Knobs::PHASE_INTENSITY)
+        .knobs(Knobs::PHASE)
         .timeline()
         .window(5.0)
         .focus("bandes décalées"),
     LevelPlan::new(FieldKind::Opposed, 2.0, 0.05)
-        .knobs(Knobs::PHASE_INTENSITY)
+        .knobs(Knobs::PHASE)
         .timeline()
         .obstacles(1, 0.4, 0.6)
         .window(4.0)
@@ -1083,11 +1088,11 @@ const CHAPTERS: [ChapterSpec; 8] = [
         chapter: Chapter::Timing,
         title: "Tempo",
         question: "Quand lancer ?",
-        desc: "Le champ gèle à la phase que tu choisis : la bonne fenêtre n'existe qu'à un instant de la ligne de temps.",
+        desc: "Le champ gèle à la phase que tu choisis, et l'intensité est fixée : le seul réglage libre est l'instant. Sa position de départ ne gagne jamais, et la fenêtre gagnante occupe au plus un tiers de la ligne du temps — il faut la trouver, pas la deviner.",
         plans: &TIMING_PLANS,
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
-                .knobs(Knobs::PHASE_INTENSITY)
+                .knobs(Knobs::PHASE)
                 .wavelength(6.0)
                 .timeline()
                 .window(5.0)
@@ -1176,8 +1181,10 @@ const PHASE_BAND_PROBES: usize = 24;
 /// solution. Kept small: each sample is a full solve of the level.
 const PHASE_PROBES: usize = 6;
 /// Widest winning slice of the timeline, as a fraction of the dial, that a
-/// generated timeline level may keep.
-const PHASE_BAND_LIMIT: f64 = 0.5;
+/// generated timeline level may keep. A third, not a half: at a half the dial
+/// stops being the question and the chapter has nothing to teach. The floor is
+/// `band_bracket`'s three cells, so the window is narrow but still aimable.
+const PHASE_BAND_LIMIT: f64 = 0.34;
 const PHASE_BAND_MIN: f64 = 2.0 / PHASE_BAND_PROBES as f64;
 const TIMING_SWEEP: f64 = 1.0;
 
@@ -2082,9 +2089,8 @@ fn knobs_hold(level: &mut Level, candidate: Candidate, base_field: &FlowField) -
         let at_start = Level {
             field: base_field.clone(),
             ..level.clone()
-        }
-        .resolved(level.phase_def);
-        if solve(&at_start).is_some() {
+        };
+        if wins_at_phase(&at_start, at_start.phase_def) {
             return false;
         }
     }
@@ -2143,7 +2149,7 @@ pub fn phase_band_with(level: &Level, probes: usize) -> Option<(f64, f64, f64)> 
     let mut hits = Vec::new();
     for index in 0..probes {
         let phase = level.phase_min + span * index as f64 / probes as f64;
-        if solve(&level.resolved(phase)).is_some() {
+        if wins_at_phase(level, phase) {
             hits.push(index);
         }
     }
@@ -2476,6 +2482,13 @@ fn guaranteed_fallback(shell: Level, plan: &LevelPlan, step_index: usize) -> Lev
             // claim a needle where the level is a corridor.
             level.k_solution = k;
             level.k_window = k_window(&level, level.a, &level.beacons, k);
+            // It also has to answer for the chapter. Without this a timeline
+            // chapter can ship a level the phase dial cannot decide, which is
+            // the one thing its copy promises, and every earlier gate is
+            // bypassed because this is the last resort.
+            if !timing_band_ok(&level) {
+                continue;
+            }
             return with_plan_index(level, step_index);
         }
     }
@@ -2491,31 +2504,61 @@ fn guaranteed_fallback(shell: Level, plan: &LevelPlan, step_index: usize) -> Lev
         baseline_y: 0.0,
         gain_y: 1.0,
     };
-    level.rules = LevelRules::default();
     level.ghosts = Vec::new();
     level.a = (-5.0, 0.0);
     level.default_release = level.a;
     level.k_min = -1.0;
     level.k_max = 1.0;
     level.k_def = 0.0;
-    level.phase_min = 0.0;
-    level.phase_max = 0.0;
-    level.phase_def = 0.0;
-    level.phase_sweep = 0.0;
-    for k in [0.25, -0.25, 0.5, -0.5] {
-        if let Some(beacon) = interior_beacon(&level, k) {
-            level.beacons = vec![beacon];
-            level.k_def = k;
-            if integrate_from(&level, level.a, k).reached() {
+    // Keep the plan's rules, and its timeline when it had one. Clobbering them
+    // with LevelRules::default() shipped a level with every knob free, no zone
+    // and no dial, which belonged to no chapter at all: the copy described one
+    // game and the fallback produced another.
+    if level.has_timeline() {
+        level.phase_min = PHASE_MIN;
+        level.phase_max = PHASE_MAX;
+        level.phase_def = PHASE_DEF;
+        level.phase_sweep = TIMING_SWEEP;
+    }
+    // Search the dial rather than guessing a point on it. The last resort used
+    // to drop a beacon at a fixed coordinate and hope the dial still mattered,
+    // which is how a timeline chapter ended up shipping levels the phase could
+    // not decide. Here the window is placed: pick where it should sit, build
+    // the level frozen there, and let the band gate reject the placements that
+    // come out too wide.
+    if level.has_timeline() {
+        let steps = 16;
+        for step in 0..steps {
+            let phase =
+                level.phase_min + (level.phase_max - level.phase_min) * step as f64 / steps as f64;
+            let frozen = level.resolved(level.normalize_phase(phase));
+            for k in [0.25, -0.25, 0.5, -0.5] {
+                let Some(beacon) = interior_beacon(&frozen, k) else {
+                    continue;
+                };
+                level.beacons = vec![beacon];
+                level.k_def = k;
+                if !integrate_from(&level, level.a, k).reached() {
+                    continue;
+                }
                 level.k_solution = k;
                 level.k_window = k_window(&level, level.a, &level.beacons, k);
-                return with_plan_index(level, step_index);
+                if timing_band_ok(&level) {
+                    return with_plan_index(level.clone(), step_index);
+                }
             }
         }
     }
     level.beacons = vec![(5.0, 0.0)];
     level.k_solution = level.k_def;
     level.k_window = k_window(&level, level.a, &level.beacons, level.k_def);
+    // Nothing above produced a fair level, so this last resort is only fair if
+    // it still is. Checked rather than assumed: the gate is cheap next to
+    // shipping a level whose dial decides nothing.
+    debug_assert!(
+        timing_band_ok(&level),
+        "last-resort level must still honour its chapter"
+    );
     with_plan_index(level, step_index)
 }
 
@@ -2715,12 +2758,31 @@ fn timing_band_ok(level: &Level) -> bool {
         return true;
     }
     match phase_band_with(level, PHASE_BAND_PROBES) {
-        Some((low, high, width)) => {
+        Some((_low, _high, width)) => {
             let span = level.phase_max - level.phase_min;
-            let start_outside = level.phase_def < low || level.phase_def >= high;
-            start_outside && (PHASE_BAND_MIN..=PHASE_BAND_LIMIT).contains(&width) && span > 0.0
+            // Whether the dial has to move is a question about the starting
+            // phase, so it is asked of the starting phase. Comparing it to the
+            // bounds of the longest winning run instead let a level through
+            // that wins at two separate places: the shorter run held the start,
+            // the longer one defined the window, and the two never met.
+            !wins_at_phase(level, level.phase_def)
+                && (PHASE_BAND_MIN..=PHASE_BAND_LIMIT).contains(&width)
+                && span > 0.0
         }
         None => false,
+    }
+}
+
+/// Whether the level is won at `phase`, measured the way the player meets it:
+/// with the dial as the only variable when the chapter pins the intensity.
+/// A chapter that leaves the intensity free can always be dialled out of
+/// trouble, so asking `solve` for it would report a window that is not there.
+pub fn wins_at_phase(level: &Level, phase: f64) -> bool {
+    let frozen = level.resolved(phase);
+    if level.knobs().intensity {
+        solve(&frozen).is_some()
+    } else {
+        integrate_from(&frozen, level.a, level.k_def).reached()
     }
 }
 
@@ -3377,10 +3439,17 @@ mod tests {
                         .expect("chaque plan doit viser une marge")
                         * level.recommended_step;
                     if level.k_window > max_window {
-                        offenders.push(format!(
-                            "{:?}/{} {} ({:?}) marge {:.2} > {:.2}",
-                            spec.chapter, step, level.focus, seed, level.k_window, max_window
-                        ));
+                        // The margin is the player's margin, and it is measured
+                        // over the intensity. A chapter that pins the intensity
+                        // has no such dial to be narrow across: its window is
+                        // the phase band, which `timing_band_ok` bounds
+                        // separately.
+                        if level.knobs().intensity {
+                            offenders.push(format!(
+                                "{:?}/{} {} ({:?}) marge {:.2} > {:.2}",
+                                spec.chapter, step, level.focus, seed, level.k_window, max_window
+                            ));
+                        }
                     }
                 }
             }
@@ -3399,16 +3468,32 @@ mod tests {
                 continue;
             }
             assert_eq!(level.a, level.default_release, "{}", level.focus);
-            let (phase, k) = solve_any_phase(&level).expect("gagnable");
-            let won = level.resolved(phase);
-            // With the intensity pinned, the pinned value has to be the winner.
-            let k = if won.knobs().intensity { k } else { won.k_def };
-            if !won.knobs().intensity {
-                assert!((won.k_def - k).abs() < 1e-9, "{}", level.focus);
+            if level.knobs().intensity {
+                let (phase, k) = solve_any_phase(&level).expect("gagnable");
+                let won = level.resolved(phase);
+                assert!(
+                    integrate_from(&won, won.default_release, k).reached(),
+                    "{}: largage fixe sans solution",
+                    level.focus
+                );
+                continue;
             }
+            // With the intensity pinned, the level has to be won at the pinned
+            // value, and `solve_any_phase` cannot be asked where: it answers
+            // with whatever intensity suits the first phase it likes, which is
+            // not a dial the player has. Ask the chapter's own window instead.
+            let (phase, k) = if level.has_timeline() {
+                let (low, high, _) = level
+                    .phase_band()
+                    .unwrap_or_else(|| panic!("{}: aucune fenêtre gagnante", level.focus));
+                ((low + high) / 2.0, level.k_def)
+            } else {
+                (level.phase_def, level.k_def)
+            };
+            let won = level.resolved(phase);
             assert!(
                 integrate_from(&won, won.default_release, k).reached(),
-                "{}: largage fixe sans solution",
+                "{}: largage fixe sans solution à l'intensité fixée",
                 level.focus
             );
         }
@@ -3644,6 +3729,35 @@ mod tests {
             let result = integrate(&level, k);
             assert!(result.reached());
             assert_eq!(result.visited, level.beacons.len());
+        }
+    }
+
+    #[test]
+    fn timing_levels_leave_the_phase_deciding() {
+        for level in generate_level_group(DEFAULT_SEED, Chapter::Timing.group_index()) {
+            assert!(
+                level.has_timeline(),
+                "{}: le chapitre doit garder sa ligne du temps",
+                level.focus
+            );
+            assert!(
+                !level.knobs().intensity,
+                "{}: une seconde variable libre rend la phase décorative",
+                level.focus
+            );
+            let (_low, _high, width) = level
+                .phase_band()
+                .unwrap_or_else(|| panic!("{}: aucune fenêtre gagnante", level.focus));
+            assert!(
+                !wins_at_phase(&level, level.phase_def),
+                "{}: le curseur part déjà sur la réponse",
+                level.focus
+            );
+            assert!(
+                width <= PHASE_BAND_LIMIT + 1e-9,
+                "{}: fenêtre à {width:.3} de la ligne du temps, la limite est {PHASE_BAND_LIMIT}",
+                level.focus
+            );
         }
     }
 
@@ -3944,8 +4058,13 @@ mod tests {
     fn timeline_levels_force_the_dial_to_move() {
         for level in generate_level_group(DEFAULT_SEED, Chapter::Timing.group_index()) {
             assert!(level.has_timeline(), "{}", level.focus);
+            // Checked the way the player meets it: the chapter pins the
+            // intensity, so only the dial can be moved, and the starting
+            // position has to lose at that same intensity. Asking `solve` here
+            // would test a dial the player does not have.
+            let at_start = level.resolved(level.phase_def);
             assert!(
-                solve(&level.resolved(level.phase_def)).is_none(),
+                !integrate_from(&at_start, level.a, level.k_def).reached(),
                 "gagnable sans bouger la phase: {}",
                 level.focus
             );
@@ -3963,12 +4082,16 @@ mod tests {
                 level.focus
             );
             // The widest band is the one the player is meant to find, so a
-            // phase in the middle of it has to win.
+            // phase in the middle of it has to win at the pinned intensity.
             let middle = (low + high) / 2.0;
+            let at_middle = level.resolved(middle);
+            assert!(
+                integrate_from(&at_middle, level.a, level.k_def).reached(),
+                "le milieu de la fenêtre ne gagne pas: {}",
+                level.focus
+            );
             let (phase, k) = solve_any_phase(&level).expect("gagnable quelque part");
-            let in_band = solve(&level.resolved(middle)).expect("le milieu de la fenêtre gagne");
             assert!(integrate(&level.resolved(phase), k).reached());
-            assert!(integrate(&level.resolved(middle), in_band).reached());
             assert_eq!(level.resolved(phase), {
                 let mut expected = level.clone();
                 expected.field = level.field.at_phase(
@@ -4022,7 +4145,10 @@ mod tests {
         );
 
         let timing = &tutorial[Chapter::Timing.group_index()];
-        assert!(timing.knobs().phase && timing.knobs().intensity);
+        // Tempo hands the player the dial and nothing else. With the intensity
+        // free as well, a wrong phase could always be dialled out of trouble,
+        // which is what made the phase a decoration rather than the question.
+        assert!(timing.knobs().phase && !timing.knobs().intensity);
         assert!(!timing.knobs().release);
         assert_eq!(timing.rules.release, ReleaseMode::Fixed);
     }
