@@ -914,12 +914,14 @@ const COORDINATE_PLANS: [LevelPlan; 4] = [
 
 const THREAD_PLANS: [LevelPlan; 4] = [
     LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
+        .knobs(Knobs::INTENSITY)
         .obstacles(1, 0.45, 0.7)
         .window(3.0)
         .zone(0.8, 2.0)
         .ghosts()
         .focus("houle douce"),
     LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
+        .knobs(Knobs::INTENSITY)
         .obstacles(1, 0.45, 0.75)
         .window(3.0)
         .zone(0.8, 2.0)
@@ -927,6 +929,7 @@ const THREAD_PLANS: [LevelPlan; 4] = [
         .focus("période courte"),
     LevelPlan::new(FieldKind::Bands, 1.5, 0.05)
         .bands(2)
+        .knobs(Knobs::INTENSITY)
         .obstacles(1, 0.45, 0.7)
         .window(3.0)
         .zone(0.8, 2.0)
@@ -934,6 +937,7 @@ const THREAD_PLANS: [LevelPlan; 4] = [
         .focus("deux bandes"),
     LevelPlan::new(FieldKind::Bands, 2.0, 0.02)
         .bands(2)
+        .knobs(Knobs::INTENSITY)
         .obstacles(2, 0.4, 0.7)
         .window(5.0)
         .zone(0.8, 2.0)
@@ -1076,9 +1080,8 @@ const CHAPTERS: [ChapterSpec; 8] = [
         plans: &THREAD_PLANS,
         tutorial: TutorialSpec {
             plan: LevelPlan::new(FieldKind::Waves, 1.5, 0.05)
-                .knobs(Knobs::RELEASE_INTENSITY)
+                .knobs(Knobs::INTENSITY)
                 .window(4.0)
-                .zone(0.8, 2.0)
                 .ghosts()
                 .focus("couloir fantôme"),
             hint: "Les deux traces grises ont échoué : le passage se trouve entre elles.",
@@ -4123,6 +4126,41 @@ mod tests {
     }
 
     #[test]
+    fn each_chapter_offers_only_the_dials_it_can_teach() {
+        let generated = levels();
+        for chapter in Chapter::all() {
+            let level = &generated[chapter_offset(chapter.group_index())];
+            let knobs = level.knobs();
+            // The phase flag is set by the default but the dial only exists
+            // where the level has a timeline, so counting the flag would charge
+            // the player for a control they never see.
+            let phase = knobs.phase && level.has_timeline();
+            let free = knobs.release as u8 + knobs.intensity as u8 + phase as u8;
+            assert!(free >= 1, "{chapter:?} ne laisse rien à jouer");
+            // Tempo is the reason this table exists. It once handed out the
+            // phase and the intensity, and the intensity could always dial a
+            // wrong phase out of trouble, so the dial was decoration. A second
+            // free variable is only worth its cost where the chapter's own
+            // question genuinely needs two hands.
+            let expected = match chapter {
+                // "Every start opens a different trajectory": several release
+                // points are meant to win, which only holds while the intensity
+                // is free to separate them. Pinning it forces a single winning
+                // anchor, and generation stops finding these levels at all.
+                Chapter::Position | Chapter::Detect => 2,
+                // Threading every beacon with one line is a joint read of where
+                // and how hard.
+                Chapter::Coordinate => 2,
+                _ => 1,
+            };
+            assert_eq!(
+                free, expected,
+                "{chapter:?} offre {free} variables libres au lieu de {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn pinned_knobs_leave_only_the_free_ones_to_play() {
         let tutorial = tutorial_levels(TUTORIAL_SEED);
         let follow = &tutorial[Chapter::Predict.group_index()];
@@ -4157,6 +4195,28 @@ mod tests {
     fn ghost_threads_bracket_the_winning_path() {
         for level in generate_level_group(DEFAULT_SEED, Chapter::Thread.group_index()) {
             assert_eq!(level.ghosts.len(), 2, "{}", level.focus);
+            // Two bounds are only enough if the winning intensities form one
+            // unbroken run. Two runs would leave a second corridor outside the
+            // pair, and "the passage is between them" would be a guess. The
+            // release is pinned, so this sweep is the player's whole search.
+            assert!(!level.knobs().release, "{}", level.focus);
+            let probes = 60;
+            let step = (level.k_max - level.k_min) / (probes - 1) as f64;
+            let hits: Vec<usize> = (0..probes)
+                .filter(|index| {
+                    integrate_from(&level, level.a, level.k_min + step * *index as f64).reached()
+                })
+                .collect();
+            assert!(
+                !hits.is_empty(),
+                "{}: aucune intensité gagnante",
+                level.focus
+            );
+            assert!(
+                hits.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "{}: le corridor gagnant est discontinu, deux traces ne suffisent pas",
+                level.focus
+            );
             let (phase, k) = solve_any_phase(&level).expect("gagnable");
             let frozen = level.resolved(phase);
             for ghost in &level.ghosts {
