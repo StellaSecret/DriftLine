@@ -127,6 +127,16 @@ fn accepts_release(level: &Level, point: (f64, f64)) -> bool {
         && level.rules.zone.contains(point)
 }
 
+/// A level that offers a release zone has not been answered until the player
+/// picks a point inside it. Until then the probe has no place in the field.
+/// `release_of` would hand back the generator's own anchor, and the zone is
+/// centred on that anchor, so the probe would be drawn mid-zone together with
+/// the path it would take: an answer to the chapter's question, given away
+/// before the question was asked.
+fn awaits_release(level: &Level, progress: &LevelProgress) -> bool {
+    level.knobs().release && level.rules.release != ReleaseMode::Fixed && progress.release.is_none()
+}
+
 async fn handle_field_click(
     event: Event<MouseData>,
     mut progress: Signal<Vec<LevelProgress>>,
@@ -695,6 +705,10 @@ fn App() -> Element {
     let is_tutorial = slot_is_tutorial(current_level_idx);
     let visibility = current.rules.visibility;
     let release = release_of(&current, &current_progress);
+    // A chapter that is still waiting for a launch point draws neither the probe
+    // nor the path it would take: the field belongs to the player until they
+    // have chosen where the probe enters it.
+    let release_pending = awaits_release(&current, &current_progress);
     let preview = integrate_from(&current, release, k());
     let description = current.desc.to_string();
     let active_result = current_progress
@@ -706,6 +720,13 @@ fn App() -> Element {
         .as_ref()
         .map(|result| result.points.clone())
         .unwrap_or_else(|| preview.points.clone());
+    // Nothing to show while the launch point is still the player's to choose:
+    // an empty path keeps the drawing code below from having to know about it.
+    let shown_points = if release_pending {
+        Vec::new()
+    } else {
+        shown_points
+    };
     // A hidden trajectory shows only the part the player has earned: a blind
     // start reveals the run as it flies, a hidden path shows nothing until the
     // probe has run at all, and both complete once the beacon has been found.
@@ -1048,10 +1069,18 @@ fn App() -> Element {
                             class: "release-zone",
                         }
                     }
-                    circle {
-                        cx: "{map_x(release.0):.2}", cy: "{map_y(release.1):.2}",
-                        r: if current.rules.release == ReleaseMode::Fixed { "6" } else { "7" },
-                        class: "point-a release-handle",
+                    if !release_pending {
+                        circle {
+                            cx: "{map_x(release.0):.2}", cy: "{map_y(release.1):.2}",
+                            r: if current.rules.release == ReleaseMode::Fixed { "6" } else { "7" },
+                            class: "point-a release-handle",
+                        }
+                    }
+                    if release_pending {
+                        text {
+                            x: "16", y: "26", class: "blind-note",
+                            "sonde absente · clique dans la zone pour choisir son départ",
+                        }
                     }
                     if !visibility.reveals_beacon_before_launch()
                         && !reveal_beacons
@@ -1679,6 +1708,46 @@ mod tests {
         let empty: SaveData = serde_json::from_str("{}").expect("defaults");
         assert!(empty.progress.is_empty());
         assert!(empty.seen.is_empty());
+    }
+
+    #[test]
+    fn a_release_zone_is_answered_by_a_click_not_by_the_default_anchor() {
+        let position: Vec<Level> = (0..chapter_count())
+            .flat_map(|group| chapter_slots(DEFAULT_SEED, group, 0))
+            .filter(|level| level.chapter == Chapter::Position)
+            .collect();
+        assert!(!position.is_empty(), "aucun niveau de Position");
+        for level in &position {
+            // Nothing chosen yet: the probe has no place in the field, because
+            // release_of would otherwise draw it at the generator's anchor —
+            // which the zone is centred on — along with the path it would take.
+            let untouched = LevelProgress::default();
+            assert!(awaits_release(level, &untouched), "{}", level.focus);
+            assert_eq!(
+                release_of(level, &untouched),
+                level.default_release,
+                "{}: l'ancre par défaut reste le largage implicite",
+                level.focus
+            );
+            let chosen = level.rules.zone.center();
+            let answered = LevelProgress {
+                release: Some(chosen),
+                ..LevelProgress::default()
+            };
+            assert!(!awaits_release(level, &answered), "{}", level.focus);
+            assert!(accepts_release(level, chosen), "{}", level.focus);
+        }
+
+        // A chapter that fixes its release has nothing to wait for: there is no
+        // zone to click in, so the probe belongs in the field from the start.
+        let fixed: Vec<Level> = (0..chapter_count())
+            .flat_map(|group| chapter_slots(DEFAULT_SEED, group, 0))
+            .filter(|level| level.rules.release == ReleaseMode::Fixed)
+            .collect();
+        assert!(!fixed.is_empty(), "aucun chapitre à largage fixe");
+        for level in fixed {
+            assert!(!awaits_release(&level, &LevelProgress::default()));
+        }
     }
 
     #[test]
