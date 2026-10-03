@@ -145,6 +145,62 @@ pub enum TraceRule {
     KeepOptions,
 }
 
+/// A property of the run the player has to find a *setting* for, instead of a
+/// point to hit. A discovery level carries no beacon at all: the win is the
+/// player's chosen value satisfying the property, and the generator only keeps
+/// values whose neighbours fail, so the property is something you can look for
+/// rather than something that is quietly true everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Discovery {
+    /// The probe climbs and then comes back down, without hitting anything: the
+    /// intensity at which the current stops carrying it the same way.
+    TurnsBack,
+}
+
+/// Whether the path really reverses, rather than wobbling by a hundredth of a
+/// unit. The run has to travel a meaningful distance up and a meaningful
+/// distance back, so a numerical tremor or a path that slides sideways never
+/// reads as a turn.
+fn turns_back(points: &[Point]) -> bool {
+    const SWING: f64 = 0.25;
+    let Some(peak) = points
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(index, _)| index)
+    else {
+        return false;
+    };
+    let last = points.len().saturating_sub(1);
+    if peak == 0 || peak == last {
+        return false;
+    }
+    points[peak].1 - points[0].1 > SWING && points[peak].1 - points[last].1 > SWING
+}
+
+/// Whether `k` answers the level's discovery question. Levels without a
+/// discovery rule never satisfy one, so a caller can ask unconditionally.
+pub fn discovery_holds(level: &Level, k: f64) -> bool {
+    let Some(rule) = level.discovery else {
+        return false;
+    };
+    satisfies(rule, &integrate_from(level, level.a, k))
+}
+
+/// Whether a run the player already launched shows the property. Judged on the
+/// run itself rather than by re-simulating it, so that the release actually
+/// used is the one the property is asked about.
+pub fn satisfies(rule: Discovery, result: &SimResult) -> bool {
+    // A run that crashes into an obstacle has not discovered anything about the
+    // current, and a short path past the edge has not described it either.
+    if result.collided() {
+        return false;
+    }
+    match rule {
+        Discovery::TurnsBack => turns_back(&result.points),
+    }
+}
+
 /// Which controls a level actually teaches. A knob that is switched off stays
 /// pinned to the winning value found by the generator, so the level can only be
 /// solved through the knobs the chapter is about.
@@ -224,10 +280,13 @@ pub enum Chapter {
     Timing,
     Compose,
     Coordinate,
+    /// Appended, so no existing chapter's index — and so no existing level's
+    /// geometry, which is derived from it — moves.
+    Experiment,
 }
 
 impl Chapter {
-    pub fn all() -> [Chapter; 8] {
+    pub fn all() -> [Chapter; 9] {
         [
             Chapter::Position,
             Chapter::Predict,
@@ -237,6 +296,7 @@ impl Chapter {
             Chapter::Timing,
             Chapter::Compose,
             Chapter::Coordinate,
+            Chapter::Experiment,
         ]
     }
 
@@ -545,6 +605,10 @@ pub struct Level {
     pub k_window: f64,
     pub a: Point,
     pub default_release: Point,
+    /// What the level asks the player to find, when it asks for a setting
+    /// rather than a landing. `None` on every beacon level, where the win is
+    /// reaching a point as it has always been.
+    pub discovery: Option<Discovery>,
     pub ghosts: Vec<Vec<Point>>,
     pub beacons: Vec<Point>,
     pub obstacles: Vec<Obstacle>,
@@ -636,6 +700,7 @@ struct LevelPlan {
     zone: Rect,
     visibility: Visibility,
     traces: TraceRule,
+    discovery: Option<Discovery>,
     knobs: Knobs,
     timeline: bool,
     ghosts: bool,
@@ -660,6 +725,7 @@ impl LevelPlan {
             zone: Rect::new((0.0, 0.0), (0.0, 0.0)),
             visibility: Visibility::Full,
             traces: TraceRule::None,
+            discovery: None,
             knobs: Knobs::ALL,
             timeline: false,
             ghosts: false,
@@ -742,6 +808,11 @@ impl LevelPlan {
 
     const fn beacons(mut self, count: usize) -> Self {
         self.beacons = count;
+        self
+    }
+
+    const fn discovers(mut self, rule: Discovery) -> Self {
+        self.discovery = Some(rule);
         self
     }
 
@@ -1006,9 +1077,47 @@ const COMPOSE_PLANS: [LevelPlan; 4] = [
         .focus("champ dense"),
 ];
 
+/// The dial is the whole question and the property is the whole win, so these
+/// plans name no window: there is no landing point to measure a window around.
+/// They do name the field kinds that produce a rising-then-falling path at all —
+/// on a calm or vortical field no intensity answers, which is exactly what the
+/// measurement behind `turns_back` found.
+/// Every plan carries obstacles, and that is load-bearing rather than
+/// decorative: the answer has to stop being true at the top of the dial as well
+/// as the bottom, and the only thing that makes a very fast probe *not* turn
+/// back is its hitting something on the way out. A plan without obstacles can
+/// only ever produce a threshold, which the player beats by turning the dial up.
+const EXPERIMENT_PLANS: [LevelPlan; 4] = [
+    LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
+        .knobs(Knobs::INTENSITY)
+        .obstacles(1, 0.4, 0.6)
+        .beacons(0)
+        .discovers(Discovery::TurnsBack)
+        .focus("un aller-retour"),
+    LevelPlan::new(FieldKind::Compose, 2.5, 0.05)
+        .knobs(Knobs::INTENSITY)
+        .obstacles(1, 0.35, 0.5)
+        .beacons(0)
+        .discovers(Discovery::TurnsBack)
+        .focus("obstacle au milieu"),
+    LevelPlan::new(FieldKind::Waves, 2.0, 0.05)
+        .knobs(Knobs::INTENSITY)
+        .obstacles(2, 0.4, 0.65)
+        .beacons(0)
+        .discovers(Discovery::TurnsBack)
+        .focus("aller-retour sur houle"),
+    LevelPlan::new(FieldKind::Waves, 3.0, 0.02)
+        .knobs(Knobs::INTENSITY)
+        .obstacles(2, 0.4, 0.65)
+        .gain(2.0)
+        .beacons(0)
+        .discovers(Discovery::TurnsBack)
+        .focus("champ chargé"),
+];
+
 /// Every plan is tuned to a needle: each one names the window it is measured
 /// against, and the gates below hold every chapter to that target.
-const CHAPTERS: [ChapterSpec; 8] = [
+const CHAPTERS: [ChapterSpec; 9] = [
     ChapterSpec {
         chapter: Chapter::Position,
         title: "Position",
@@ -1132,6 +1241,21 @@ const CHAPTERS: [ChapterSpec; 8] = [
                 .beacons(2)
                 .focus("deux balises"),
             hint: "Une seule sonde doit toucher les deux balises dans le même lancer : l'intensité fixe l'ordre, le point de départ fixe la route.",
+        },
+    },
+    ChapterSpec {
+        chapter: Chapter::Experiment,
+        title: "Expérience",
+        question: "Quelle intensité fait revenir la sonde ?",
+        desc: "Il n'y a aucune balise à atteindre ici : la sonde gagne si sa dérive monte puis redescend. La propriété apparaît vers une intensité précise, et disparaît au-delà.",
+        plans: &EXPERIMENT_PLANS,
+        tutorial: TutorialSpec {
+            plan: LevelPlan::new(FieldKind::Compose, 2.0, 0.05)
+                .knobs(Knobs::INTENSITY)
+                .beacons(0)
+        .discovers(Discovery::TurnsBack)
+                .focus("aller-retour"),
+            hint: "Aucune balise ici : la sonde gagne si elle monte puis redescend. Fais varier l'intensité et regarde ce que fait la trajectoire.",
         },
     },
 ];
@@ -1331,6 +1455,7 @@ fn shell_level(spec: &ChapterSpec, plan: &LevelPlan, field: FlowField) -> Level 
         k_window: 0.0,
         a: anchor,
         default_release: anchor,
+        discovery: plan.discovery,
         ghosts: Vec::new(),
         beacons: Vec::new(),
         obstacles: Vec::new(),
@@ -1486,12 +1611,20 @@ fn obstacle_free(level: &Level, point: Point) -> bool {
 }
 
 fn valid_geometry(level: &Level) -> bool {
-    if !point_in_field(level.a, ANCHOR_MARGIN)
-        || level.beacons.is_empty()
-        || !level
-            .beacons
-            .iter()
-            .all(|beacon| point_in_field(*beacon, ANCHOR_MARGIN + WIN_R))
+    if !point_in_field(level.a, ANCHOR_MARGIN) {
+        return false;
+    }
+    // A discovery level has no beacon, so there is no landing point to keep
+    // clear of the walls or of each other. Having none without a rule to replace
+    // them is the one shape that is still wrong: nothing to reach and nothing to
+    // look for.
+    if level.beacons.is_empty() {
+        return level.discovery.is_some();
+    }
+    if !level
+        .beacons
+        .iter()
+        .all(|beacon| point_in_field(*beacon, ANCHOR_MARGIN + WIN_R))
     {
         return false;
     }
@@ -2418,6 +2551,29 @@ fn canonical_shell(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> L
 }
 
 fn canonical_level(spec: &ChapterSpec, plan: &LevelPlan, step_index: usize) -> Level {
+    // A discovery plan has no landing point, so both paths below are looking for
+    // the wrong thing. Sweep the start on the canonical field instead: the field
+    // stays fixed, which is the whole point of the canonical level.
+    if plan.discovery.is_some() {
+        let field = canonical_field(plan);
+        for attempt in 0..GENERATION_ATTEMPTS * 4 {
+            let mut rng =
+                SeededRng::new(RELAXED_GOLDEN ^ (attempt as u64 + 1).wrapping_mul(GOLDEN_RATIO));
+            for (min_run, max_win) in DISCOVERY_RELAXATION {
+                if let Some(level) = discovery_level(
+                    spec,
+                    plan,
+                    step_index,
+                    field.clone(),
+                    &mut rng,
+                    min_run,
+                    max_win,
+                ) {
+                    return level;
+                }
+            }
+        }
+    }
     let shell = canonical_shell(spec, plan, step_index);
     let mut rng = SeededRng::new(RELAXED_GOLDEN);
     if let Some(level) = canonical_candidate(&shell, plan, step_index, &mut rng) {
@@ -2706,6 +2862,100 @@ fn trajectory_level_beacons(level: &Level) -> Vec<Candidate> {
     }
     candidates
 }
+/// Where a discovery level's answer sits on the dial, and how wide the answer
+/// is. Deliberately the same shape of question `phase_band_with` answers for
+/// Tempo: the satisfying values have to form one unbroken run with a failure on
+/// either side, because a property that is always true teaches nothing and a
+/// lone satisfying value is a needle rather than something to look for.
+const DISCOVERY_PROBES: usize = 192;
+/// The widest band has to be wide enough that a player looking for a shape can
+/// recognise it, and narrow enough that turning the dial all the way up is
+/// still not a strategy. Below this the answer is a needle to be hit by luck
+/// rather than a property to be found, and a discovery chapter that plays like
+/// that has stopped being one.
+const DISCOVERY_MIN_RUN: f64 = 0.06;
+/// Every satisfying intensity wins the level, not only the widest band of them,
+/// so the cap is on all of them. Measured at a third of the dial being enough
+/// that the player has to reason; islands are allowed inside that budget,
+/// because a level you can also win on a stray value is still a level you
+/// cannot win by turning the knob up.
+const DISCOVERY_MAX_WIN: f64 = 0.3;
+/// How far the run bounds may give when a plan will not yield a level at the
+/// strict setting. Loosening is the last resort before the plan is treated as
+/// unwinnable, and `discovery_levels_still_answer_their_own_question` fails if
+/// any level had to ship on the loosest rung.
+const DISCOVERY_RELAXATION: [(f64, f64); 1] = [(DISCOVERY_MIN_RUN, DISCOVERY_MAX_WIN)];
+
+/// The intensity that answers a discovery level, with the width of the run of
+/// intensities that answer it.
+pub fn discovery_solution(level: &Level) -> Option<(f64, f64)> {
+    discovery_solution_with(level, DISCOVERY_MIN_RUN, DISCOVERY_MAX_WIN)
+}
+
+fn discovery_solution_with(level: &Level, min_run: f64, max_win: f64) -> Option<(f64, f64)> {
+    level.discovery?;
+    let step = (level.k_max - level.k_min) / (DISCOVERY_PROBES - 1) as f64;
+    let hits: Vec<usize> = (0..DISCOVERY_PROBES)
+        .filter(|index| discovery_holds(level, level.k_min + step * *index as f64))
+        .collect();
+    let probes = DISCOVERY_PROBES as f64;
+    if hits.len() as f64 / probes > max_win {
+        return None;
+    }
+    let (first, cells) = largest_connected(hits);
+    // Both ends have to be a failure the player can reach, so the property is
+    // seen to appear and disappear instead of running off the end of the dial.
+    if first == 0 || first + cells >= DISCOVERY_PROBES {
+        return None;
+    }
+    if cells as f64 / probes < min_run {
+        return None;
+    }
+    Some((
+        level.k_min + step * (first + cells / 2) as f64,
+        step * (cells - 1) as f64,
+    ))
+}
+
+/// Builds a discovery level. This does not go through the beacon pipeline: the
+/// whole question is what *setting* to choose, so there is no point to place
+/// and no window to measure around one. The shell still supplies the field and
+/// the start, and the answer is whatever the property admits.
+fn discovery_level(
+    spec: &ChapterSpec,
+    plan: &LevelPlan,
+    step_index: usize,
+    field: FlowField,
+    rng: &mut SeededRng,
+    min_run: f64,
+    max_win: f64,
+) -> Option<Level> {
+    let mut level = shell_level(spec, plan, field);
+    level.a = (rng.range(-5.2, -4.0), rng.range(-2.6, 2.6));
+    level.default_release = level.a;
+    // No beacon, so the reachability machinery stays inert by construction and
+    // the anti-free-win gates pass on distance rather than being switched off.
+    level.beacons.clear();
+    // Obstacles first, and for a reason rather than for looks: they are what
+    // makes a very fast probe fail. Without them the answer runs to the top of
+    // the dial and the chapter is beaten by turning the knob up. They are placed
+    // by hand here because the helper that normally does it, `shape_level`, is
+    // part of the beacon pipeline.
+    level.obstacles = random_obstacles(plan, level.a, &[], rng);
+    let (k, window) = discovery_solution_with(&level, min_run, max_win)?;
+    level.k_solution = k;
+    level.k_window = window;
+    // The dial has to start on a failure, or the level is won before the player
+    // touches it. The bottom of the dial is the safe place to park it: the run
+    // is required to have a reachable failure on either side, so the bottom is
+    // provably not the answer.
+    level.k_def = level.k_min;
+    if !valid_field(&level) {
+        return None;
+    }
+    Some(with_plan_index(level, step_index))
+}
+
 fn generate_level(spec: &ChapterSpec, step_index: usize, seed: u64) -> Level {
     let plan = spec.plans[step_index];
     generate_from_plan(spec, plan, step_index, seed, false)
@@ -2731,6 +2981,34 @@ fn generate_from_plan(
                         .wrapping_add(pass.wrapping_mul(RELAXED_GOLDEN)),
                 ),
             );
+            // A discovery level has no beacon to place, so the whole beacon
+            // pipeline is the wrong tool: it would be looking for a landing
+            // point the level never asks for. There is no looser rung to fall
+            // back on: dropping the bounds would ship a level answered by most
+            // of the dial, and falling through would build a beacon level under a
+            // discovery plan — a chapter that quietly stopped being itself.
+            //
+            // The field is drawn inside the branch on purpose. Drawing it for
+            // every plan would spend an extra number from the generator's rng
+            // before the beacon pipeline gets to it, which re-rolls the field of
+            // every chapter in the game.
+            if plan.discovery.is_some() {
+                let field = random_field(&plan, &mut rng);
+                for (min_run, max_win) in DISCOVERY_RELAXATION {
+                    if let Some(level) = discovery_level(
+                        spec,
+                        &plan,
+                        step_index,
+                        field.clone(),
+                        &mut rng,
+                        min_run,
+                        max_win,
+                    ) {
+                        return level;
+                    }
+                }
+                continue;
+            }
             if let Some(level) = random_level(spec, &plan, k_probes, strict_fairness, &mut rng) {
                 if valid_field(&level) {
                     BAND_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3335,6 +3613,25 @@ mod tests {
             .any(|k| integrate(level, k).reached())
     }
 
+    /// The same question the app asks at the win seam, so no gate can pass on a
+    /// setting the player would actually lose.
+    fn wins_at(level: &Level, k: f64) -> bool {
+        let result = integrate_from(level, level.a, k);
+        match level.discovery {
+            Some(rule) => satisfies(rule, &result),
+            None => result.reached(),
+        }
+    }
+
+    /// Whether the level admits a winning setting at all, in whatever currency
+    /// the chapter asks in.
+    fn has_winning_setting(level: &Level) -> bool {
+        match level.discovery {
+            Some(_) => discovery_solution(level).is_some(),
+            None => solve_any_phase(level).is_some(),
+        }
+    }
+
     fn calm_level(beacons: Vec<Point>) -> Level {
         Level {
             title: "Test",
@@ -3360,6 +3657,7 @@ mod tests {
             k_window: 0.0,
             a: (0.0, 0.0),
             default_release: (0.0, 0.0),
+            discovery: None,
             ghosts: Vec::new(),
             beacons,
             obstacles: Vec::new(),
@@ -3393,7 +3691,8 @@ mod tests {
                 Chapter::Thread,
                 Chapter::Timing,
                 Chapter::Compose,
-                Chapter::Coordinate
+                Chapter::Coordinate,
+                Chapter::Experiment
             ]
         );
     }
@@ -3402,7 +3701,7 @@ mod tests {
     fn all_levels_are_winnable() {
         for level in levels() {
             assert!(
-                solve_any_phase(&level).is_some(),
+                has_winning_setting(&level),
                 "aucun réglage ne gagne : {} {}",
                 level.title,
                 level.focus
@@ -3437,6 +3736,12 @@ mod tests {
             for (group, spec) in CHAPTERS.iter().enumerate() {
                 for step in 0..CHAPTERS[group].plans.len() {
                     let level = &generated[chapter_offset(group) + step];
+                    // A discovery plan names no window: it has no landing point
+                    // to be narrow across, and its margin is measured against
+                    // the dial by `discovery_levels_still_answer_their_own_question`.
+                    if spec.plans[step].discovery.is_some() {
+                        continue;
+                    }
                     let max_window = spec.plans[step]
                         .k_window_steps
                         .expect("chaque plan doit viser une marge")
@@ -3472,6 +3777,15 @@ mod tests {
             }
             assert_eq!(level.a, level.default_release, "{}", level.focus);
             if level.knobs().intensity {
+                if level.discovery.is_some() {
+                    let (k, _window) = discovery_solution(&level).expect("gagnable");
+                    assert!(
+                        wins_at(&level, k),
+                        "{}: largage fixe sans solution",
+                        level.focus
+                    );
+                    continue;
+                }
                 let (phase, k) = solve_any_phase(&level).expect("gagnable");
                 let won = level.resolved(phase);
                 assert!(
@@ -3688,7 +4002,7 @@ mod tests {
                 (0..=count)
                     .filter(|index| {
                         let k = level.k_min + *index as f64 * step;
-                        k <= level.k_max + EPSILON && integrate(&frozen, k).reached()
+                        k <= level.k_max + EPSILON && wins_at(&frozen, k)
                     })
                     .count()
             })
@@ -3765,6 +4079,112 @@ mod tests {
     }
 
     #[test]
+    fn discovery_levels_still_answer_their_own_question() {
+        for level in generate_level_group(DEFAULT_SEED, Chapter::Experiment.group_index()) {
+            assert!(
+                level.beacons.is_empty(),
+                "{}: une découverte n'a pas de balise à atteindre",
+                level.focus
+            );
+            assert_eq!(
+                level.discovery,
+                Some(Discovery::TurnsBack),
+                "{}: le chapitre a perdu sa règle",
+                level.focus
+            );
+            assert!(
+                level.knobs().intensity && !level.knobs().release,
+                "{}: le Curseur doit être la seule chose libre",
+                level.focus
+            );
+            assert!(
+                !discovery_holds(&level, level.k_def),
+                "{}: le curseur part déjà sur la réponse",
+                level.focus
+            );
+            // The band is measured on the same grid the generator used, rather
+            // than re-derived from the reported window: at the exact edge of the
+            // band the predicate is a coin flip, and a gate that flaked on a
+            // rounding error would be a gate nobody trusts.
+            let step = (level.k_max - level.k_min) / (DISCOVERY_PROBES - 1) as f64;
+            let hits: Vec<bool> = (0..DISCOVERY_PROBES)
+                .map(|index| discovery_holds(&level, level.k_min + step * index as f64))
+                .collect();
+            let holds = |index: isize| {
+                let index = index.clamp(0, DISCOVERY_PROBES as isize - 1);
+                discovery_holds(&level, level.k_min + step * index as f64)
+            };
+            let satisfying = hits.iter().filter(|hit| **hit).count();
+            let (first, cells) = largest_connected(
+                hits.iter()
+                    .enumerate()
+                    .filter(|(_, hit)| **hit)
+                    .map(|(index, _)| index)
+                    .collect(),
+            );
+            let probes = DISCOVERY_PROBES as f64;
+            assert!(
+                cells as f64 / probes >= DISCOVERY_MIN_RUN,
+                "{}: la bande la plus large fait {:.1}% du Curseur, une aiguille se \
+                 trouve au hasard et non en cherchant",
+                level.focus,
+                cells as f64 / probes * 100.0
+            );
+            assert!(
+                satisfying as f64 / probes <= DISCOVERY_MAX_WIN,
+                "{}: {:.1}% du Curseur gagne, ce n'est plus une découverte",
+                level.focus,
+                satisfying as f64 / probes * 100.0
+            );
+            assert!(
+                first > 0 && first + cells < DISCOVERY_PROBES,
+                "{}: la réponse court jusqu'au bout du Curseur, on gagne en poussant à fond",
+                level.focus
+            );
+            assert!(
+                !holds(first as isize - 1) && !holds((first + cells) as isize),
+                "{}: la propriété ne disparaît pas d'un côté",
+                level.focus
+            );
+            let (k, _window) = discovery_solution(&level)
+                .unwrap_or_else(|| panic!("{}: aucune réponse", level.focus));
+            assert!(
+                discovery_holds(&level, k),
+                "{}: le centre de la fenêtre ne répond pas",
+                level.focus
+            );
+        }
+    }
+
+    #[test]
+    fn a_beacon_level_never_answers_a_discovery_question() {
+        // The win seam asks one question for every level, so a level with no
+        // discovery rule has to fail it — otherwise a chapter that still had a
+        // beacon in it would be winnable by its old rule.
+        let level = calm_level(vec![(4.0, 0.0)]);
+        assert_eq!(level.discovery, None);
+        assert!(!discovery_holds(&level, 0.0));
+        assert!(!discovery_holds(&level, level.k_max));
+    }
+
+    #[test]
+    fn discovery_plans_carry_the_obstacles_that_bound_the_answer() {
+        for spec in CHAPTERS.iter() {
+            for plan in spec.plans {
+                let Some(_) = plan.discovery else {
+                    continue;
+                };
+                assert!(
+                    plan.obstacles > 0,
+                    "{}: sans obstacle, une intensité maximale ne peut pas échouer et \
+                     le chapitre se réduit à pousser le Curseur à fond",
+                    plan.focus
+                );
+            }
+        }
+    }
+
+    #[test]
     fn band_field_switches_direction_between_bands() {
         let spec = &CHAPTERS[Chapter::Detect.group_index()];
         let level = canonical_level(spec, &spec.plans[3], 3);
@@ -3804,7 +4224,7 @@ mod tests {
                 );
                 assert!(valid_field(&level), "champ: {} {}", spec.title, level.focus);
                 assert!(
-                    solve_any_phase(&level).is_some(),
+                    has_winning_setting(&level),
                     "repli insoluble: {} {}",
                     spec.title,
                     level.focus
@@ -3863,7 +4283,7 @@ mod tests {
                 );
                 assert!(valid_field(&level), "champ invalide: {}", level.title);
                 assert!(
-                    solve_any_phase(&level).is_some(),
+                    has_winning_setting(&level),
                     "niveau impossible: {} {}",
                     level.title,
                     level.focus
@@ -3980,7 +4400,7 @@ mod tests {
             assert_eq!(level.step_index, 0);
             assert_eq!(level.title, CHAPTERS[index].title);
             assert!(
-                solve_any_phase(level).is_some(),
+                has_winning_setting(level),
                 "tutoriel insoluble: {} {}",
                 level.title,
                 level.focus

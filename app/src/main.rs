@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
 use peoplemodeler_core::{
-    chapter_count, generate_level_group, integrate_from, slot_chapter, slot_count,
+    chapter_count, generate_level_group, integrate_from, satisfies, slot_chapter, slot_count,
     slot_is_tutorial, slot_offset, slot_size, tutorial_hint, tutorial_level_for, Chapter, Level,
     Outcome, ReleaseMode, SimResult, TraceRule, Vector2, DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX,
     YMIN,
@@ -19,6 +19,16 @@ const HISTORY_LIMIT: usize = 3;
 /// reads as a slider, few enough that the preview stays honest.
 const PHASE_SLIDER_STEPS: usize = 360;
 const SAVE_KEY: &str = "driftline.save.v1";
+
+/// Whether a launch solved the level. Every chapter answers through its beacon
+/// except the one that asks for a setting rather than a landing, which has no
+/// beacon to reach and whose win is the property itself.
+fn won_by(level: &Level, result: &SimResult) -> bool {
+    match level.discovery {
+        Some(rule) => satisfies(rule, result),
+        None => result.reached(),
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Attempt {
@@ -1414,7 +1424,7 @@ fn App() -> Element {
                             );
                             k.set(launch_k);
                             let result = integrate_from(&launch_level, release, launch_k);
-                            let won = result.reached();
+                            let won = won_by(&launch_level, &result);
                             animation_visible.set(false);
                             animation_id.set(animation_id() + 1);
                             archive_active_attempt(&mut progress, current_level_idx);
@@ -1809,6 +1819,7 @@ mod tests {
             k_window: 0.0,
             a: (-4.5, 0.0),
             default_release: (-4.5, 0.0),
+            discovery: None,
             ghosts: Vec::new(),
             beacons: Vec::new(),
             obstacles: Vec::new(),
