@@ -3,10 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
 use peoplemodeler_core::{
-    chapter_count, generate_level_group, integrate_from, slot_chapter, slot_count,
-    slot_is_tutorial, slot_offset, slot_size, tutorial_hint, tutorial_level_for, Chapter, Level,
-    Outcome, ReleaseMode, SimResult, TraceRule, Vector2, DEFAULT_SEED, WIN_R, XMAX, XMIN, YMAX,
-    YMIN,
+    chapter_count, generate_level_group, integrate_from, satisfies, slot_chapter, slot_count,
+    slot_is_tutorial, slot_offset, slot_size, tutorial_hint, tutorial_level_for, Chapter,
+    Discovery, Level, Outcome, ReleaseMode, SimResult, TraceRule, Vector2, DEFAULT_SEED, WIN_R,
+    XMAX, XMIN, YMAX, YMIN,
 };
 
 const W: f64 = 640.0;
@@ -19,6 +19,16 @@ const HISTORY_LIMIT: usize = 3;
 /// reads as a slider, few enough that the preview stays honest.
 const PHASE_SLIDER_STEPS: usize = 360;
 const SAVE_KEY: &str = "driftline.save.v1";
+
+/// Whether a launch solved the level. Every chapter answers through its beacon
+/// except the one that asks for a setting rather than a landing, which has no
+/// beacon to reach and whose win is the property itself.
+fn won_by(level: &Level, result: &SimResult) -> bool {
+    match level.discovery {
+        Some(rule) => satisfies(rule, result),
+        None => result.reached(),
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Attempt {
@@ -202,17 +212,41 @@ fn field_grid_y() -> Vec<f64> {
 }
 
 fn path_to_svg(points: &[(f64, f64)]) -> String {
-    let mut path = String::new();
+    use std::fmt::Write as _;
+    // Each point used to go through format!() + push_str (one heap
+    // allocation per point); for a full-resolution trajectory (up to
+    // MAX_STEPS = 3000 points) rebuilt on every render, that's thousands of
+    // small allocations for a single SVG path string. write! into a
+    // pre-sized buffer instead: same output, ~one allocation total.
+    let mut path = String::with_capacity(points.len() * 14);
     for (index, (x, y)) in points.iter().enumerate() {
         let (px, py) = (map_x(*x), map_y(*y));
-        if index == 0 {
-            path.push_str(&format!("M {px:.2} {py:.2} "));
+        let _ = if index == 0 {
+            write!(path, "M {px:.2} {py:.2} ")
         } else {
-            path.push_str(&format!("L {px:.2} {py:.2} "));
-        }
+            write!(path, "L {px:.2} {py:.2} ")
+        };
     }
     path
 }
+
+/// Thins a point sequence to at most `max_points` for display, keeping the
+/// first and last point exactly. A 640x420 canvas can't show the difference
+/// between a 3000-point and a 200-point curve, but string-building and SVG
+/// path length scale with point count, so this is a display-only cut — any
+/// caller that needs the real trajectory (win detection, closest-approach)
+/// must keep using the untouched `SimResult`/`preview`, never this.
+fn decimate(points: &[(f64, f64)], max_points: usize) -> Vec<(f64, f64)> {
+    if points.len() <= max_points || max_points < 2 {
+        return points.to_vec();
+    }
+    let stride = (points.len() - 1) as f64 / (max_points - 1) as f64;
+    (0..max_points)
+        .map(|i| points[((i as f64 * stride).round() as usize).min(points.len() - 1)])
+        .collect()
+}
+
+const DISPLAY_POINTS_MAX: usize = 220;
 
 fn vector_endpoints(level: &Level, x: f64, y: f64, k: f64) -> Option<(f64, f64, f64, f64)> {
     let Vector2 { x: vx, y: vy } = level.flow_at(x, y, k);
@@ -451,24 +485,17 @@ fn chapter_slots(seed: u64, group: usize, variant: usize) -> Vec<Level> {
     levels
 }
 
-fn solved_prefix(progress: &[LevelProgress]) -> usize {
-    progress.iter().take_while(|level| level.solved).count()
+/// Every chapter is independent: nothing is locked behind solving an earlier
+/// one. The only boundary left is `loaded`, which is about how many slots
+/// have been generated/paged in, not about progress. `progress` and `seen`
+/// are kept as parameters (and still updated elsewhere, for badges/history)
+/// but no longer gate access — a player can jump straight to any chapter.
+fn slot_unlocked(_progress: &[LevelProgress], _seen: &[bool], index: usize, loaded: usize) -> bool {
+    index < loaded
 }
 
-/// A slot is playable when the run of solved levels reaches it, or once its
-/// chapter's teaching level has been opened. The lesson is the way in, never a
-/// lock: skipping it costs nothing but the badge.
-fn slot_unlocked(progress: &[LevelProgress], seen: &[bool], index: usize, loaded: usize) -> bool {
-    if index >= loaded {
-        return false;
-    }
-    index < solved_prefix(progress) + 1 || seen.get(slot_chapter(index)).copied().unwrap_or(false)
-}
-
-fn unlocked_count(progress: &[LevelProgress], seen: &[bool], loaded: usize) -> usize {
-    (0..loaded)
-        .find(|index| !slot_unlocked(progress, seen, *index, loaded))
-        .unwrap_or(loaded)
+fn unlocked_count(_progress: &[LevelProgress], _seen: &[bool], loaded: usize) -> usize {
+    loaded
 }
 
 fn level_button_class(active: bool, unlocked: bool, solved: bool) -> &'static str {
@@ -509,7 +536,35 @@ fn reset_level_progress(progress: &mut Signal<Vec<LevelProgress>>, level_idx: us
     progress.set(levels);
 }
 
-fn result_message(result: &SimResult, beacons_total: usize) -> (String, bool) {
+fn result_message(
+    result: &SimResult,
+    beacons_total: usize,
+    discovery: Option<Discovery>,
+) -> (String, bool) {
+    // A discovery level has no beacon at all, so the generic "atteint la
+    // balise" / "quitté la zone" phrasing below would be actively
+    // misleading — the win condition is a property of the shape of the
+    // curve, not a landing. won_by() already uses satisfies() to decide
+    // the actual win; this just has to describe that same verdict in
+    // words that make sense without a target circle on screen.
+    if let Some(rule) = discovery {
+        if result.collided() {
+            return (
+                "La sonde a percuté un obstacle avant d'avoir pu montrer quoi que ce soit."
+                    .to_string(),
+                false,
+            );
+        }
+        return if satisfies(rule, result) {
+            ("La sonde est repartie dans l'autre sens : la propriété est confirmée !".to_string(), true)
+        } else {
+            (
+                "La sonde n'a pas fait demi-tour à cette intensité. Essaie une autre valeur."
+                    .to_string(),
+                false,
+            )
+        };
+    }
     let progress_prefix = if beacons_total > 1 && result.visited > 0 {
         format!("{} balise(s) sur {}. ", result.visited, beacons_total)
     } else {
@@ -576,15 +631,26 @@ fn closest_message(result: &SimResult) -> String {
 
 #[component]
 fn App() -> Element {
-    let all_levels = use_signal(|| chapter_slots(DEFAULT_SEED, 0, 0));
-    let initial_k = launch_intensity(&all_levels()[0]);
-    let initial_step = all_levels()[0].recommended_step;
+    // Genuinely nothing level-related is computed synchronously here.
+    // Generating even a single tutorial level still runs the same solver
+    // search (generate_from_plan: up to ~70 attempts, each potentially
+    // thousands of RK4 steps) as any other level — cutting six levels'
+    // worth down to one still left real, unbounded-by-us work sitting on
+    // the path to first paint. This starts from nothing instead: all_levels
+    // is empty, every other signal uses a hardcoded default that needs no
+    // Level at all, and the render below bails out to a loading message
+    // before touching levels_snapshot[current_level_idx]. The existing
+    // entropy_loaded effect (just below) does the one real generation pass,
+    // asynchronously, after first paint, and replace_levels sets k/phase/
+    // step_idx/progress correctly once real data exists — exactly as it
+    // already does for every later reseed, just also covering the first one.
+    let all_levels = use_signal(Vec::new);
     let total_levels = slot_count();
     let level_idx = use_signal(|| 0usize);
-    let mut k = use_signal(|| initial_k);
-    let mut phase = use_signal(|| all_levels()[0].phase_def);
-    let mut step_idx = use_signal(|| step_index(initial_step));
-    let mut progress = use_signal(|| vec![LevelProgress::default(); slot_size(0)]);
+    let mut k = use_signal(|| 0.0);
+    let mut phase = use_signal(|| 0.0);
+    let mut step_idx = use_signal(|| 0usize);
+    let mut progress = use_signal(Vec::new);
     let mut tutorial_seen = use_signal(|| vec![false; chapter_count()]);
     let mut tutorial_variant = use_signal(|| 0usize);
     let mut show_levels = use_signal(|| false);
@@ -671,6 +737,14 @@ fn App() -> Element {
     });
 
     use_effect(move || {
+        // Without this, loaded == 0 on the very first render (all_levels now
+        // starts empty) would satisfy `loaded < total_levels` immediately,
+        // firing append_group with the placeholder DEFAULT_SEED/variant-0
+        // state before entropy_loaded has determined the real seed — racing
+        // with, and duplicating, that effect's own generation.
+        if !restored() {
+            return;
+        }
         let loaded = all_levels().len();
         let reached = unlocked_count(&progress(), &tutorial_seen(), loaded);
         if loaded < total_levels && reached >= loaded {
@@ -691,7 +765,19 @@ fn App() -> Element {
     });
 
     let levels_snapshot = all_levels();
-    let current_level_idx = level_idx();
+    if levels_snapshot.is_empty() {
+        // First paint, before entropy_loaded's spawn has resolved. No Level
+        // exists yet, so nothing below this point is safe to run — render a
+        // minimal placeholder instead of indexing into empty data.
+        return rsx! {
+            div {
+                style: "min-height:100vh;display:flex;align-items:center;justify-content:center;\
+                         font-family:system-ui,sans-serif;color:#9aa0a6;",
+                "Chargement…"
+            }
+        };
+    }
+    let current_level_idx = level_idx().min(levels_snapshot.len() - 1);
     let base_level = levels_snapshot[current_level_idx].clone();
     // The dial freezes the field: everything below simulates and draws the
     // snapshot the player dialled into, never the live field.
@@ -740,18 +826,18 @@ fn App() -> Element {
     let reveal_beacons = visibility.reveals_beacon_before_launch()
         || has_launched
         || !current_progress.history.is_empty();
-    let shown_path_d = path_to_svg(&shown_points[..revealed]);
+    let shown_path_d = path_to_svg(&decimate(&shown_points[..revealed], DISPLAY_POINTS_MAX));
     // Only a blind start trails a faint remainder; a hidden path has no tail to
     // give away, so nothing is drawn in flight.
     let blind_path_d = if visibility.draws_in_flight_tail() {
-        path_to_svg(&shown_points[revealed..])
+        path_to_svg(&decimate(&shown_points[revealed..], DISPLAY_POINTS_MAX))
     } else {
         String::new()
     };
     let ghost_paths: Vec<String> = base_level
         .ghosts
         .iter()
-        .map(|ghost| path_to_svg(ghost))
+        .map(|ghost| path_to_svg(&decimate(ghost, DISPLAY_POINTS_MAX)))
         .collect();
     // A hidden path would spoil its own lesson: earlier trajectories are
     // dropped while their marks stay, so each attempt is read off the field.
@@ -762,7 +848,7 @@ fn App() -> Element {
         .map(|attempt| {
             (
                 if keep_history_paths {
-                    path_to_svg(&attempt.result.points)
+                    path_to_svg(&decimate(&attempt.result.points, DISPLAY_POINTS_MAX))
                 } else {
                     String::new()
                 },
@@ -804,7 +890,7 @@ fn App() -> Element {
     };
     let active_message = active_result
         .as_ref()
-        .map(|result| result_message(result, current.beacons.len()));
+        .map(|result| result_message(result, current.beacons.len(), current.discovery));
     let path_class = if animation_visible() && active_result.is_some() {
         "path active-path"
     } else {
@@ -1414,7 +1500,7 @@ fn App() -> Element {
                             );
                             k.set(launch_k);
                             let result = integrate_from(&launch_level, release, launch_k);
-                            let won = result.reached();
+                            let won = won_by(&launch_level, &result);
                             animation_visible.set(false);
                             animation_id.set(animation_id() + 1);
                             archive_active_attempt(&mut progress, current_level_idx);
@@ -1629,40 +1715,27 @@ mod tests {
     }
 
     #[test]
-    fn zones_unlock_one_at_a_time() {
+    fn every_loaded_slot_is_unlocked_regardless_of_progress() {
         let loaded = slot_count();
         let seen = vec![false; chapter_count()];
-        let mut progress = vec![LevelProgress::default(); loaded];
-        assert_eq!(unlocked_count(&progress, &seen, loaded), 1);
-        progress[0].solved = true;
-        assert_eq!(unlocked_count(&progress, &seen, loaded), 2);
-        progress[2].solved = true;
-        assert_eq!(unlocked_count(&progress, &seen, loaded), 2);
-        progress[1].solved = true;
-        assert_eq!(unlocked_count(&progress, &seen, loaded), 4);
+        let progress = vec![LevelProgress::default(); loaded];
+        // Nothing solved, nothing seen: every slot should still be open.
+        assert_eq!(unlocked_count(&progress, &seen, loaded), loaded);
+        for index in 0..loaded {
+            assert!(slot_unlocked(&progress, &seen, index, loaded));
+        }
     }
 
     #[test]
-    fn opening_a_tutorial_unlocks_the_chapter_without_solving_it() {
+    fn chapters_are_reachable_without_solving_earlier_ones() {
         let loaded = slot_count();
-        let door = slot_offset(1);
-        assert_eq!(door, slot_size(0));
-        let mut progress = vec![LevelProgress::default(); loaded];
-        let mut seen = vec![false; chapter_count()];
-        // Solving chapter 1 lands the player on chapter 2's teaching level: it
-        // is the door, and it is always reachable.
-        for level in progress.iter_mut().take(door) {
-            level.solved = true;
-        }
-        assert!(slot_unlocked(&progress, &seen, door, loaded));
-        // The real levels behind it stay shut until the lesson is met.
-        assert!(!slot_unlocked(&progress, &seen, door + 1, loaded));
-        // Skipping it is allowed: opening the tutorial is the whole price.
-        seen[1] = true;
-        assert!(slot_unlocked(&progress, &seen, door, loaded));
-        assert!(slot_unlocked(&progress, &seen, door + 1, loaded));
-        // Chapter 3 has not been met, so its door is still shut.
-        assert!(!slot_unlocked(&progress, &seen, slot_offset(2), loaded));
+        let progress = vec![LevelProgress::default(); loaded];
+        let seen = vec![false; chapter_count()];
+        // A level deep into a later chapter, with nothing solved anywhere
+        // and that chapter's tutorial never opened, is still playable.
+        let later = slot_offset(chapter_count() - 1) + 1;
+        assert!(later < loaded, "test needs a chapter with more than one slot");
+        assert!(slot_unlocked(&progress, &seen, later, loaded));
     }
 
     #[test]
@@ -1777,10 +1850,10 @@ mod tests {
             closest: None,
             visited: 2,
         };
-        let (message, won) = result_message(&result, 3);
+        let (message, won) = result_message(&result, 3, None);
         assert!(!won);
         assert!(message.starts_with("2 balise(s) sur 3."));
-        let (_, won) = result_message(&result, 1);
+        let (_, won) = result_message(&result, 1, None);
         assert!(!won);
     }
 
@@ -1809,6 +1882,7 @@ mod tests {
             k_window: 0.0,
             a: (-4.5, 0.0),
             default_release: (-4.5, 0.0),
+            discovery: None,
             ghosts: Vec::new(),
             beacons: Vec::new(),
             obstacles: Vec::new(),
