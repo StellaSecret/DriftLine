@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vector Field</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e1016; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; outline: none; }
+    #msg { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+           color: #aab0c0; font: 18px monospace; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas" tabindex="1"></canvas>
+  <div id="msg">Loading...</div>
+  <!-- Relative URLs so the page works under any GitHub Pages base path. -->
+  <script src="gl.js"></script>
+  <script>
+    load("vfield.wasm").then(function () { document.getElementById("msg").remove(); });
+  </script>
+</body>
+</html>
