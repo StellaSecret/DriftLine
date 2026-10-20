@@ -4,6 +4,10 @@ use vfield::sim::Outcome;
 use vfield::{levels, validate, Rules};
 
 fn main() {
+    if std::env::args().any(|a| a == "--steer") {
+        print!("{}", vfield::validate_steer::report(&levels::steer_levels()));
+        return;
+    }
     let detail = std::env::args().any(|a| a == "--detail");
     for l in levels::all() {
         println!("{:<6} {:<22} solvable={:<5} {}", l.id, l.title, validate::solvable(&l), validate::summarize(&l));

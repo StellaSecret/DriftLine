@@ -3,9 +3,10 @@ use crate::render as r;
 use crate::ui::{self, alpha, rgb, text, text_c, wrap, Input, H, W};
 use macroquad::prelude::*;
 use std::collections::HashSet;
+use vfield::modes::steer::Run as SteerRun;
 use vfield::modes::*;
 use vfield::sim::{Outcome, Trajectory};
-use vfield::{levels, Chapter, Level, Reveal, Rules, V2};
+use vfield::{levels, Chapter, GustDirs, Level, Reveal, Rules, V2};
 
 const PX0: f32 = 1014.0; // panel content x
 const PW: f32 = 236.0; // panel content width
@@ -34,7 +35,7 @@ enum Screen {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Action {
+enum Nav {
     None,
     Menu,
     Next,
@@ -70,6 +71,10 @@ struct St {
     exp_i: f64,
     exp_choice: Option<usize>,
     exp_est: [f64; 2],
+    // Steer
+    sel: Option<Action>,
+    beat_t: f64,
+    replay: Option<SteerReplay>,
 }
 impl St {
     fn flying(&self) -> bool {
@@ -80,7 +85,17 @@ impl St {
     }
 }
 
+/// Playback of a recorded Steer run (re-simulated from its actions; never touches the live run).
+struct SteerReplay {
+    run: SteerRun,
+    beat: usize,
+    t: f64,
+    hold: f64,
+}
+
+#[allow(clippy::large_enum_variant)]
 enum Game {
+    Steer(SteerGame),
     Position(PositionGame),
     Predict(PredictGame),
     Tempo(TempoGame),
@@ -89,6 +104,7 @@ enum Game {
 impl Game {
     fn level(&self) -> &Level {
         match self {
+            Game::Steer(g) => &g.level,
             Game::Position(g) => &g.level,
             Game::Predict(g) => &g.level,
             Game::Tempo(g) => &g.level,
@@ -97,6 +113,7 @@ impl Game {
     }
     fn complete(&self) -> bool {
         match self {
+            Game::Steer(g) => g.won,
             Game::Position(g) => g.won,
             Game::Predict(g) => g.passed(),
             Game::Tempo(g) => g.won,
@@ -114,6 +131,7 @@ struct Session {
 fn make_session(idx: usize, level: Level) -> Session {
     let mut st = St::default();
     let game = match &level.rules {
+        Rules::Steer { .. } => Game::Steer(SteerGame::new(level)),
         Rules::Position { .. } => Game::Position(PositionGame::new(level)),
         Rules::Predict { .. } => Game::Predict(PredictGame::new(level)),
         Rules::Tempo { .. } => Game::Tempo(TempoGame::new(level)),
@@ -203,9 +221,9 @@ impl App {
                     }
                 }
                 match act {
-                    Action::None => Screen::Play(s),
-                    Action::Menu => Screen::Select(c),
-                    Action::Next => {
+                    Nav::None => Screen::Play(s),
+                    Nav::Menu => Screen::Select(c),
+                    Nav::Next => {
                         let ids = self.chapter_levels(c);
                         match ids.iter().position(|i| *i == s.idx) {
                             Some(p) if p + 1 < ids.len() => Screen::Play(Box::new(make_session(ids[p + 1], self.levels[ids[p + 1]].clone()))),
@@ -222,7 +240,7 @@ impl App {
         text_c("Read the flow. Steer the probe.", W / 2.0, 150.0, 26.0, gray());
         let mut next = Screen::Menu;
         for (k, c) in Chapter::ALL.iter().enumerate() {
-            let r = Rect::new(48.0 + k as f32 * 240.0, 200.0, 224.0, 300.0);
+            let r = Rect::new(40.0 + k as f32 * 202.0, 200.0, 190.0, 300.0);
             let unlocked = self.chapter_unlocked(*c);
             let ids = self.chapter_levels(*c);
             let n = ids.iter().filter(|i| self.done(**i)).count();
@@ -293,6 +311,7 @@ fn chapter_color(c: Chapter) -> Color {
         Chapter::Predict => rgb(86, 180, 233),
         Chapter::Tempo => rgb(240, 228, 66),
         Chapter::Experiment => rgb(0, 158, 115),
+        Chapter::Steer => rgb(213, 94, 0),
         Chapter::Combo => rgb(230, 159, 0),
     }
 }
@@ -341,6 +360,12 @@ fn do_retry(g: &mut Game, st: &mut St) {
             }
         }
         Game::Experiment(e) => e.reset(),
+        Game::Steer(g) => {
+            let _ = g.retry();
+            st.sel = None;
+            st.beat_t = 0.0;
+            st.replay = None;
+        }
         _ => {}
     }
     st.anim = None;
@@ -353,11 +378,12 @@ fn retry_enabled(g: &Game, st: &St) -> bool {
     match g {
         Game::Predict(p) => p.finished(),
         Game::Experiment(e) => !e.runs.is_empty(),
+        Game::Steer(g) => !g.history.is_empty() && g.phase != Phase::Advancing && st.replay.is_none(),
         _ => st.anim.is_some() || !st.msg.is_empty(),
     }
 }
 
-fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Action {
+fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
     let dt = get_frame_time() as f64;
     if is_key_pressed(KeyCode::G) {
         prefs.grid = (prefs.grid + 1) % 4;
@@ -366,12 +392,13 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Action {
         prefs.hc = !prefs.hc;
     }
     if is_key_pressed(KeyCode::Escape) {
-        return Action::Menu;
+        return Nav::Menu;
     }
     if let Some(a) = &mut s.st.anim {
         a.time += dt * a.speed;
     }
     match &mut s.game {
+        Game::Steer(g) => steer_frame(g, &mut s.st, inp, prefs, dt),
         Game::Position(g) => pos_frame(g, &mut s.st, inp, prefs),
         Game::Predict(g) => predict_frame(g, &mut s.st, inp, prefs),
         Game::Tempo(g) => tempo_frame(g, &mut s.st, inp, prefs, dt),
@@ -403,15 +430,25 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Action {
     if ui::button(inp, Rect::new(PX0 + 120.0, 700.0, 116.0, 34.0), retry_label, can_retry, acc) || (is_key_pressed(KeyCode::R) && can_retry) {
         do_retry(&mut s.game, &mut s.st);
     }
-    let can_replay = s.st.anim.is_some();
+    let can_replay = match &s.game {
+        Game::Steer(g) => g.phase != Phase::Advancing && g.replayable().is_some() && s.st.replay.is_none(),
+        _ => s.st.anim.is_some(),
+    };
     if ui::button(inp, Rect::new(PX0, 742.0, 116.0, 34.0), "Replay (V)", can_replay, acc) || (is_key_pressed(KeyCode::V) && can_replay) {
-        if let Some(a) = &mut s.st.anim {
+        if let Game::Steer(g) = &s.game {
+            if let Some(run) = g.replayable() {
+                // re-simulate from the recorded actions: a replay must reproduce, not replay stored pixels
+                if let Ok(r) = g.spec.replay(&run.actions()) {
+                    s.st.replay = Some(SteerReplay { run: r, beat: 0, t: 0.0, hold: 0.0 });
+                }
+            }
+        } else if let Some(a) = &mut s.st.anim {
             a.time = 0.0;
         }
     }
-    let mut action = Action::None;
+    let mut action = Nav::None;
     if ui::button(inp, Rect::new(PX0 + 120.0, 742.0, 116.0, 34.0), "Menu (Esc)", true, acc) {
-        action = Action::Menu;
+        action = Nav::Menu;
     }
     // completion banner
     let complete = s.game.complete();
@@ -421,6 +458,7 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Action {
         draw_rectangle_lines(b.x, b.y, b.w, b.h, 4.0, good_c());
         text_c("Level complete", b.x + b.w / 2.0, b.y + 36.0, 40.0, good_c());
         let detail = match &s.game {
+            Game::Steer(g) => format!("Gusts used: {} of {}   Attempts: {}", g.run().gusts_used(), g.spec.budget, g.attempts + 1),
             Game::Position(g) => format!("Launches used: {}", g.attempts.len()),
             Game::Predict(g) => format!("Forecasts correct: {} of {}", g.correct_count(), g.rounds.len()),
             Game::Tempo(g) => format!("Launches used: {}", g.attempts.len()),
@@ -428,14 +466,14 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Action {
         };
         text_c(&detail, b.x + b.w / 2.0, b.y + 74.0, 22.0, WHITE);
         if ui::button(inp, Rect::new(b.x + 20.0, b.y + 106.0, 200.0, 50.0), "Next (N)", true, good_c()) {
-            action = Action::Next;
+            action = Nav::Next;
         }
         if ui::button(inp, Rect::new(b.x + 260.0, b.y + 106.0, 200.0, 50.0), "Keep playing", true, rgb(120, 130, 160)) {
             s.st.banner = false;
         }
     }
     if complete && is_key_pressed(KeyCode::N) {
-        action = Action::Next;
+        action = Nav::Next;
     }
     action
 }
@@ -940,5 +978,284 @@ fn exp_frame(g: &mut ExperimentGame, st: &mut St, inp: &Input, prefs: &Prefs, dt
         let v = g.conclude(c);
         st.msg = v.message;
         st.good = Some(v.correct);
+    }
+}
+
+// ------------------------------------------------------------------ STEER
+const BEAT_ANIM_SECS: f64 = 0.9;
+const FIELD_ARROW: f64 = 0.5; // world units drawn per unit of speed
+
+fn c_field() -> Color {
+    r::c_predict()
+}
+fn c_gust() -> Color {
+    r::c_gate()
+}
+
+/// Compass layout: grid cell -> (key, direction index in an 8-way set, label). `None` = wait.
+const COMPASS: [(KeyCode, Option<usize>, &str); 9] = [
+    (KeyCode::Q, Some(3), "Q NW"),
+    (KeyCode::W, Some(2), "W N"),
+    (KeyCode::E, Some(1), "E NE"),
+    (KeyCode::A, Some(4), "A W"),
+    (KeyCode::S, None, "S Wait"),
+    (KeyCode::D, Some(0), "D E"),
+    (KeyCode::Z, Some(5), "Z SW"),
+    (KeyCode::X, Some(6), "X S"),
+    (KeyCode::C, Some(7), "C SE"),
+];
+
+/// Map an 8-way index to the level's own direction index (`GustDirs::Four` only has E, N, W, S).
+fn dir_for(dirs: GustDirs, eight: usize) -> Option<usize> {
+    match dirs {
+        GustDirs::Eight => Some(eight),
+        GustDirs::Four => eight.is_multiple_of(2).then_some(eight / 2),
+    }
+}
+
+fn end_message(e: End, g: &SteerGame) -> String {
+    match e {
+        End::Success => format!("Reached the target on beat {} using {} gust(s).", g.beat(), g.run().gusts_used()),
+        End::Failed(FailReason::Boundary) => "The probe left the field.".into(),
+        End::Failed(FailReason::BeatsExhausted) => "Out of beats before reaching the target.".into(),
+        End::Failed(FailReason::Invalid) => "Numerical error: the run was stopped.".into(),
+        End::Failed(FailReason::Hazard) => "The probe hit a hazard.".into(),
+        End::Failed(FailReason::MissedGate) => "Reached the target but skipped the gate.".into(),
+        End::Failed(FailReason::WrongRegion) => "The probe ended in the wrong region.".into(),
+    }
+}
+
+fn draw_run_path(run: &SteerRun, col: Color, th: f32, gust_col: Color, upto_beat: Option<(usize, usize)>) {
+    // upto_beat = (beat index in progress, number of its points to show); earlier beats are drawn fully
+    for (i, b) in run.beats.iter().enumerate() {
+        let pts: Vec<V2> = match upto_beat {
+            Some((cur, _)) if i > cur => break,
+            Some((cur, n)) if i == cur => b.points[..n.min(b.points.len())].to_vec(),
+            _ => b.points.clone(),
+        };
+        let mut line = vec![b.from];
+        line.extend(pts);
+        r::draw_path(&line, col, th);
+        // beat boundary tick, and a gust marker at the start of every beat that used one
+        let bend = r::w2s(b.to());
+        if upto_beat.is_none_or(|(cur, _)| i < cur) {
+            draw_circle_lines(bend.x, bend.y, 4.0, 1.5, col);
+        }
+        if let Action::Gust(_) = b.action {
+            let dirn = b.gust;
+            r::draw_gust_marker(b.from, dirn, gust_col);
+            let p = r::w2s(b.from);
+            text(&format!("{}", i + 1), p.x + 6.0, p.y - 10.0, 16.0, gust_col);
+        }
+    }
+}
+
+fn steer_frame(g: &mut SteerGame, st: &mut St, inp: &Input, prefs: &Prefs, dt: f64) {
+    let lvl = g.level.clone();
+    let dirs = g.spec.dirs;
+    let nbeats = g.spec.beats;
+
+    // ---- advance the beat animation / replay (time only; decisions are never made for the player)
+    if g.phase == Phase::Advancing {
+        st.beat_t += dt / BEAT_ANIM_SECS;
+        if st.beat_t >= 1.0 {
+            if let Some(end) = g.finish_beat() {
+                st.msg = end_message(end, g);
+                st.good = Some(end == End::Success);
+            }
+            st.beat_t = 0.0;
+        }
+    }
+    let mut replay_done = false;
+    if let Some(rp) = &mut st.replay {
+        if rp.beat < rp.run.beats.len() {
+            rp.t += dt / BEAT_ANIM_SECS;
+            if rp.t >= 1.0 {
+                rp.t = 0.0;
+                rp.beat += 1;
+            }
+        } else {
+            rp.hold += dt;
+            if rp.hold > 1.2 {
+                replay_done = true;
+            }
+        }
+    }
+    if replay_done || (st.replay.is_some() && is_key_pressed(KeyCode::V)) {
+        st.replay = None;
+    }
+    let replaying = st.replay.is_some();
+
+    // ---- draw the world
+    r::begin_area();
+    r::draw_field(&lvl.field, 0.0, prefs.grid, prefs.hc);
+    for reg in &lvl.regions {
+        r::draw_region(reg, false);
+    }
+    // ghosts: oldest faintest
+    let ng = g.ghosts.len();
+    for (i, run) in g.ghosts.iter().enumerate() {
+        let a = 0.14 + 0.16 * (i + 1) as f32 / ng.max(1) as f32;
+        draw_run_path(run, alpha(rgb(200, 206, 220), a), 2.0, alpha(rgb(200, 206, 220), a + 0.15), None);
+    }
+    let accepting = g.accepting_input() && !replaying;
+    if let Some(rp) = &st.replay {
+        let n = rp.run.beats.get(rp.beat).map_or(0, |b| (b.points.len() as f64 * rp.t).ceil() as usize);
+        let cur = if rp.beat < rp.run.beats.len() { Some((rp.beat, n)) } else { None };
+        draw_run_path(&rp.run, r::c_probe(), 3.5, c_gust(), cur);
+        let head = match cur {
+            Some((b, n)) if n > 0 => rp.run.beats[b].points[n.min(rp.run.beats[b].points.len()) - 1],
+            Some((b, _)) => rp.run.beats[b].from,
+            None => rp.run.beats.last().map_or(rp.run.start, |b| b.to()),
+        };
+        r::draw_probe(head, r::c_probe());
+        r::draw_start(rp.run.start);
+    } else {
+        let run = g.run();
+        let cur = if g.phase == Phase::Advancing { g.pending_beat().map(|b| (b.points.len() as f64 * st.beat_t).ceil() as usize) } else { None };
+        draw_run_path(&run, r::c_probe(), 3.5, c_gust(), None);
+        // the beat in flight
+        let mut head = g.pos();
+        if let (Some(n), Some(b)) = (cur, g.pending_beat()) {
+            let pts = &b.points[..n.min(b.points.len())];
+            let mut line = vec![b.from];
+            line.extend_from_slice(pts);
+            r::draw_path(&line, r::c_probe(), 3.5);
+            if let Action::Gust(_) = b.action {
+                r::draw_gust_marker(b.from, b.gust, c_gust());
+            }
+            head = line.last().copied().unwrap_or(b.from);
+        }
+        r::draw_start(g.spec.start);
+        r::draw_probe(head, r::c_probe());
+        // ---- decision overlay: field + gust = net velocity, drawn head-to-tail at the probe
+        if accepting {
+            let a = st.sel.unwrap_or(Action::Wait);
+            let p = g.pos();
+            let fv = g.field_velocity();
+            let gv = g.gust_vector(a);
+            let (ps, ft) = (r::w2s(p), r::w2s(p + fv * FIELD_ARROW));
+            let nt = r::w2s(p + (fv + gv) * FIELD_ARROW);
+            r::draw_arrow(ps, ft, c_field(), 3.0, false);
+            text("field", (ps.x + ft.x) / 2.0 - 14.0, (ps.y + ft.y) / 2.0 + 20.0, 17.0, c_field());
+            if gv != V2::ZERO {
+                r::draw_arrow(ft, nt, c_gust(), 4.0, true);
+                text("gust", (ft.x + nt.x) / 2.0 + 10.0, (ft.y + nt.y) / 2.0 + 4.0, 17.0, c_gust());
+                r::draw_arrow(ps, nt, WHITE, 2.0, false);
+                text("net", nt.x - 34.0, nt.y - 8.0, 17.0, WHITE);
+            }
+        }
+    }
+    r::end_area();
+
+    // ---- beat track under the play area: one cell per beat (arrow = gust, dot = wait)
+    let track = Rect::new(r::AX, 748.0, r::AW, 32.0);
+    let cw = track.w / nbeats as f32;
+    let (done_beats, cur_beat) = match &st.replay {
+        Some(rp) => (rp.run.beats.iter().take(rp.beat).map(|b| b.action).collect::<Vec<_>>(), rp.beat),
+        None => (g.history.iter().map(|b| b.action).collect::<Vec<_>>(), g.history.len()),
+    };
+    for i in 0..nbeats {
+        let c = Rect::new(track.x + i as f32 * cw, track.y, cw - 4.0, track.h);
+        draw_rectangle(c.x, c.y, c.w, c.h, rgb(30, 34, 46));
+        let live = i == cur_beat && (accepting || g.phase == Phase::Advancing || replaying);
+        draw_rectangle_lines(c.x, c.y, c.w, c.h, if live { 3.0 } else { 1.5 }, if live { WHITE } else { rgb(90, 98, 120) });
+        text(&format!("{}", i + 1), c.x + 4.0, c.y + 12.0, 14.0, rgb(130, 138, 160));
+        if let Some(a) = done_beats.get(i) {
+            let mid = vec2(c.x + c.w / 2.0, c.y + c.h / 2.0 + 3.0);
+            match a {
+                Action::Gust(d) => {
+                    let u = dirs.unit(*d);
+                    let dv = vec2(u.x as f32, -(u.y as f32));
+                    r::draw_arrow(mid - dv * 9.0, mid + dv * 9.0, c_gust(), 3.0, false);
+                }
+                Action::Wait => draw_circle(mid.x, mid.y, 3.0, rgb(150, 158, 178)),
+            }
+        }
+    }
+
+    // ---- panel
+    let mut y = panel_header(&lvl);
+    y = wrap("Each beat: choose a gust or wait, then confirm. The field does the rest.", PX0, y + 8.0, PW, 17.0, gray());
+    y += 6.0;
+    let shown_beat = if matches!(g.phase, Phase::Completed(_)) { g.beat() } else { (g.beat() + 1).min(nbeats) };
+    text(&format!("Beat {} of {}", shown_beat, nbeats), PX0, y + 14.0, 20.0, WHITE);
+    y += 26.0;
+    text("Gusts:", PX0, y + 14.0, 18.0, WHITE);
+    for i in 0..g.spec.budget {
+        let (cx, cy) = (PX0 + 62.0 + i as f32 * 24.0, y + 8.0);
+        if i < g.gusts_left() {
+            draw_circle(cx, cy, 8.0, c_gust());
+        } else {
+            draw_circle_lines(cx, cy, 8.0, 2.0, gray());
+        }
+    }
+    text(&format!("{} left", g.gusts_left()), PX0 + 70.0 + g.spec.budget as f32 * 24.0, y + 14.0, 17.0, gray());
+    y += 30.0;
+    let sel = st.sel;
+    let fv = g.field_velocity();
+    let gv = g.gust_vector(sel.unwrap_or(Action::Wait));
+    let sel_name = match sel {
+        Some(Action::Gust(d)) => format!("gust {}", dirs.name(d)),
+        Some(Action::Wait) => "wait".to_string(),
+        None => "none yet".to_string(),
+    };
+    let live_c = |c: Color| if accepting { c } else { rgb(100, 106, 122) };
+    text(&format!("Field  ({:+.1}, {:+.1})", fv.x, fv.y), PX0, y + 12.0, 16.0, live_c(c_field()));
+    text(&format!("Gust   ({:+.1}, {:+.1})", gv.x, gv.y), PX0, y + 30.0, 16.0, live_c(c_gust()));
+    text(&format!("Net    ({:+.1}, {:+.1})", fv.x + gv.x, fv.y + gv.y), PX0, y + 48.0, 16.0, live_c(WHITE));
+    text(&format!("Selected: {}", sel_name), PX0, y + 70.0, 17.0, WHITE);
+    y += 82.0;
+
+    // compass 3x3 (center = wait). Keys: Q W E / A S D / Z X C, arrows for the cardinals.
+    let can_act = accepting;
+    for (k, (key, eight, label)) in COMPASS.iter().enumerate() {
+        let (col, row) = ((k % 3) as f32, (k / 3) as f32);
+        let rect = Rect::new(PX0 + col * 80.0, y + row * 38.0, 76.0, 34.0);
+        let action = match eight {
+            None => Some(Action::Wait),
+            Some(e) => dir_for(dirs, *e).map(Action::Gust),
+        };
+        let usable = can_act && action.is_some() && (matches!(action, Some(Action::Wait)) || g.gusts_left() > 0);
+        let is_sel = sel == action && action.is_some();
+        let clicked = ui::button(inp, rect, label, usable, if is_sel { c_gust() } else { rgb(120, 130, 160) });
+        if is_sel {
+            draw_rectangle_lines(rect.x - 3.0, rect.y - 3.0, rect.w + 6.0, rect.h + 6.0, 3.0, c_gust());
+        }
+        if usable && (clicked || is_key_pressed(*key)) {
+            st.sel = action;
+        }
+    }
+    if can_act {
+        for (key, e) in [(KeyCode::Up, 2usize), (KeyCode::Down, 6), (KeyCode::Left, 4), (KeyCode::Right, 0)] {
+            if is_key_pressed(key) {
+                if let Some(d) = dir_for(dirs, e) {
+                    if g.gusts_left() > 0 {
+                        st.sel = Some(Action::Gust(d));
+                    }
+                }
+            }
+        }
+        if is_key_pressed(KeyCode::Key0) || is_key_pressed(KeyCode::Kp0) {
+            st.sel = Some(Action::Wait);
+        }
+    }
+    y += 3.0 * 38.0 + 6.0;
+    let ready = can_act && st.sel.is_some();
+    let go = ui::button(inp, Rect::new(PX0, y, PW, 42.0), "Confirm (Space)", ready, chapter_color(Chapter::Steer));
+    if ready && (go || space()) {
+        if let Some(a) = st.sel {
+            if g.choose(a).is_ok() {
+                st.beat_t = 0.0;
+                st.sel = None;
+                st.msg.clear();
+                st.good = None;
+            }
+        }
+    }
+    if replaying {
+        text("Replay running (V: stop)", PX0, y + 62.0, 16.0, c_gust());
+    } else if !g.ghosts.is_empty() {
+        text(&format!("Faint paths: {} earlier run(s)", g.ghosts.len()), PX0, y + 62.0, 16.0, gray());
     }
 }

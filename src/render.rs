@@ -224,3 +224,30 @@ pub fn draw_zone(z: &Zone) {
 pub fn hit_region(inp: &Input, r: &Region) -> bool {
     in_area(inp.mouse) && (inp.mouse - w2s(r.center)).length() <= r.radius as f32 * PX
 }
+
+/// Straight arrow with a filled head. `dashed` draws the shaft as dashes (used for the gust).
+pub fn draw_arrow(a: Vec2, b: Vec2, col: Color, th: f32, dashed: bool) {
+    let d = b - a;
+    let len = d.length();
+    if len < 2.0 {
+        return;
+    }
+    let dir = d / len;
+    let n = vec2(-dir.y, dir.x);
+    let head = (len * 0.4).clamp(7.0, 14.0);
+    let base = b - dir * head;
+    if dashed {
+        dashed_line(a, base, col, th);
+    } else {
+        draw_line(a.x, a.y, base.x, base.y, th, col);
+    }
+    draw_triangle(b, base + n * (head * 0.5), base - n * (head * 0.5), col);
+}
+
+/// Small marker for a gust that was applied: a short arrow pointing in the gust direction, anchored at `at`.
+pub fn draw_gust_marker(at: V2, dir_world: V2, col: Color) {
+    let a = w2s(at);
+    let d = vec2(dir_world.x as f32, -(dir_world.y as f32)).normalize_or_zero();
+    draw_circle(a.x, a.y, 5.0, col);
+    draw_arrow(a, a + d * 26.0, col, 3.0, false);
+}

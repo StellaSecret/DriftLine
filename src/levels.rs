@@ -58,6 +58,14 @@ fn square_up(_p: V2, t: f64) -> V2 {
     v2(0.0, (4.0 * (TAU * t / T12).sin()).tanh())
 }
 
+// Leverage field for Steer level 2: a rightward stream whose vertical divergence is strong around
+// x = 0 (a small sideways offset entering that zone is amplified) and mildly convergent beyond it.
+fn lever_field(p: V2, _t: f64) -> V2 {
+    let dz = (-(p.x / 1.5).powi(2)).exp();
+    let k = 1.3 * dz - 0.35 * (1.0 - dz) * (p.x > 0.0) as i32 as f64;
+    v2(1.4, k * p.y)
+}
+
 pub fn position_levels() -> Vec<Level> {
     vec![
         hints(base("pos-1", Chapter::Position, "Open Water", "Drop the probe anywhere in the zone so it reaches the target.",
@@ -172,6 +180,40 @@ pub fn experiment_levels() -> Vec<Level> {
     ]
 }
 
+fn steer(start: V2, beats: usize, budget: usize, strength: f64, goal: usize) -> Rules {
+    Rules::Steer { start, beats, gust_budget: budget, gust_strength: strength, dirs: GustDirs::Eight, beat_time: 1.0, goal }
+}
+
+pub fn steer_levels() -> Vec<Level> {
+    vec![
+        hints(base("ste-1", Chapter::Steer, "First Gust", "Nudge the probe so it reaches the target. A gust changes its velocity for one beat.",
+            Field::new().fixed(uni(1.6, 0.05)),
+            vec![Region::target(2.9, 0.1, 0.5)],
+            steer(v2(-5.0, -0.9), 5, 1, 1.0, 0)),
+            &["Left alone, the probe drifts past just below the target.", "A gust adds to the velocity for one beat only. The field carries the probe on afterwards."]),
+        hints(base("ste-2", Chapter::Steer, "Leverage", "The same gust matters more in some places than others. Find where.",
+            Field::new().fixed(Term::Custom(lever_field)),
+            vec![Region::target(3.2, -1.6, 0.5)],
+            steer(v2(-5.0, 0.15), 6, 2, 0.35, 0)),
+            &["Watch how the arrows spread apart around the middle of the field: offsets grow there.", "A small push before the spreading zone is magnified. The same push afterwards is not."]),
+        hints(base("ste-3", Chapter::Steer, "Tipping Point", "A saddle splits the flow. Cross to the other side in time.",
+            Field::new().fixed(uni(1.6, 0.0)).fixed(Term::Saddle { c: v2(-0.7, 0.0), k: 0.27 }),
+            vec![Region::target(2.62, -1.41, 0.7)],
+            steer(v2(-5.0, 0.3), 6, 1, 1.0, 0)),
+            &["Above the centre line the flow is thrown up, below it down. The probe starts just above it.", "The dividing line is close now. Every beat the probe drifts further from it."]),
+        hints(base("ste-4", Chapter::Steer, "The Long Way", "The flow circles the centre. Pushing straight at the target will not get you there.",
+            Field::new().fixed(vortex(0.0, 0.0, 8.5, 0.8)).fixed(radial(0.0, 0.0, -0.45, 0.8)),
+            vec![Region::target(3.3, 0.3, 0.5)],
+            steer(v2(-2.1, 0.0), 7, 2, 1.0, 0)),
+            &["The flow carries the probe around the centre, anticlockwise, and slowly inward.", "The target is on a wider orbit than the probe. Which way does the probe need to move to join it?"]),
+        hints(base("ste-5", Chapter::Steer, "Set Up", "The first gust is for the second one. The target is small.",
+            Field::new().fixed(uni(0.65, 0.0)).fixed(vortex(-1.9, 0.43, 1.41, 0.7)).fixed(vortex(-0.06, 0.6, -1.21, 0.7)).fixed(radial(1.71, -0.27, 1.37, 0.7)),
+            vec![Region::target(0.82, 1.79, 0.3)],
+            steer(v2(-5.0, 0.94), 8, 2, 1.0, 0)),
+            &["A good first move changes what the second move can do. It may not look like progress.", "Do not just close the distance. Look for the flow that will do the work for you."]),
+    ]
+}
+
 pub fn combo_levels() -> Vec<Level> {
     let w = TAU / T12;
     vec![
@@ -211,6 +253,7 @@ pub fn all() -> Vec<Level> {
     v.extend(predict_levels());
     v.extend(tempo_levels());
     v.extend(experiment_levels());
+    v.extend(steer_levels());
     v.extend(combo_levels());
     v
 }

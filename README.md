@@ -9,8 +9,9 @@ A 2D puzzle game about steering a probe through a vector field, written in Rust
 | **Predict** | Where will it go? | a committed forecast of the exit | mentally extrapolating flow |
 | **Tempo** | When should I launch? | the launch phase of a changing field | reasoning about time-dependent geometry |
 | **Experiment** | How does the system behave? | a parameter, then a *conclusion* | discovering a rule by controlled tests |
+| **Steer** | What should I do next? | a gust (or nothing) every beat, with feedback | closed-loop control: planning from observed state |
 
-20 fundamental levels (5 per mechanic) and 6 combination levels. See [DESIGN.md](DESIGN.md) for the per-mechanic
+25 fundamental levels (5 per mechanic) and 6 combination levels. See [DESIGN.md](DESIGN.md) for the per-mechanic
 design, and how the "these are really different" requirement is checked by automated tests.
 
 ## Run
@@ -19,9 +20,10 @@ design, and how the "these are really different" requirement is checked by autom
 cargo run --release            # desktop game
 cargo test --release           # simulation, level and mechanic validation
 cargo run --release --bin report [-- --detail]   # per-level validation numbers
+cargo run --release --bin report -- --steer      # Steer validation report (see STEER_VALIDATION.md)
 ```
 
-Controls: mouse; Space/Enter launch or confirm; arrow keys nudge; `H` hint; `R` retry/reset; `V` replay;
+Controls: mouse; Space/Enter launch or confirm; in Steer, Q W E / A S D / Z X C pick a gust direction (S = wait) or use the arrow keys; arrow keys nudge; `H` hint; `R` retry/reset; `V` replay;
 `G` arrow-grid density; `K` high-contrast arrows; `U` unlock all levels; `Esc` back.
 Progress is saved to `vfield_progress.txt` (desktop only).
 
@@ -30,7 +32,7 @@ Progress is saved to `vfield_progress.txt` (desktop only).
 ```
 src/field.rs        field model v(x, y, t; theta)      src/sim.rs      RK4 engine, regions, outcomes
 src/level.rs        level data types                   src/levels.rs   all content, as data
-src/modes/          the four gameplay modes (no UI)    src/validate.rs automated mechanic checks
+src/modes/          the five gameplay modes (no UI)    src/validate.rs automated mechanic checks
 src/app.rs, render.rs, ui.rs, main.rs  macroquad front end        tests/mechanics.rs  validation suite
 ```
 

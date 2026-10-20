@@ -133,10 +133,16 @@ impl Trajectory {
 }
 
 pub fn rk4_step(field: &Field, p: V2, t: f64, dt: f64) -> V2 {
-    let k1 = field.eval(p, t);
-    let k2 = field.eval(p + k1 * (dt * 0.5), t + dt * 0.5);
-    let k3 = field.eval(p + k2 * (dt * 0.5), t + dt * 0.5);
-    let k4 = field.eval(p + k3 * dt, t + dt);
+    rk4_step_u(field, p, t, dt, V2::ZERO)
+}
+
+/// RK4 for dp/dt = v(p, t) + u with a constant extra velocity `u` (a gust).
+/// With `u = 0` this is bit-identical to the plain field step (adding 0.0 is exact).
+pub fn rk4_step_u(field: &Field, p: V2, t: f64, dt: f64, u: V2) -> V2 {
+    let k1 = field.eval(p, t) + u;
+    let k2 = field.eval(p + k1 * (dt * 0.5), t + dt * 0.5) + u;
+    let k3 = field.eval(p + k2 * (dt * 0.5), t + dt * 0.5) + u;
+    let k4 = field.eval(p + k3 * dt, t + dt) + u;
     p + (k1 + k2 * 2.0 + k3 * 2.0 + k4) * (dt / 6.0)
 }
 
@@ -146,6 +152,61 @@ pub fn seg_point(a: V2, b: V2, c: V2) -> (f64, f64) {
     let l2 = ab.dot(ab);
     let u = if l2 < 1e-18 { 0.0 } else { ((c - a).dot(ab) / l2).clamp(0.0, 1.0) };
     ((a + ab * u).dist(c), u)
+}
+
+/// Result of one integration sub-step.
+pub struct SubStep {
+    /// New position, or `None` if the state was numerically invalid.
+    pub q: Option<V2>,
+    /// Speed at the start of the sub-step (used for stall detection).
+    pub speed: f64,
+    /// Terminal outcome reached during this sub-step, if any.
+    pub outcome: Option<Outcome>,
+}
+
+/// One RK4 sub-step plus all region / gate / bounds / validity checks. Shared by `simulate`
+/// (whole trajectories) and `advance_beat` (turn-based Steer) so both use identical physics.
+///
+/// Contact detection tests the *whole segment* p->q against each region, so a probe cannot
+/// tunnel through a target between two sampled positions. The segment is the chord of the RK4
+/// step; its deviation from the true path is O(dt^2 * curvature), far below any target radius.
+#[allow(clippy::too_many_arguments)]
+pub fn substep(field: &Field, p: V2, t: f64, dt: f64, u: V2, regions: &[Region], cfg: &SimConfig, gates: &mut Vec<usize>) -> SubStep {
+    let v = field.eval(p, t) + u;
+    if !v.is_finite() || v.len() > cfg.max_speed {
+        return SubStep { q: None, speed: f64::NAN, outcome: Some(Outcome::Invalid) };
+    }
+    let q = rk4_step_u(field, p, t, dt, u);
+    if !q.is_finite() {
+        return SubStep { q: None, speed: v.len(), outcome: Some(Outcome::Invalid) };
+    }
+    let mut terminal: Option<(f64, usize)> = None;
+    for (idx, r) in regions.iter().enumerate() {
+        if r.kind == RegionKind::Gate {
+            continue;
+        }
+        let (d, w) = seg_point(p, q, r.center);
+        if d <= r.radius && terminal.is_none_or(|(bu, _)| w < bu) {
+            terminal = Some((w, idx));
+        }
+    }
+    for (idx, r) in regions.iter().enumerate() {
+        if r.kind != RegionKind::Gate || gates.contains(&idx) {
+            continue;
+        }
+        let (d, w) = seg_point(p, q, r.center);
+        if d <= r.radius && terminal.is_none_or(|(bu, _)| w <= bu) {
+            gates.push(idx);
+        }
+    }
+    let outcome = if let Some((_, idx)) = terminal {
+        Some(if regions[idx].kind == RegionKind::Hazard { Outcome::Hazard(idx) } else { Outcome::Reached(idx) })
+    } else if !cfg.bounds.contains(q) {
+        Some(Outcome::Boundary)
+    } else {
+        None
+    };
+    SubStep { q: Some(q), speed: v.len(), outcome }
 }
 
 /// Integrate a probe released at `start` when the field clock reads `t0`.
@@ -160,46 +221,17 @@ pub fn simulate(field: &Field, start: V2, t0: f64, regions: &[Region], cfg: &Sim
     let mut outcome = Outcome::Timeout;
     for i in 0..steps {
         let t = t0 + i as f64 * cfg.dt;
-        let v = field.eval(p, t);
-        if !v.is_finite() || v.len() > cfg.max_speed {
+        let s = substep(field, p, t, cfg.dt, V2::ZERO, regions, cfg, &mut gates);
+        let Some(q) = s.q else {
             outcome = Outcome::Invalid;
             break;
-        }
-        let q = rk4_step(field, p, t, cfg.dt);
-        if !q.is_finite() {
-            outcome = Outcome::Invalid;
-            break;
-        }
-        // Region tests use the whole step segment so fast probes cannot tunnel.
-        let mut terminal: Option<(f64, usize)> = None;
-        for (idx, r) in regions.iter().enumerate() {
-            if r.kind == RegionKind::Gate {
-                continue;
-            }
-            let (d, u) = seg_point(p, q, r.center);
-            if d <= r.radius && terminal.is_none_or(|(bu, _)| u < bu) {
-                terminal = Some((u, idx));
-            }
-        }
-        for (idx, r) in regions.iter().enumerate() {
-            if r.kind != RegionKind::Gate || gates.contains(&idx) {
-                continue;
-            }
-            let (d, u) = seg_point(p, q, r.center);
-            if d <= r.radius && terminal.is_none_or(|(bu, _)| u <= bu) {
-                gates.push(idx);
-            }
-        }
+        };
         pts.push(q);
-        if let Some((_, idx)) = terminal {
-            outcome = if regions[idx].kind == RegionKind::Hazard { Outcome::Hazard(idx) } else { Outcome::Reached(idx) };
+        if let Some(o) = s.outcome {
+            outcome = o;
             break;
         }
-        if !cfg.bounds.contains(q) {
-            outcome = Outcome::Boundary;
-            break;
-        }
-        if v.len() < cfg.stall_speed {
+        if s.speed < cfg.stall_speed {
             slow += 1;
             if slow > slow_limit {
                 outcome = Outcome::Stalled;
@@ -211,6 +243,29 @@ pub fn simulate(field: &Field, start: V2, t0: f64, regions: &[Region], cfg: &Sim
         p = q;
     }
     Trajectory { points: pts, dt: cfg.dt, t0, outcome, gates }
+}
+
+/// Advance one *beat*: a fixed interval `beat_time` during which the constant gust `u` is added
+/// to the field. Returns the sub-step positions (excluding the start), and the terminal outcome
+/// if the probe reached a region, left the bounds, or became numerically invalid mid-beat.
+/// The gust only exists inside this call; nothing persists to the next beat.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_beat(field: &Field, start: V2, t0: f64, u: V2, beat_time: f64, regions: &[Region], cfg: &SimConfig, gates: &mut Vec<usize>) -> (Vec<V2>, Option<Outcome>) {
+    let n = (beat_time / cfg.dt).round().max(1.0) as usize;
+    let mut p = start;
+    let mut pts = Vec::with_capacity(n);
+    for i in 0..n {
+        let s = substep(field, p, t0 + i as f64 * cfg.dt, cfg.dt, u, regions, cfg, gates);
+        let Some(q) = s.q else {
+            return (pts, Some(Outcome::Invalid));
+        };
+        pts.push(q);
+        if let Some(o) = s.outcome {
+            return (pts, Some(o));
+        }
+        p = q;
+    }
+    (pts, None)
 }
 
 #[cfg(test)]

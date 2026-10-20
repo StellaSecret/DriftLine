@@ -70,11 +70,15 @@ jobs:
         run: cargo test --workspace --release --locked
       - name: Mechanic validation report
         run: cargo run --release --locked --bin report | tee validation-report.txt
+      - name: Steer validation report
+        run: cargo run --release --locked --bin report -- --steer | tee steer-validation.md
       - name: Upload validation report
         uses: actions/upload-artifact@v7
         with:
           name: validation-report
-          path: validation-report.txt
+          path: |
+            validation-report.txt
+            steer-validation.md
           retention-days: 7
       - name: Check WASM build
         run: cargo check --locked --target wasm32-unknown-unknown --bin vfield

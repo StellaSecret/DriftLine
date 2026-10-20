@@ -8,16 +8,18 @@ pub enum Chapter {
     Predict,
     Tempo,
     Experiment,
+    Steer,
     Combo,
 }
 impl Chapter {
-    pub const ALL: [Chapter; 5] = [Chapter::Position, Chapter::Predict, Chapter::Tempo, Chapter::Experiment, Chapter::Combo];
+    pub const ALL: [Chapter; 6] = [Chapter::Position, Chapter::Predict, Chapter::Tempo, Chapter::Experiment, Chapter::Steer, Chapter::Combo];
     pub fn name(self) -> &'static str {
         match self {
             Chapter::Position => "Position",
             Chapter::Predict => "Predict",
             Chapter::Tempo => "Tempo",
             Chapter::Experiment => "Experiment",
+            Chapter::Steer => "Steer",
             Chapter::Combo => "Combinations",
         }
     }
@@ -27,7 +29,41 @@ impl Chapter {
             Chapter::Predict => "Where will it go?",
             Chapter::Tempo => "When should I launch?",
             Chapter::Experiment => "How does the system behave?",
+            Chapter::Steer => "What should I do next?",
             Chapter::Combo => "Mix what you have learned.",
+        }
+    }
+}
+
+/// Permitted gust directions. Index 0 is East and indices run counter-clockwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GustDirs {
+    /// E, N, W, S
+    Four,
+    /// E, NE, N, NW, W, SW, S, SE
+    Eight,
+}
+impl GustDirs {
+    pub fn count(self) -> usize {
+        match self {
+            GustDirs::Four => 4,
+            GustDirs::Eight => 8,
+        }
+    }
+    /// Unit vector of direction `i` (exact for the cardinal directions).
+    pub fn unit(self, i: usize) -> V2 {
+        const S: f64 = std::f64::consts::FRAC_1_SQRT_2;
+        const T: [V2; 8] = [v2(1.0, 0.0), v2(S, S), v2(0.0, 1.0), v2(-S, S), v2(-1.0, 0.0), v2(-S, -S), v2(0.0, -1.0), v2(S, -S)];
+        match self {
+            GustDirs::Eight => T[i % 8],
+            GustDirs::Four => T[(i % 4) * 2],
+        }
+    }
+    pub fn name(self, i: usize) -> &'static str {
+        const N: [&str; 8] = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"];
+        match self {
+            GustDirs::Eight => N[i % 8],
+            GustDirs::Four => N[(i % 4) * 2],
         }
     }
 }
@@ -121,6 +157,9 @@ pub enum Rules {
     Position { slots: Vec<Slot>, period: Option<f64>, intensity: Option<(f64, f64)> },
     /// Commit to a forecast of the exit; `rounds` rounds, `pass` correct needed.
     Predict { zone: Zone, rounds: usize, pass: usize, reveal: Reveal },
+    /// Turn-based control: after every beat the player picks a gust (or waits). The field, start and
+    /// target are fixed and fully visible; a gust adds `gust_strength` to the velocity for one beat.
+    Steer { start: V2, beats: usize, gust_budget: usize, gust_strength: f64, dirs: GustDirs, beat_time: f64, goal: usize },
     /// Choose the launch phase of a periodic field.
     Tempo { start: V2, period: f64, goal: usize },
     /// Probe the intensity knob, then report the rule you found.
