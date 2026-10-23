@@ -1,5 +1,7 @@
 # Design and validation
 
+> For the precise, per-mechanic rules see [`docs/README.md`](docs/README.md). This file is the design rationale.
+
 ## Architecture
 
 `field` (what the flow is) -> `sim` (deterministic RK4, region detection) -> `level` / `levels` (data) ->

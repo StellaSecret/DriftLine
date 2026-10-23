@@ -1,5 +1,6 @@
 //! Vector-field puzzle game core. Nothing in this crate touches rendering or UI,
 //! so every module (and every gameplay mode) can be tested headlessly.
+pub mod catalog;
 pub mod field;
 pub mod level;
 pub mod levels;

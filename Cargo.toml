@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "report"
 path = "src/bin/report.rs"
 
+[[bin]]
+name = "catalog"
+path = "src/bin/catalog.rs"
+
 [dependencies]
 # Cargo.lock pins macroquad 0.4.13 / fontdue 0.9.2 (older toolchains); CI builds with --locked.
 # default-features = false drops audio: no ALSA, and the web build needs only miniquad's gl.js.

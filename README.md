@@ -27,6 +27,10 @@ Controls: mouse; Space/Enter launch or confirm; in Steer, Q W E / A S D / Z X C 
 `G` arrow-grid density; `K` high-contrast arrows; `U` unlock all levels; `Esc` back.
 Progress is saved to `vfield_progress.txt` (desktop only).
 
+## Documentation
+
+[`docs/`](docs/README.md) is a precise, code-derived reference for each mechanic (Position, Predict, Tempo, Experiment, Steer): information, controls, state machine, exact rules, feedback, level properties, known weaknesses and the tests that pin them. `docs/LEVEL_CATALOG.md` is generated from the level data (`cargo run --release --bin catalog > docs/LEVEL_CATALOG.md`) and a test fails if it is stale.
+
 ## Layout
 
 ```

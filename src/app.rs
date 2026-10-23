@@ -434,7 +434,12 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
         Game::Steer(g) => g.phase != Phase::Advancing && g.replayable().is_some() && s.st.replay.is_none(),
         _ => s.st.anim.is_some(),
     };
-    if ui::button(inp, Rect::new(PX0, 742.0, 116.0, 34.0), "Replay (V)", can_replay, acc) || (is_key_pressed(KeyCode::V) && can_replay) {
+    let replay_running = matches!(s.game, Game::Steer(_)) && s.st.replay.is_some();
+    let vkey = replay_key(replay_running, can_replay, is_key_pressed(KeyCode::V));
+    if vkey == ReplayKey::Stop {
+        s.st.replay = None;
+    }
+    if ui::button(inp, Rect::new(PX0, 742.0, 116.0, 34.0), "Replay (V)", can_replay, acc) || vkey == ReplayKey::Start {
         if let Game::Steer(g) = &s.game {
             if let Some(run) = g.replayable() {
                 // re-simulate from the recorded actions: a replay must reproduce, not replay stored pixels
@@ -476,6 +481,26 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
         action = Nav::Next;
     }
     action
+}
+
+/// What one press of `V` does. It must do exactly one thing: stop a running Steer replay, or start a
+/// replay, never both in the same frame (a previous version restarted the replay it had just stopped).
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayKey {
+    None,
+    Stop,
+    Start,
+}
+fn replay_key(running: bool, can_start: bool, v_pressed: bool) -> ReplayKey {
+    if !v_pressed {
+        ReplayKey::None
+    } else if running {
+        ReplayKey::Stop
+    } else if can_start {
+        ReplayKey::Start
+    } else {
+        ReplayKey::None
+    }
 }
 
 fn space() -> bool {
@@ -1081,7 +1106,7 @@ fn steer_frame(g: &mut SteerGame, st: &mut St, inp: &Input, prefs: &Prefs, dt: f
             }
         }
     }
-    if replay_done || (st.replay.is_some() && is_key_pressed(KeyCode::V)) {
+    if replay_done {
         st.replay = None;
     }
     let replaying = st.replay.is_some();
@@ -1257,5 +1282,23 @@ fn steer_frame(g: &mut SteerGame, st: &mut St, inp: &Input, prefs: &Prefs, dt: f
         text("Replay running (V: stop)", PX0, y + 62.0, 16.0, c_gust());
     } else if !g.ghosts.is_empty() {
         text(&format!("Faint paths: {} earlier run(s)", g.ghosts.len()), PX0, y + 62.0, 16.0, gray());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_v_press_does_exactly_one_thing() {
+        // running replay: V stops it, and must not also start a new one
+        assert_eq!(replay_key(true, false, true), ReplayKey::Stop);
+        assert_eq!(replay_key(true, true, true), ReplayKey::Stop);
+        // idle with something to replay: V starts it
+        assert_eq!(replay_key(false, true, true), ReplayKey::Start);
+        // nothing to replay, or no key press: nothing happens
+        assert_eq!(replay_key(false, false, true), ReplayKey::None);
+        assert_eq!(replay_key(true, true, false), ReplayKey::None);
+        assert_eq!(replay_key(false, true, false), ReplayKey::None);
     }
 }
