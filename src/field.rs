@@ -82,6 +82,11 @@ pub enum Term {
     Modulated { inner: Box<Term>, offset: f64, amp: f64, omega: f64, phase: f64 },
     /// Travelling shear wave: dir * amp * sin(wave . p - omega t).
     Wave { dir: V2, amp: f64, wave: V2, omega: f64 },
+    /// A *local* radial push: v = k d exp(-|d|^2 / (2 sigma^2)). It peaks at |d| = sigma with speed
+    /// k sigma e^(-1/2); it is still 45% of that at 2 sigma and 5.5% at 3 sigma, and below 0.25% from
+    /// 4 sigma. Unlike `Radial` (a 1/r tail that is felt everywhere) it can only be detected by passing
+    /// close. k > 0 repels, k < 0 attracts.
+    Gauss { c: V2, k: f64, sigma: f64 },
     /// Escape hatch for any other function.
     Custom(fn(V2, f64) -> V2),
 }
@@ -118,6 +123,10 @@ impl Term {
                 inner.eval(p, t) * (offset + amp * (omega * t + phase).sin())
             }
             Term::Wave { dir, amp, wave, omega } => *dir * (amp * (wave.dot(p) - omega * t).sin()),
+            Term::Gauss { c, k, sigma } => {
+                let d = p - *c;
+                d * (k * (-d.dot(d) / (2.0 * sigma * sigma)).exp())
+            }
             Term::Custom(f) => f(p, t),
         }
     }

@@ -9,10 +9,11 @@ pub enum Chapter {
     Tempo,
     Experiment,
     Steer,
+    Survey,
     Combo,
 }
 impl Chapter {
-    pub const ALL: [Chapter; 6] = [Chapter::Position, Chapter::Predict, Chapter::Tempo, Chapter::Experiment, Chapter::Steer, Chapter::Combo];
+    pub const ALL: [Chapter; 7] = [Chapter::Position, Chapter::Predict, Chapter::Tempo, Chapter::Experiment, Chapter::Steer, Chapter::Survey, Chapter::Combo];
     pub fn name(self) -> &'static str {
         match self {
             Chapter::Position => "Position",
@@ -20,6 +21,7 @@ impl Chapter {
             Chapter::Tempo => "Tempo",
             Chapter::Experiment => "Experiment",
             Chapter::Steer => "Steer",
+            Chapter::Survey => "Survey",
             Chapter::Combo => "Combinations",
         }
     }
@@ -30,6 +32,7 @@ impl Chapter {
             Chapter::Tempo => "When should I launch?",
             Chapter::Experiment => "How does the system behave?",
             Chapter::Steer => "What should I do next?",
+            Chapter::Survey => "Where is the hidden source?",
             Chapter::Combo => "Mix what you have learned.",
         }
     }
@@ -160,6 +163,15 @@ pub enum Rules {
     /// Turn-based control: after every beat the player picks a gust (or waits). The field, start and
     /// target are fixed and fully visible; a gust adds `gust_strength` to the velocity for one beat.
     Steer { start: V2, beats: usize, gust_budget: usize, gust_strength: f64, dirs: GustDirs, beat_time: f64, goal: usize },
+    /// Hidden-source survey. `Level::field` is the *charted* background. A hidden local repeller
+    /// (`Term::Gauss`, known strength `k` and width `sigma`) adds to it at one position, drawn from
+    /// `pool` (a different one each attempt). One scout is flown for free from `free`; the player
+    /// places up to `scouts` more inside `zone` (each leaves a `Level::max_time`-second trail), then
+    /// commits one estimate of the source position, correct within `tol`.
+    /// `rays`: draw each push arrow as a long faint line back toward the source, so where they cross can be read
+    /// off directly. On in the teaching level; later levels turn it off and the player must extend the arrows
+    /// by eye.
+    Survey { zone: Zone, free: V2, scouts: usize, k: f64, sigma: f64, tol: f64, rays: bool, pool: Vec<V2> },
     /// Choose the launch phase of a periodic field.
     Tempo { start: V2, period: f64, goal: usize },
     /// Probe the intensity knob, then report the rule you found.

@@ -220,6 +220,70 @@ pub fn draw_zone(z: &Zone) {
     }
 }
 
+/// Dashed outline of a rectangular zone with no fill, for zones that cover most of the field
+/// (a filled zone would tint every arrow underneath it).
+pub fn draw_zone_frame(z: &Zone) {
+    let col = alpha(gray_line(), 0.8);
+    match z {
+        Zone::Rect(r) => {
+            let (a, b) = (w2s(r.min), w2s(r.max));
+            let (x0, y0, x1, y1) = (a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y));
+            dashed_line(vec2(x0, y0), vec2(x1, y0), col, 2.0);
+            dashed_line(vec2(x1, y0), vec2(x1, y1), col, 2.0);
+            dashed_line(vec2(x1, y1), vec2(x0, y1), col, 2.0);
+            dashed_line(vec2(x0, y1), vec2(x0, y0), col, 2.0);
+        }
+        Zone::Circle(..) => draw_zone(z),
+    }
+}
+fn gray_line() -> Color {
+    rgb(150, 158, 178)
+}
+
+/// Small triangles along a path pointing the way it travels, one per `every` world units of *distance*.
+/// They are spaced by arc length, not by time, so they show direction without leaking speed.
+pub fn draw_chevrons(points: &[V2], col: Color, every: f64) {
+    let (mut acc, mut next) = (0.0, every * 0.5);
+    for w in points.windows(2) {
+        let seg = w[0].dist(w[1]);
+        if seg < 1e-9 {
+            continue;
+        }
+        while acc + seg >= next {
+            let f = (next - acc) / seg;
+            let p = V2 { x: w[0].x + (w[1].x - w[0].x) * f, y: w[0].y + (w[1].y - w[0].y) * f };
+            let s = w2s(p);
+            let dir = vec2((w[1].x - w[0].x) as f32, -(w[1].y - w[0].y) as f32).normalize_or_zero();
+            let perp = vec2(-dir.y, dir.x);
+            draw_triangle(s + dir * 7.0, s - dir * 5.0 + perp * 5.0, s - dir * 5.0 - perp * 5.0, col);
+            next += every;
+        }
+        acc += seg;
+    }
+}
+
+/// The player's estimate: a diamond with a cross, ringed by the commit tolerance (what counts as found).
+pub fn draw_estimate(p: V2, tol: f64, col: Color) {
+    let s = w2s(p);
+    draw_circle_lines(s.x, s.y, tol as f32 * PX, 2.0, alpha(col, 0.55));
+    draw_poly(s.x, s.y, 4, 12.0, 0.0, rgb(14, 16, 22));
+    draw_poly_lines(s.x, s.y, 4, 12.0, 0.0, 3.0, col);
+    draw_line(s.x - 5.0, s.y, s.x + 5.0, s.y, 2.0, col);
+    draw_line(s.x, s.y - 5.0, s.x, s.y + 5.0, 2.0, col);
+}
+
+/// The revealed hidden source: a disc with eight outward rays (it repels), ringed at its width sigma.
+pub fn draw_source(p: V2, sigma: f64) {
+    let (s, col) = (w2s(p), c_hazard());
+    draw_circle_lines(s.x, s.y, sigma as f32 * PX, 2.0, alpha(col, 0.5));
+    for k in 0..8 {
+        let a = k as f32 / 8.0 * std::f32::consts::TAU;
+        draw_line(s.x + 11.0 * a.cos(), s.y + 11.0 * a.sin(), s.x + 21.0 * a.cos(), s.y + 21.0 * a.sin(), 3.0, col);
+    }
+    draw_circle(s.x, s.y, 9.0, BLACK);
+    draw_circle(s.x, s.y, 7.0, col);
+}
+
 /// Shorthand to check a click on an exit circle.
 pub fn hit_region(inp: &Input, r: &Region) -> bool {
     in_area(inp.mouse) && (inp.mouse - w2s(r.center)).length() <= r.radius as f32 * PX

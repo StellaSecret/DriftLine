@@ -79,6 +79,35 @@ For levels 2 to 5 the greedy bearing policy, the one-beat greedy lookahead and *
 - All five levels use 8 directions. 4-direction mode is implemented and tested but no level uses it.
 - The abstractions `Knobs` and `Visibility` named in the brief do not exist in this codebase. Steer uses none of the release / intensity / phase controls and needs no visibility switch because everything is visible.
 
+### Survey - "Where is the hidden source?" (prototype)
+- **Information:** the charted background field (visible arrows), the zone, and every scout's finished 5 s trail with direction chevrons. The hidden source's position, and what it does to the field, are never shown before the commit.
+- **Decisions:** where to release each of a limited number of scouts (one more is free), then where to put one estimate marker.
+- **Loop:** observe -> place a scout -> read its trail -> place the next scout where the remaining explanations disagree -> commit one estimate -> reveal. A retry moves the source to a different authored position.
+- **Success:** the committed marker is within 0.75 of the source.
+- **Skill:** choosing which observation is most informative under a budget, i.e. inferring a hidden structure from sparse evidence.
+- **Different because:** a scout's own outcome is irrelevant; it is an instrument. Experiment's runs are unlimited and test a *known* system for a relationship; here observations are limited and the unknown is a *structure*. By the check in `docs/08-comparison.md` it is only borderline (same lever as Position, same timing and observations as Experiment), so this is the least-proven mechanic: its evidence is an ideal solver, not players.
+
+**The source** is `Term::Gauss`, a *local* repeller (`v = k d exp(-|d|^2/(2 sigma^2))`). The first design used `Term::Radial`, whose 1/r tail bends every scout wherever it is; a single free trail then settled 99.5% of sources, so there was nothing to decide. A local source can only be found by passing near it, which is what makes *where* to look matter.
+
+**State machine** (`modes/survey.rs`). `Scouting -> Committed -> retry -> Scouting`. `retry` is refused until the commit, because abandoning a round would refund its scouts. `SurveySpec::fly` is the only function that sees the hidden position; the interface reads it only through `Round::revealed_source`, which is `None` before the commit.
+
+**Validation** (`SURVEY_VALIDATION.md`, `cargo run --release --bin report -- --survey`; model in `validate_survey.rs`). The source is one of 221 candidates on a 0.5 grid; a scout's trail under each candidate is compared with what was seen, at two precisions (`0.15`: a careful player could see it; `0.4`: what mental inference can use). A level is *solvable* iff an oracle that knows the truth finds some combination of scouts that works (exhaustive, hard requirement); *non-trivial* is judged over many random sources and against baselines (fixed pattern, random scouts, an adaptive player that picks each scout to split the remaining candidates). The adaptive player is also run through the real `SurveyGame` and must agree with the model. A test checks the validator can say no (a source with no effect is rejected).
+
+| Result (300 random continuous sources, 2 paid scouts) | coarse | fine |
+|---|---|---|
+| free scout alone | 39% | 57% |
+| fixed pattern of 2 scouts | 75% | 92% |
+| random scouts | 64% | 83% |
+| adaptive, 1 scout / 2 scouts | 73% / 81% | 89% / 96% |
+| unsolvable by any 2 scouts | 1% | 1% |
+
+**Known limitations.**
+- No human has played it. The question that decides whether Survey is a fundamental mechanic is whether players pick scouts to tell two explanations apart, not whether they find the source.
+- The lead over a sensible fixed pattern is small (+6 points coarse, +4 fine); over random scouts it is +17 and +13. With 3 scouts the lead over the fixed pattern is +9 and +3.
+- For ideal play 5 of the 6 authored positions need only one paid scout; the second matters for imperfect play (73% -> 81%).
+- Difficulty is mostly whether the free trail (which only reaches x = 0) passes near the source. The two-scout positions all lie in one patch the free scout never sees.
+- The validator's candidate grid is its own device; the game is continuous. Strength and width of the source are known; the estimate is a single point.
+
 ## Combinations
 | Level | Combines | Why it exists |
 |---|---|---|

@@ -94,6 +94,7 @@ pub fn solvable(level: &Level) -> bool {
         Rules::Tempo { .. } => tempo_success_by_phase(level, 240).iter().any(|b| *b),
         Rules::Experiment { .. } => experiment::truth(level).is_some(),
         Rules::Steer { .. } => crate::validate_steer::enumerate(&crate::modes::SteerSpec::from_level(level)).successes > 0,
+        Rules::Survey { .. } => crate::validate_survey::solvable(level),
     }
 }
 
@@ -150,6 +151,7 @@ pub fn summarize(level: &Level) -> String {
             let c = crate::validate_steer::check(level);
             format!("{} runs, {} solutions, min gusts {:?}, no-gust wins {}, greedy bearing/lookahead win {}/{}", c.runs, c.successes, c.min_gusts, c.no_gust_success, c.greedy_bearing, c.greedy_lookahead)
         }
+        Rules::Survey { .. } => crate::validate_survey::summarize(level),
     }
 }
 

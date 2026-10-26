@@ -66,6 +66,24 @@ fn lever_field(p: V2, _t: f64) -> V2 {
     v2(1.4, k * p.y)
 }
 
+// Survey tuning (see docs/09-survey.md and SURVEY_VALIDATION.md for how these were chosen).
+const SURVEY_K: f64 = 1.6;
+const SURVEY_SIGMA: f64 = 1.0;
+/// How close the committed marker must be to count as found. 0.5 was the first guess and was never calibrated;
+/// in play, six consecutive misses landed at 0.52, 0.55, 0.61, 0.66, 0.90 and 1.05 (people located the region but
+/// not to 0.5). 1.0 (= sigma) was tried and rejected: the free scout alone then settles (-2.75, 2.25), which the level
+/// must never allow. 0.75 keeps every authored position valid (see SURVEY_VALIDATION.md) and is the middle ground.
+const SURVEY_TOL: f64 = 0.75;
+/// Seconds of trail a scout leaves.
+const SURVEY_TRAIL: f64 = 5.0;
+/// Authored hidden positions (off the validator's 0.5 candidate grid on purpose), **in the order a player meets them**:
+/// easy to hard, by how much the free trail already narrows the search (candidates left after it, from
+/// `SURVEY_VALIDATION.md`: 27, 29, 105, 113, 130, 130). The last, (2.25, 2.25), sits in the patch where the free trail
+/// sees nothing and even the adaptive player needs both scouts, so it comes last. A test keeps this order honest.
+/// Chosen from positions that `validate_survey` accepts (solvable at both precisions, still ambiguous after the
+/// free scout, adaptive play wins).
+const SURVEY_POOL: [(f64, f64); 6] = [(-3.25, -2.25), (-2.75, 2.25), (-0.75, -2.25), (-0.25, 2.25), (3.25, -1.75), (2.25, 2.25)];
+
 pub fn position_levels() -> Vec<Level> {
     vec![
         hints(base("pos-1", Chapter::Position, "Open Water", "Drop the probe anywhere in the zone so it reaches the target.",
@@ -214,6 +232,21 @@ pub fn steer_levels() -> Vec<Level> {
     ]
 }
 
+pub fn survey_levels() -> Vec<Level> {
+    // Charted background: a steady stream to the right. The hidden source is not part of `field`.
+    let mut l = base("sur-1", Chapter::Survey, "Something in the Stream",
+        "Something hidden pushes the flow away from itself. Fly scouts, then mark where it is.",
+        Field::new().fixed(uni(1.0, 0.0)),
+        vec![],
+        Rules::Survey { zone: zr(-5.5, -3.5, 5.5, 3.5), free: v2(-5.0, 0.0), scouts: 2, k: SURVEY_K, sigma: SURVEY_SIGMA, tol: SURVEY_TOL, rays: true, pool: SURVEY_POOL.iter().map(|&(x, y)| v2(x, y)).collect() });
+    l.max_time = SURVEY_TRAIL;
+    vec![hints(l, &[
+        "The arrows show the flow as charted. Where a scout does something the arrows do not predict, the hidden source is acting on it.",
+        "A scout that passes far from the source learns almost nothing: its trail only speaks for the places it went near.",
+        "Two guesses for the source send a scout in different directions only from certain places. Put the next scout where they disagree.",
+    ])]
+}
+
 pub fn combo_levels() -> Vec<Level> {
     let w = TAU / T12;
     vec![
@@ -254,6 +287,7 @@ pub fn all() -> Vec<Level> {
     v.extend(tempo_levels());
     v.extend(experiment_levels());
     v.extend(steer_levels());
+    v.extend(survey_levels());
     v.extend(combo_levels());
     v
 }

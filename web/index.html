@@ -17,7 +17,25 @@
   <!-- Relative URLs so the page works under any GitHub Pages base path. -->
   <script src="gl.js"></script>
   <script>
-    load("vfield.wasm").then(function () { document.getElementById("msg").remove(); });
+    // miniquad's load() returns nothing (it is not a promise), so there is no .then to hang the
+    // "Loading..." notice on. gl.js sets the global `wasm_exports` once the module is instantiated and
+    // main() is running; the notice is removed on the first animation frame after that. If that never
+    // happens, the notice says so instead of sitting over the playfield forever.
+    var loadingMsg = document.getElementById("msg");
+    function hideMsg() { if (loadingMsg) { loadingMsg.remove(); loadingMsg = null; } }
+    load("vfield.wasm");
+    var loadWaited = 0;
+    var loadTimer = setInterval(function () {
+      loadWaited += 100;
+      if (typeof wasm_exports !== "undefined" && wasm_exports) {
+        clearInterval(loadTimer);
+        requestAnimationFrame(function () { requestAnimationFrame(hideMsg); });
+      } else if (loadWaited >= 20000 && loadingMsg) {
+        clearInterval(loadTimer);
+        loadingMsg.style.color = "#e07a5f";
+        loadingMsg.textContent = "The game did not start. Check the browser console for details.";
+      }
+    }, 100);
   </script>
 </body>
 </html>

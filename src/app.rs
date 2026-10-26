@@ -71,6 +71,9 @@ struct St {
     exp_i: f64,
     exp_choice: Option<usize>,
     exp_est: [f64; 2],
+    // Survey
+    tool: Tool,
+    cur: V2,
     // Steer
     sel: Option<Action>,
     beat_t: f64,
@@ -85,6 +88,14 @@ impl St {
     }
 }
 
+/// Which thing a click or Space places in a Survey round.
+#[derive(Default, Clone, Copy, PartialEq)]
+enum Tool {
+    #[default]
+    Scout,
+    Marker,
+}
+
 /// Playback of a recorded Steer run (re-simulated from its actions; never touches the live run).
 struct SteerReplay {
     run: SteerRun,
@@ -96,6 +107,7 @@ struct SteerReplay {
 #[allow(clippy::large_enum_variant)]
 enum Game {
     Steer(SteerGame),
+    Survey(SurveyGame),
     Position(PositionGame),
     Predict(PredictGame),
     Tempo(TempoGame),
@@ -105,6 +117,7 @@ impl Game {
     fn level(&self) -> &Level {
         match self {
             Game::Steer(g) => &g.level,
+            Game::Survey(g) => &g.level,
             Game::Position(g) => &g.level,
             Game::Predict(g) => &g.level,
             Game::Tempo(g) => &g.level,
@@ -114,6 +127,7 @@ impl Game {
     fn complete(&self) -> bool {
         match self {
             Game::Steer(g) => g.won,
+            Game::Survey(g) => g.won,
             Game::Position(g) => g.won,
             Game::Predict(g) => g.passed(),
             Game::Tempo(g) => g.won,
@@ -132,6 +146,7 @@ fn make_session(idx: usize, level: Level) -> Session {
     let mut st = St::default();
     let game = match &level.rules {
         Rules::Steer { .. } => Game::Steer(SteerGame::new(level)),
+        Rules::Survey { .. } => Game::Survey(SurveyGame::new(level)),
         Rules::Position { .. } => Game::Position(PositionGame::new(level)),
         Rules::Predict { .. } => Game::Predict(PredictGame::new(level)),
         Rules::Tempo { .. } => Game::Tempo(TempoGame::new(level)),
@@ -239,16 +254,18 @@ impl App {
         text_c("VECTOR FIELD", W / 2.0, 100.0, 64.0, WHITE);
         text_c("Read the flow. Steer the probe.", W / 2.0, 150.0, 26.0, gray());
         let mut next = Screen::Menu;
+        let count = Chapter::ALL.len() as f32;
+        let (gap, cw) = (12.0, (W - 80.0 - 12.0 * (count - 1.0)) / count);
         for (k, c) in Chapter::ALL.iter().enumerate() {
-            let r = Rect::new(40.0 + k as f32 * 202.0, 200.0, 190.0, 300.0);
+            let r = Rect::new(40.0 + k as f32 * (cw + gap), 200.0, cw, 300.0);
             let unlocked = self.chapter_unlocked(*c);
             let ids = self.chapter_levels(*c);
             let n = ids.iter().filter(|i| self.done(**i)).count();
             let hot = r.contains(inp.mouse) && unlocked;
             draw_rectangle(r.x, r.y, r.w, r.h, if hot { rgb(54, 62, 82) } else { rgb(36, 41, 56) });
             draw_rectangle_lines(r.x, r.y, r.w, r.h, 3.0, if unlocked { chapter_color(*c) } else { rgb(70, 74, 86) });
-            text_c(c.name(), r.x + r.w / 2.0, r.y + 40.0, 30.0, if unlocked { WHITE } else { gray() });
-            wrap(c.question(), r.x + 16.0, r.y + 90.0, r.w - 32.0, 22.0, gray());
+            text_c(c.name(), r.x + r.w / 2.0, r.y + 40.0, if count > 6.0 { 26.0 } else { 30.0 }, if unlocked { WHITE } else { gray() });
+            wrap(c.question(), r.x + 14.0, r.y + 90.0, r.w - 28.0, if count > 6.0 { 20.0 } else { 22.0 }, gray());
             text_c(&format!("{}/{} complete", n, ids.len()), r.x + r.w / 2.0, r.y + 250.0, 20.0, WHITE);
             if !unlocked {
                 text_c("Locked", r.x + r.w / 2.0, r.y + 170.0, 22.0, bad_c());
@@ -260,7 +277,7 @@ impl App {
         }
         let lines = [
             "Mouse: click and drag.   Space / Enter: launch or confirm.   H: hint.   R: retry.   V: replay.   Esc: back.",
-            "G: arrow grid density.   K: high-contrast arrows.   U: unlock every level.",
+            "G: arrow grid density.   K: high-contrast arrows.   U: unlock every level.   Survey: S scout, M marker, C commit.",
         ];
         for (i, l) in lines.iter().enumerate() {
             text_c(l, W / 2.0, 570.0 + i as f32 * 28.0, 20.0, gray());
@@ -312,6 +329,7 @@ fn chapter_color(c: Chapter) -> Color {
         Chapter::Tempo => rgb(240, 228, 66),
         Chapter::Experiment => rgb(0, 158, 115),
         Chapter::Steer => rgb(213, 94, 0),
+        Chapter::Survey => rgb(160, 130, 255),
         Chapter::Combo => rgb(230, 159, 0),
     }
 }
@@ -366,6 +384,10 @@ fn do_retry(g: &mut Game, st: &mut St) {
             st.beat_t = 0.0;
             st.replay = None;
         }
+        Game::Survey(g) => {
+            let _ = g.retry();
+            st.tool = Tool::Scout;
+        }
         _ => {}
     }
     st.anim = None;
@@ -379,6 +401,7 @@ fn retry_enabled(g: &Game, st: &St) -> bool {
         Game::Predict(p) => p.finished(),
         Game::Experiment(e) => !e.runs.is_empty(),
         Game::Steer(g) => !g.history.is_empty() && g.phase != Phase::Advancing && st.replay.is_none(),
+        Game::Survey(g) => g.finished(),
         _ => st.anim.is_some() || !st.msg.is_empty(),
     }
 }
@@ -399,6 +422,7 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
     }
     match &mut s.game {
         Game::Steer(g) => steer_frame(g, &mut s.st, inp, prefs, dt),
+        Game::Survey(g) => survey_frame(g, &mut s.st, inp, prefs),
         Game::Position(g) => pos_frame(g, &mut s.st, inp, prefs),
         Game::Predict(g) => predict_frame(g, &mut s.st, inp, prefs),
         Game::Tempo(g) => tempo_frame(g, &mut s.st, inp, prefs, dt),
@@ -413,11 +437,16 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
     let nh = lvl.hints.len();
     if s.st.hints > 0 {
         let k = s.st.hints.min(nh);
-        let h = 16.0 + k as f32 * 44.0;
-        draw_rectangle(r::AX + 8.0, r::AY + r::AH - 8.0 - h, 540.0, h, Color::new(0.05, 0.06, 0.09, 0.88));
-        draw_rectangle_lines(r::AX + 8.0, r::AY + r::AH - 8.0 - h, 540.0, h, 2.0, r::c_gate());
-        for i in 0..k {
-            wrap(&format!("Hint {}: {}", i + 1, lvl.hints[i]), r::AX + 18.0, r::AY + r::AH - 8.0 - h + 28.0 + i as f32 * 44.0, 520.0, 18.0, WHITE);
+        let texts: Vec<String> = (0..k).map(|i| format!("Hint {}: {}", i + 1, lvl.hints[i])).collect();
+        let heights: Vec<f32> = texts.iter().map(|t| ui::wrap_height(t, 520.0, 18.0) + 10.0).collect();
+        let h = 16.0 + heights.iter().sum::<f32>();
+        let top = r::AY + r::AH - 8.0 - h;
+        draw_rectangle(r::AX + 8.0, top, 540.0, h, Color::new(0.05, 0.06, 0.09, 0.88));
+        draw_rectangle_lines(r::AX + 8.0, top, 540.0, h, 2.0, r::c_gate());
+        let mut yy = top + 26.0;
+        for (t, hh) in texts.iter().zip(&heights) {
+            wrap(t, r::AX + 18.0, yy, 520.0, 18.0, WHITE);
+            yy += hh;
         }
     }
     // footer buttons
@@ -432,6 +461,7 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
     }
     let can_replay = match &s.game {
         Game::Steer(g) => g.phase != Phase::Advancing && g.replayable().is_some() && s.st.replay.is_none(),
+        Game::Survey(_) => true,
         _ => s.st.anim.is_some(),
     };
     let replay_running = matches!(s.game, Game::Steer(_)) && s.st.replay.is_some();
@@ -440,15 +470,22 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
         s.st.replay = None;
     }
     if ui::button(inp, Rect::new(PX0, 742.0, 116.0, 34.0), "Replay (V)", can_replay, acc) || vkey == ReplayKey::Start {
-        if let Game::Steer(g) = &s.game {
-            if let Some(run) = g.replayable() {
-                // re-simulate from the recorded actions: a replay must reproduce, not replay stored pixels
-                if let Ok(r) = g.spec.replay(&run.actions()) {
-                    s.st.replay = Some(SteerReplay { run: r, beat: 0, t: 0.0, hold: 0.0 });
+        match &s.game {
+            Game::Steer(g) => {
+                if let Some(run) = g.replayable() {
+                    // re-simulate from the recorded actions: a replay must reproduce, not replay stored pixels
+                    if let Ok(r) = g.spec.replay(&run.actions()) {
+                        s.st.replay = Some(SteerReplay { run: r, beat: 0, t: 0.0, hold: 0.0 });
+                    }
                 }
             }
-        } else if let Some(a) = &mut s.st.anim {
-            a.time = 0.0;
+            // every trail of this round flies again together
+            Game::Survey(g) => s.st.anim = Some(Anim::new(survey_items(g))),
+            _ => {
+                if let Some(a) = &mut s.st.anim {
+                    a.time = 0.0;
+                }
+            }
         }
     }
     let mut action = Nav::None;
@@ -464,6 +501,7 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
         text_c("Level complete", b.x + b.w / 2.0, b.y + 36.0, 40.0, good_c());
         let detail = match &s.game {
             Game::Steer(g) => format!("Gusts used: {} of {}   Attempts: {}", g.run().gusts_used(), g.spec.budget, g.attempts + 1),
+            Game::Survey(g) => format!("Attempts: {}   Scouts used last round: {} of {}", g.attempts(), g.round().paid(), g.spec.budget),
             Game::Position(g) => format!("Launches used: {}", g.attempts.len()),
             Game::Predict(g) => format!("Forecasts correct: {} of {}", g.correct_count(), g.rounds.len()),
             Game::Tempo(g) => format!("Launches used: {}", g.attempts.len()),
@@ -1285,6 +1323,331 @@ fn steer_frame(g: &mut SteerGame, st: &mut St, inp: &Input, prefs: &Prefs, dt: f
     }
 }
 
+// ------------------------------------------------------------------ Survey
+fn survey_color(i: usize, free: bool) -> Color {
+    if free {
+        rgb(210, 210, 210)
+    } else {
+        r::run_color(i.saturating_sub(1))
+    }
+}
+
+fn survey_items(g: &SurveyGame) -> Vec<(Trajectory, Color)> {
+    g.round().scouts.iter().enumerate().map(|(i, sc)| (sc.traj.clone(), survey_color(i, sc.free))).collect()
+}
+
+/// Use the active tool at `p`: fly a scout there, or move the estimate marker.
+fn survey_place(g: &mut SurveyGame, st: &mut St, p: V2) {
+    match st.tool {
+        Tool::Scout => match g.place_scout(p).map(|_| ()) {
+            Ok(()) => {
+                let i = g.round().scouts.len() - 1;
+                st.anim = Some(Anim::new(vec![(g.round().scouts[i].traj.clone(), survey_color(i, false))]));
+                st.msg.clear();
+                st.good = None;
+                if g.scouts_left() == 0 {
+                    st.tool = Tool::Marker;
+                }
+            }
+            Err(PlaceError::NoScouts) => {
+                st.msg = "No scouts left. Use the marker (M) to say where the source is.".into();
+                st.good = None;
+            }
+            Err(PlaceError::OutOfZone) => {
+                st.msg = "Place scouts inside the dashed frame.".into();
+                st.good = None;
+            }
+            Err(PlaceError::Duplicate) => {
+                st.msg = "A scout is already there: it would draw the same trail.".into();
+                st.good = None;
+            }
+            Err(PlaceError::Finished) => {}
+        },
+        Tool::Marker => {
+            if g.set_marker(p).is_ok() {
+                st.msg.clear();
+                st.good = None;
+            }
+        }
+    }
+}
+
+fn survey_commit(g: &mut SurveyGame, st: &mut St) {
+    let tol = g.spec.tol;
+    match g.commit() {
+        Ok(v) if v.ok => {
+            st.msg = format!("Found it: your marker is {:.2} from the source (within {:.2}).", v.distance, tol);
+            st.good = Some(true);
+            st.banner = true;
+        }
+        Ok(v) => {
+            st.msg = format!("Missed: your marker is {:.2} from the source (needs within {:.2}). Retry (R) hides it somewhere else.", v.distance, tol);
+            st.good = Some(false);
+        }
+        Err(CommitError::NoMarker) => {
+            st.msg = "Place the marker first (M, then click).".into();
+            st.good = None;
+        }
+        Err(CommitError::Finished) => {}
+    }
+}
+
+/// Spend a test on the current marker (or show the same result again for free), and say what happened.
+fn survey_test(g: &mut SurveyGame, st: &mut St) {
+    match g.test_estimate() {
+        Ok(true) => st.msg = format!("Tested your marker. {} test(s) left this attempt.", g.tests_left()),
+        Ok(false) => {}
+        Err(TestError::NoMarker) => st.msg = "Place the marker first (M, then click), then test it.".into(),
+        Err(TestError::NoTestsLeft) => st.msg = "No tests left this attempt. Commit your estimate, or place a scout and reason from the evidence.".into(),
+        Err(TestError::Finished) => {}
+    }
+    st.good = None;
+}
+
+/// Would a scout released at `p` be accepted? (Mirrors `SurveyGame::place_scout`'s checks, without spending.)
+fn survey_scout_ok(g: &SurveyGame, p: V2) -> bool {
+    g.scouts_left() > 0 && g.spec.zone.contains(p) && !g.round().scouts.iter().any(|s| s.start.dist(p) < MIN_SCOUT_SEPARATION)
+}
+
+/// A faint ghost of what the active tool would place at `p`.
+fn survey_hover(g: &SurveyGame, tool: Tool, p: V2, accent: Color) {
+    let s = r::w2s(p);
+    match tool {
+        Tool::Scout => {
+            if survey_scout_ok(g, p) {
+                draw_poly(s.x, s.y, 4, 13.0, 0.0, alpha(rgb(14, 16, 22), 0.6));
+                draw_poly_lines(s.x, s.y, 4, 13.0, 0.0, 2.0, alpha(WHITE, 0.55));
+            } else {
+                let c = alpha(bad_c(), 0.8);
+                draw_line(s.x - 8.0, s.y - 8.0, s.x + 8.0, s.y + 8.0, 2.5, c);
+                draw_line(s.x - 8.0, s.y + 8.0, s.x + 8.0, s.y - 8.0, 2.5, c);
+            }
+        }
+        Tool::Marker => {
+            let p = g.spec.zone.clamp(p);
+            let s = r::w2s(p);
+            draw_circle_lines(s.x, s.y, g.spec.tol as f32 * r::PX, 1.5, alpha(accent, 0.35));
+            draw_poly_lines(s.x, s.y, 4, 12.0, 0.0, 2.0, alpha(accent, 0.55));
+        }
+    }
+}
+
+/// A path drawn as dashes (three samples on, three off).
+fn dashed_path(points: &[V2], col: Color, th: f32) {
+    for (i, w) in points.windows(2).enumerate() {
+        if (i / 3) % 2 == 0 {
+            let (a, b) = (r::w2s(w[0]), r::w2s(w[1]));
+            draw_line(a.x, a.y, b.x, b.y, th, col);
+        }
+    }
+}
+
+/// Small arrows along a trail: the extra push the scout felt beyond the charted flow. They point away from the
+/// source, so lines drawn back along them meet at it; a longer arrow is a stronger push.
+fn survey_push(spec: &SurveySpec, traj: &Trajectory, col: Color) {
+    // reading aid first, so the arrows sit on top of the rays
+    for (p, dir) in spec.push_rays(traj) {
+        let (a, b) = (r::w2s(p), r::w2s(p + dir * 9.0));
+        draw_line(a.x, a.y, b.x, b.y, 1.5, alpha(col, 0.2));
+    }
+    for (p, push) in spec.push_samples(traj) {
+        let len = (push.len() * 0.45).clamp(0.12, 0.7);
+        let tip = p + push * (len / push.len());
+        r::draw_arrow(r::w2s(p), r::w2s(tip), alpha(col, 0.9), 2.0, false);
+    }
+}
+
+fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
+    let lvl = g.level.clone();
+    let accent = chapter_color(Chapter::Survey);
+    let flying = st.flying();
+    let replay_all = st.anim.as_ref().is_some_and(|a| a.items.len() > 1);
+
+    r::begin_area();
+    r::draw_field(&lvl.field, 0.0, prefs.grid, prefs.hc);
+    r::draw_zone_frame(&g.spec.zone);
+    {
+        let rd = g.round();
+        let n = rd.scouts.len();
+        for (i, sc) in rd.scouts.iter().enumerate() {
+            let col = survey_color(i, sc.free);
+            // the newest scout (or all of them, on a replay) flies through the animation; older ones are static
+            let animated = st.anim.is_some() && (replay_all || i + 1 == n);
+            if !animated {
+                r::draw_path(&sc.traj.points, col, 3.5);
+                r::draw_chevrons(&sc.traj.points, col, 1.4);
+                r::draw_marker_end(sc.traj.end(), col, "");
+                survey_push(&g.spec, &sc.traj, col);
+            }
+            r::draw_start(sc.start);
+            let sp = r::w2s(sc.start);
+            text(&if sc.free { "F".to_string() } else { format!("{}", i) }, sp.x - 26.0, sp.y + 6.0, 22.0, col);
+        }
+        if let Some(a) = &st.anim {
+            for (t, c) in &a.items {
+                let pts = t.upto(a.time);
+                r::draw_path(&pts, *c, 3.5);
+                r::draw_chevrons(&pts, *c, 1.4);
+                if a.time < t.duration() {
+                    r::draw_probe(t.pos_at(a.time), *c);
+                } else {
+                    r::draw_marker_end(t.end(), *c, "");
+                    survey_push(&g.spec, t, *c);
+                }
+            }
+        }
+        if !g.finished() {
+            if let Some(test) = &rd.test {
+                for (i, (t, sc)) in test.trails.iter().zip(&rd.scouts).enumerate() {
+                    dashed_path(&t.points, alpha(survey_color(i, sc.free), 0.9), 2.0);
+                }
+                let s = r::w2s(test.at);
+                draw_poly_lines(s.x, s.y, 4, 9.0, 0.0, 1.5, alpha(WHITE, 0.5));
+            }
+        }
+        if let Some(m) = rd.marker {
+            r::draw_estimate(m, g.spec.tol, accent);
+        }
+        if let Some(src) = rd.revealed_source() {
+            r::draw_source(src, g.spec.sigma);
+            if let Some(m) = rd.marker {
+                r::draw_arrow(r::w2s(m), r::w2s(src), alpha(WHITE, 0.7), 2.0, true);
+            }
+        }
+    }
+    // Placement preview under the mouse. A scout cannot be taken back, so show where it would start
+    // (and whether the click would be refused) before it is spent. This shows a start point only, never
+    // a predicted trail.
+    if !flying && !g.finished() && r::in_area(inp.mouse) {
+        survey_hover(g, st.tool, r::s2w(inp.mouse), accent);
+    }
+    if !flying && !g.finished() {
+        let c = r::w2s(st.cur);
+        draw_line(c.x - 12.0, c.y, c.x + 12.0, c.y, 1.5, alpha(WHITE, 0.45));
+        draw_line(c.x, c.y - 12.0, c.x, c.y + 12.0, 1.5, alpha(WHITE, 0.45));
+    }
+    r::end_area();
+    text(
+        "Small arrows on a trail: the extra push the scout felt beyond the charted flow. They point away from the source.",
+        r::AX,
+        r::AY + r::AH + 24.0,
+        16.0,
+        gray(),
+    );
+    let mut ly = r::AY + r::AH + 44.0;
+    if g.spec.rays {
+        text("Faint lines run back along each arrow. Where they cross is the source.", r::AX, ly, 16.0, gray());
+        ly += 20.0;
+    }
+    if g.round().test.is_some() && !g.finished() {
+        text(
+            "Thin dashes: what each scout would have done if the source were at the small diamond (your last test).",
+            r::AX,
+            ly,
+            16.0,
+            gray(),
+        );
+    }
+
+    // input
+    if !flying && !g.finished() {
+        if is_key_pressed(KeyCode::S) {
+            st.tool = Tool::Scout;
+        }
+        if is_key_pressed(KeyCode::M) {
+            st.tool = Tool::Marker;
+        }
+        if is_key_pressed(KeyCode::Tab) {
+            st.tool = if st.tool == Tool::Scout { Tool::Marker } else { Tool::Scout };
+        }
+        let sp = if is_key_down(KeyCode::LeftShift) { 0.8 } else { 3.5 } * get_frame_time() as f64;
+        let mut d = V2::ZERO;
+        if is_key_down(KeyCode::Left) {
+            d.x -= sp;
+        }
+        if is_key_down(KeyCode::Right) {
+            d.x += sp;
+        }
+        if is_key_down(KeyCode::Up) {
+            d.y += sp;
+        }
+        if is_key_down(KeyCode::Down) {
+            d.y -= sp;
+        }
+        if d != V2::ZERO {
+            st.cur = g.spec.zone.clamp(V2 { x: st.cur.x + d.x, y: st.cur.y + d.y });
+        }
+        if inp.pressed && r::in_area(inp.mouse) {
+            survey_place(g, st, r::s2w(inp.mouse));
+        } else if space() {
+            survey_place(g, st, st.cur);
+        }
+        if is_key_pressed(KeyCode::C) {
+            survey_commit(g, st);
+        }
+        if is_key_pressed(KeyCode::T) {
+            survey_test(g, st);
+        }
+    }
+
+    // panel
+    let mut y = panel_header(&lvl);
+    let attempt = format!("Attempt {}", g.attempts());
+    text(&attempt, PX0 + PW - measure_text(&attempt, None, 18, 1.0).width, 108.0, 18.0, gray());
+    y = wrap("A hidden source pushes the flow away from itself. The arrows show only the charted background: scouts show what the current really does.", PX0, y + 8.0, PW, 17.0, gray());
+    y += 10.0;
+    text("Scouts left", PX0, y + 14.0, 19.0, WHITE);
+    for i in 0..g.spec.budget {
+        let (cx, cy) = (PX0 + 130.0 + i as f32 * 28.0, y + 8.0);
+        if i < g.scouts_left() {
+            draw_circle(cx, cy, 10.0, accent);
+        } else {
+            draw_circle_lines(cx, cy, 10.0, 2.0, gray());
+        }
+    }
+    y += 34.0;
+    let live = !flying && !g.finished();
+    let half = (PW - 8.0) / 2.0;
+    let sc = ui::button(inp, Rect::new(PX0, y, half, 36.0), "Scout (S)", live, if st.tool == Tool::Scout { accent } else { rgb(90, 96, 118) });
+    let mk = ui::button(inp, Rect::new(PX0 + half + 8.0, y, half, 36.0), "Marker (M)", live, if st.tool == Tool::Marker { accent } else { rgb(90, 96, 118) });
+    if sc {
+        st.tool = Tool::Scout;
+    }
+    if mk {
+        st.tool = Tool::Marker;
+    }
+    y += 46.0;
+    y = wrap(
+        if st.tool == Tool::Scout { "Release scouts near where you suspect the source: a trail only bends close to it." } else { "Click to place the estimate; click again to move it." },
+        PX0,
+        y,
+        PW,
+        17.0,
+        WHITE,
+    );
+    y += 16.0;
+    match g.round().marker {
+        Some(m) => text(&format!("Marker: ({:.1}, {:.1})", m.x, m.y), PX0, y + 14.0, 19.0, WHITE),
+        None => text("Marker: not placed", PX0, y + 14.0, 19.0, gray()),
+    }
+    y = wrap(&format!("Counts as found within {:.2} of the source.", g.spec.tol), PX0, y + 40.0, PW, 17.0, gray());
+    let ready = live && g.round().marker.is_some();
+    if ui::button(inp, Rect::new(PX0, y + 8.0, PW, 42.0), "Commit position (C)", ready, accent) {
+        survey_commit(g, st);
+    }
+    y += 62.0;
+    if live {
+        let label = format!("Test estimate (T): {} left", g.tests_left());
+        if ui::button(inp, Rect::new(PX0, y, PW, 34.0), &label, g.round().marker.is_some(), rgb(90, 96, 118)) {
+            survey_test(g, st);
+        }
+        y += 44.0;
+    }
+    if let Some(src) = g.round().revealed_source() {
+        wrap(&format!("The source was at ({:.1}, {:.1}). Press R for a new hidden position.", src.x, src.y), PX0, y, PW, 17.0, WHITE);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,5 +1663,89 @@ mod tests {
         assert_eq!(replay_key(false, false, true), ReplayKey::None);
         assert_eq!(replay_key(true, true, false), ReplayKey::None);
         assert_eq!(replay_key(false, true, false), ReplayKey::None);
+    }
+
+    // ---- Survey front end: the state transitions the screen drives, tested without a window ----
+    fn survey_state() -> (SurveyGame, St) {
+        (SurveyGame::new(vfield::levels::survey_levels().remove(0)), St::default())
+    }
+
+    #[test]
+    fn placing_the_last_scout_switches_to_the_marker_tool() {
+        let (mut g, mut st) = survey_state();
+        assert!(st.tool == Tool::Scout);
+        survey_place(&mut g, &mut st, vfield::v2(-2.0, 2.0));
+        assert!(st.tool == Tool::Scout, "a scout is still available");
+        assert!(st.anim.as_ref().is_some_and(|a| a.items.len() == 1), "the new trail flies on its own");
+        survey_place(&mut g, &mut st, vfield::v2(1.0, -2.0));
+        assert_eq!(g.scouts_left(), 0);
+        assert!(st.tool == Tool::Marker, "with no scouts left the next click can only be the estimate");
+    }
+
+    #[test]
+    fn rejected_placements_explain_themselves_and_cost_nothing() {
+        let (mut g, mut st) = survey_state();
+        survey_place(&mut g, &mut st, vfield::v2(40.0, 0.0));
+        assert!(st.msg.contains("frame") && g.scouts_left() == g.spec.budget);
+        let free = g.spec.free;
+        survey_place(&mut g, &mut st, free);
+        assert!(st.msg.contains("already") && g.scouts_left() == g.spec.budget);
+        for i in 0..g.spec.budget {
+            survey_place(&mut g, &mut st, vfield::v2(-2.0 + 3.0 * i as f64, 2.0 - 4.0 * i as f64));
+        }
+        assert_eq!(g.scouts_left(), 0);
+        // the tool has moved on to the marker, so a click now places the estimate rather than failing...
+        assert!(st.tool == Tool::Marker);
+        // ...and only a player who switches back to scouting is told why it does nothing
+        st.tool = Tool::Scout;
+        survey_place(&mut g, &mut st, vfield::v2(3.0, 3.0));
+        assert!(st.msg.contains("No scouts left"), "{}", st.msg);
+        assert_eq!(g.round().scouts.len(), 1 + g.spec.budget);
+    }
+
+    #[test]
+    fn the_marker_tool_places_and_moves_the_estimate_without_spending_scouts() {
+        let (mut g, mut st) = survey_state();
+        st.tool = Tool::Marker;
+        survey_place(&mut g, &mut st, vfield::v2(1.0, 1.0));
+        survey_place(&mut g, &mut st, vfield::v2(-1.0, 0.5));
+        assert_eq!(g.round().marker, Some(vfield::v2(-1.0, 0.5)));
+        assert_eq!(g.scouts_left(), g.spec.budget);
+        assert_eq!(g.round().scouts.len(), 1);
+    }
+
+    #[test]
+    fn committing_without_a_marker_says_so_and_does_not_end_the_round() {
+        let (mut g, mut st) = survey_state();
+        survey_commit(&mut g, &mut st);
+        assert!(st.msg.contains("marker") && !g.finished() && st.good.is_none() && !st.banner);
+    }
+
+    #[test]
+    fn a_hit_shows_the_banner_and_a_miss_does_not() {
+        let (mut g, mut st) = survey_state();
+        let src = g.spec.source_for_attempt(0);
+        g.set_marker(vfield::v2(src.x + 0.1, src.y)).unwrap();
+        survey_commit(&mut g, &mut st);
+        assert!(st.good == Some(true) && st.banner && g.won && st.msg.contains("Found it"));
+        let (mut g, mut st) = survey_state();
+        g.set_marker(vfield::v2(-5.0, -3.0)).unwrap();
+        survey_commit(&mut g, &mut st);
+        assert!(st.good == Some(false) && !st.banner && !g.won && st.msg.contains("Missed"));
+    }
+
+    #[test]
+    fn replay_gathers_every_trail_of_the_round_with_the_free_scout_distinguished() {
+        let (mut g, mut st) = survey_state();
+        survey_place(&mut g, &mut st, vfield::v2(-2.0, 2.0));
+        let items = survey_items(&g);
+        assert_eq!(items.len(), 2);
+        assert_ne!((items[0].1.r, items[0].1.g, items[0].1.b), (items[1].1.r, items[1].1.g, items[1].1.b));
+        // retry is only offered once the round is committed
+        assert!(!retry_enabled(&Game::Survey(SurveyGame::new(vfield::levels::survey_levels().remove(0))), &st));
+        let mut done = SurveyGame::new(vfield::levels::survey_levels().remove(0));
+        done.set_marker(vfield::v2(0.0, 0.0)).unwrap();
+        done.commit().unwrap();
+        assert!(retry_enabled(&Game::Survey(done), &st));
     }
 }

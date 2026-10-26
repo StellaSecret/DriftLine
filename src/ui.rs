@@ -46,21 +46,33 @@ pub fn text_c(s: &str, cx: f32, cy: f32, size: f32, c: Color) {
     draw_text(s, cx - d.width / 2.0, cy + d.height / 2.0, size, c);
 }
 
-/// Word-wrapped text. Returns the y for the next line.
-pub fn wrap(s: &str, x: f32, y: f32, w: f32, size: f32, c: Color) -> f32 {
+/// The lines `wrap` would draw for `s` in a column `w` wide.
+pub fn wrap_lines(s: &str, w: f32, size: f32) -> Vec<String> {
+    let mut lines = vec![];
     let mut line = String::new();
-    let mut y = y;
     for word in s.split_whitespace() {
         let trial = if line.is_empty() { word.to_string() } else { format!("{} {}", line, word) };
         if measure_text(&trial, None, size as u16, 1.0).width > w && !line.is_empty() {
-            draw_text(&line, x, y, size, c);
-            y += size * 1.15;
-            line = word.to_string();
+            lines.push(std::mem::replace(&mut line, word.to_string()));
         } else {
             line = trial;
         }
     }
     if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Height `wrap` will use for `s` (so a box can be sized to its text).
+pub fn wrap_height(s: &str, w: f32, size: f32) -> f32 {
+    wrap_lines(s, w, size).len() as f32 * size * 1.15
+}
+
+/// Word-wrapped text. Returns the y for the next line.
+pub fn wrap(s: &str, x: f32, y: f32, w: f32, size: f32, c: Color) -> f32 {
+    let mut y = y;
+    for line in wrap_lines(s, w, size) {
         draw_text(&line, x, y, size, c);
         y += size * 1.15;
     }

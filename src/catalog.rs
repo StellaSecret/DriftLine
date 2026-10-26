@@ -29,6 +29,7 @@ fn term(t: &Term, level_id: &str) -> String {
         Term::Uniform(p) => format!("uniform flow {}", v(*p)),
         Term::Radial { c, k, soft } => format!("radial about {}: v = k d / (|d|^2 + soft^2), k = {}, soft = {} ({})", v(*c), n(*k), n(*soft), if *k < 0.0 { "attracts" } else { "repels" }),
         Term::Vortex { c, k, soft } => format!("vortex about {}: v = k perp(d) / (|d|^2 + soft^2), k = {}, soft = {} ({})", v(*c), n(*k), n(*soft), if *k > 0.0 { "counter-clockwise" } else { "clockwise" }),
+        Term::Gauss { c, k, sigma } => format!("local radial push about {}: v = k d exp(-|d|^2 / (2 sigma^2)), k = {}, sigma = {} ({}; peak speed k sigma e^-1/2 at distance sigma; 5.5% of the peak at 3 sigma, 0.2% at 4 sigma)", v(*c), n(*k), n(*sigma), if *k < 0.0 { "attracts" } else { "repels" }),
         Term::Saddle { c, k } => format!("saddle at {}: v = k(-dx, +dy), k = {} (inflow along x, outflow along y)", v(*c), n(*k)),
         Term::Rotating { speed, omega, phase } => format!("rotating uniform flow: speed {}, direction angle = {} t + {}", n(*speed), n(*omega), n(*phase)),
         Term::Orbiting { kind, c, orbit, omega, phase, k, soft } => format!(
@@ -88,6 +89,17 @@ fn rules(l: &Level) -> Vec<String> {
             };
             vec!["mechanic: **Experiment**".to_string(), format!("fixed start {}", v(*start)), format!("intensity range [{}, {}]", n(range.0), n(range.1)), format!("challenge: {}", ch)]
         }
+        Rules::Survey { zone: z, free, scouts, k, sigma, tol, rays, pool } => vec![
+            "mechanic: **Survey**".to_string(),
+            "the field layers above are the *charted background*; the hidden source is added to them and is not listed".to_string(),
+            format!("hidden source: local repeller (Gauss term), strength k = {}, width sigma = {}, position unknown", n(*k), n(*sigma)),
+            format!("scouts may be placed anywhere in {}; each leaves a {} s trail", zone(z), n(l.max_time)),
+            format!("free scout flown at the start of every attempt from {}; {} further scouts can be placed", v(*free), scouts),
+            format!("one commit per attempt; correct within {} of the source", n(*tol)),
+            format!("estimate tests per attempt: {} (each shows what the scouts would have done if the source were at the marker)", crate::modes::TESTS_PER_ROUND),
+            format!("reading aid: faint rays back along each push arrow {}", if *rays { "on" } else { "off" }),
+            format!("hidden positions, one per attempt, easy to hard on the first pass, then reshuffled each pass: {}", pool.iter().map(|p| v(*p)).collect::<Vec<_>>().join(", ")),
+        ],
         Rules::Steer { start, beats, gust_budget, gust_strength, dirs, beat_time, goal } => vec![
             "mechanic: **Steer**".to_string(),
             format!("fixed start {}", v(*start)),

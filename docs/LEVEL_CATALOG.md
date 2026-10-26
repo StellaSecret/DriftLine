@@ -464,6 +464,27 @@ World coordinates: x to the right, y up. Every level uses the bounds x in [-6, 6
   - gust directions: 8 (E, NE, N, NW, W, SW, S, SE)
   - goal region 0 (T)
 
+## sur-1 - Something in the Stream (Survey)
+
+- objective: Something hidden pushes the flow away from itself. Fly scouts, then mark where it is.
+- hint 1: The arrows show the flow as charted. Where a scout does something the arrows do not predict, the hidden source is acting on it.
+- hint 2: A scout that passes far from the source learns almost nothing: its trail only speaks for the places it went near.
+- hint 3: Two guesses for the source send a scout in different directions only from certain places. Put the next scout where they disagree.
+- bounds: x in [-6, 6], y in [-4, 4]; simulation time limit: 5 s; seed: 310205517
+- field layers (summed; a *tunable* layer is multiplied by the intensity):
+  1. fixed - uniform flow (1, 0)
+- regions:
+- rules:
+  - mechanic: **Survey**
+  - the field layers above are the *charted background*; the hidden source is added to them and is not listed
+  - hidden source: local repeller (Gauss term), strength k = 1.6, width sigma = 1, position unknown
+  - scouts may be placed anywhere in rectangle x in [-5.5, 5.5], y in [-3.5, 3.5]; each leaves a 5 s trail
+  - free scout flown at the start of every attempt from (-5, 0); 2 further scouts can be placed
+  - one commit per attempt; correct within 0.75 of the source
+  - estimate tests per attempt: 3 (each shows what the scouts would have done if the source were at the marker)
+  - reading aid: faint rays back along each push arrow on
+  - hidden positions, one per attempt, easy to hard on the first pass, then reshuffled each pass: (-3.25, -2.25), (-2.75, 2.25), (-0.75, -2.25), (-0.25, 2.25), (3.25, -1.75), (2.25, 2.25)
+
 ## cmb-1 - Through the Gate (Combinations)
 
 - objective: Position + corridor: pass the gate, then reach the target.

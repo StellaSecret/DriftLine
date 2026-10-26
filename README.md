@@ -1,7 +1,7 @@
 # Vector Field
 
 A 2D puzzle game about steering a probe through a vector field, written in Rust
-([macroquad](https://github.com/not-fl3/macroquad)). It is built around four *different* kinds of reasoning:
+([macroquad](https://github.com/not-fl3/macroquad)). It is built around six *different* kinds of reasoning (Survey is a prototype, see below):
 
 | Mechanic | Question | What you decide | Skill |
 |---|---|---|---|
@@ -10,8 +10,9 @@ A 2D puzzle game about steering a probe through a vector field, written in Rust
 | **Tempo** | When should I launch? | the launch phase of a changing field | reasoning about time-dependent geometry |
 | **Experiment** | How does the system behave? | a parameter, then a *conclusion* | discovering a rule by controlled tests |
 | **Steer** | What should I do next? | a gust (or nothing) every beat, with feedback | closed-loop control: planning from observed state |
+| **Survey** *(prototype)* | Where is the hidden source? | where to release a few scouts, then one estimate | choosing what to observe to infer a hidden structure |
 
-25 fundamental levels (5 per mechanic) and 6 combination levels. See [DESIGN.md](DESIGN.md) for the per-mechanic
+25 fundamental levels (5 for each of the first five mechanics), one Survey prototype level and 6 combination levels. Survey's evidence so far is an ideal-solver validation, not playtests (see `docs/09-survey.md`). See [DESIGN.md](DESIGN.md) for the per-mechanic
 design, and how the "these are really different" requirement is checked by automated tests.
 
 ## Run
@@ -21,22 +22,23 @@ cargo run --release            # desktop game
 cargo test --release           # simulation, level and mechanic validation
 cargo run --release --bin report [-- --detail]   # per-level validation numbers
 cargo run --release --bin report -- --steer      # Steer validation report (see STEER_VALIDATION.md)
+cargo run --release --bin report -- --survey     # Survey validation report (see SURVEY_VALIDATION.md)
 ```
 
-Controls: mouse; Space/Enter launch or confirm; in Steer, Q W E / A S D / Z X C pick a gust direction (S = wait) or use the arrow keys; arrow keys nudge; `H` hint; `R` retry/reset; `V` replay;
+Controls: mouse; Space/Enter launch or confirm; in Steer, Q W E / A S D / Z X C pick a gust direction (S = wait) or use the arrow keys; arrow keys nudge; in Survey, `S` scout / `M` marker (or `Tab`), click or Space to place, `C` commit; `H` hint; `R` retry/reset; `V` replay;
 `G` arrow-grid density; `K` high-contrast arrows; `U` unlock all levels; `Esc` back.
 Progress is saved to `vfield_progress.txt` (desktop only).
 
 ## Documentation
 
-[`docs/`](docs/README.md) is a precise, code-derived reference for each mechanic (Position, Predict, Tempo, Experiment, Steer): information, controls, state machine, exact rules, feedback, level properties, known weaknesses and the tests that pin them. `docs/LEVEL_CATALOG.md` is generated from the level data (`cargo run --release --bin catalog > docs/LEVEL_CATALOG.md`) and a test fails if it is stale.
+[`docs/`](docs/README.md) is a precise, code-derived reference for each mechanic (Position, Predict, Tempo, Experiment, Steer, Survey): information, controls, state machine, exact rules, feedback, level properties, known weaknesses and the tests that pin them. `docs/LEVEL_CATALOG.md` is generated from the level data (`cargo run --release --bin catalog > docs/LEVEL_CATALOG.md`) and a test fails if it is stale.
 
 ## Layout
 
 ```
 src/field.rs        field model v(x, y, t; theta)      src/sim.rs      RK4 engine, regions, outcomes
 src/level.rs        level data types                   src/levels.rs   all content, as data
-src/modes/          the five gameplay modes (no UI)    src/validate.rs automated mechanic checks
+src/modes/          the six gameplay modes (no UI)    src/validate.rs automated mechanic checks
 src/app.rs, render.rs, ui.rs, main.rs  macroquad front end        tests/mechanics.rs  validation suite
 ```
 

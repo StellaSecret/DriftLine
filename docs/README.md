@@ -12,7 +12,8 @@ when the player does X" and "what exactly can the player do", with enough detail
 | [05-experiment.md](05-experiment.md) | **Experiment**: "How does the system behave?" |
 | [06-steer.md](06-steer.md) | **Steer**: "What should I do next?" |
 | [07-combinations.md](07-combinations.md) | How the six combination levels compose the mechanics |
-| [08-comparison.md](08-comparison.md) | The five mechanics side by side, and how they differ |
+| [08-comparison.md](08-comparison.md) | The six mechanics side by side, and how they differ |
+| [09-survey.md](09-survey.md) | **Survey**: "Where is the hidden source?" |
 | [LEVEL_CATALOG.md](LEVEL_CATALOG.md) | **Generated**: every parameter of every level (fields, regions, rules) |
 
 ## How each mechanic document is organised
@@ -36,7 +37,7 @@ Every mechanic document follows the same sections, so they can be compared direc
 - "Tested by `name`" refers to a test in `tests/` or a unit test in `src/`.
 - **What is enforced.** `LEVEL_CATALOG.md` is generated from the level data and a test (`tests/docs.rs`) fails when it is stale.
   Everything else here is hand-written from the source and is not enforced; statistics come from
-  `cargo run --release --bin report` (and `-- --steer`) on this version of the code. If you change behaviour, update the
+  `cargo run --release --bin report` (and `-- --steer`, `-- --survey`) on this version of the code. If you change behaviour, update the
   matching document.
 - Units: positions are in world units, durations in seconds, angles in radians. World x points right, y points up.
   (The screen y axis points down; the interface converts.)
@@ -62,3 +63,8 @@ Every mechanic document follows the same sections, so they can be compared direc
 | **Beat** | One fixed 1 s step of a Steer run. |
 | **Gust** | A one-beat velocity added to the field in Steer. |
 | **Ghost** | A faint copy of an earlier Steer or Position attempt. |
+| **Charted background** | In Survey, the visible field (the level's `field`); the real field is this plus the hidden source. |
+| **Source** | The hidden local repeller (`Term::Gauss`) a Survey player must locate. |
+| **Scout** | A probe the Survey player releases to gather evidence. Its own outcome does not matter; its trail does. |
+| **Commit tolerance** | In Survey, how close the single estimate must be to the source (0.5). |
+| **Candidate** | A validator-only stand-in for a possible source position (a 0.5 grid); the game itself is continuous. |

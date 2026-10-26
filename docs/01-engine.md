@@ -35,6 +35,7 @@ v(p, t) = sum over layers L of  term_L(p, t) * w_L,      w_L = intensity if L is
 | `Orbiting{kind,c,orbit,omega,phase,k,soft}` | a `Radial` or `Vortex` whose centre is `c + orbit (cos a, sin a)`, `a = omega t + phase` | a moving source |
 | `Modulated{inner,offset,amp,omega,phase}` | `inner(p,t) * (offset + amp sin(omega t + phase))` | scales another term in time |
 | `Wave{dir,amp,wave,omega}` | `dir * amp * sin(wave . p - omega t)` | travelling shear wave |
+| `Gauss{c,k,sigma}` | `k d exp(-\|d\|^2 / (2 sigma^2))`, `d = p - c` | a *local* radial push (repels for `k > 0`): peak speed `k sigma e^(-1/2)` at distance `sigma`, 45% of it at 2 sigma, 5.5% at 3 sigma, 0.22% at 4 sigma. Used as Survey's hidden source |
 | `Custom(f)` | `f(p, t)` | any function pointer (used by `tem-1` and `ste-2`) |
 
 Time dependence exists only in `Rotating`, `Orbiting`, `Modulated`, `Wave` and `Custom`. Position, Predict, Experiment
