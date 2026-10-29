@@ -25,3 +25,31 @@ Success = the centroid of the surviving candidates is within the commit toleranc
 |---|---|---|---|---|---|---|---|
 | fine | 62% | 64% | 96% | 89% | 93% | 99% | 0% |
 | coarse | 44% | 87% | 81% | 70% | 81% | 93% | 0% |
+
+## sur-2 - One Look Is a Line
+
+scouts 2, trail 5 s, source strength k = 1.65, width sigma = 0.8, commit tolerance 0.6, candidates on a 0.5 grid, precision thresholds fine 0.15 / coarse 0.4.
+
+### Authored hidden positions
+
+| source | candidates left after free scout | their spread | free scout alone solves | solvable (fine) | solvable (coarse) | scouts the adaptive player needs (coarse) | adaptive (coarse) | fixed pattern (coarse) | random scouts (coarse) |
+|---|---|---|---|---|---|---|---|---|---|
+| (-1.5, 1.6) | 34 | 5.9 | yes | yes | yes | 0 | yes | yes | 100% |
+| (1.55, 0.05) | 159 | 10.0 | no | yes | yes | - | no | no | 45% |
+| (0.5, -1.4) | 154 | 10.0 | no | yes | yes | 1 | yes | yes | 70% |
+| (1.4, -0.05) | 159 | 10.0 | no | yes | yes | - | no | no | 30% |
+| (3, 3) | 157 | 10.0 | no | yes | yes | 2 | yes | yes | 35% |
+| (2.5, -3) | 157 | 10.0 | no | yes | yes | 1 | yes | no | 20% |
+
+### 300 random continuous sources
+
+Success = the centroid of the surviving candidates is within the commit tolerance. "Unsolvable" = no combination of 2 lattice scouts achieves that.
+
+| precision | free scout alone | still ambiguous after it | fixed pattern | random scouts | adaptive (1 scout) | adaptive (full budget) | unsolvable |
+|---|---|---|---|---|---|---|---|
+| fine | 40% | 76% | 74% | 65% | 68% | 86% | 1% |
+| coarse | 23% | 94% | 57% | 48% | 50% | 67% | 1% |
+
+## sur-3 - Which Way It Pushes
+
+Not validated here: this level hides attractors and swirls as well as repellers, which the trail-similarity model below does not represent. Its checks are in `tests/survey.rs` (`level_three_*`) and described in `docs/09-survey.md`.

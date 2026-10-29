@@ -11,7 +11,7 @@ pub use experiment::{Conclusion, ExperimentGame, Run, Verdict};
 pub use position::{Attempt, PositionGame};
 pub use predict::{PredictGame, Round, RoundResult};
 pub use steer::{Action, ChooseError, End, FailReason, Phase, SteerGame, SteerSpec};
-pub use survey::{EstimateTest, TestError, MIN_SCOUT_SEPARATION, PUSH_EVERY, PUSH_MIN, TESTS_PER_ROUND, CommitError, PlaceError, RetryError, Round as SurveyRound, Scout, SurveyGame, SurveySpec, Verdict as SurveyVerdict};
+pub use survey::{CLEARED_EVERY, CLEARED_MARGIN, EstimateTest, TestError, MIN_SCOUT_SEPARATION, PUSH_EVERY, PUSH_MIN, TESTS_PER_ROUND, CommitError, PlaceError, RetryError, Round as SurveyRound, Scout, SurveyGame, SurveySpec, Verdict as SurveyVerdict};
 pub use tempo::{TempoAttempt, TempoGame};
 
 /// Small deterministic generator so Predict rounds are reproducible per (level, attempt).

@@ -87,8 +87,73 @@ pub enum Term {
     /// 4 sigma. Unlike `Radial` (a 1/r tail that is felt everywhere) it can only be detected by passing
     /// close. k > 0 repels, k < 0 attracts.
     Gauss { c: V2, k: f64, sigma: f64 },
+    /// A *local* sideways push with the same profile: v = k perp(d) exp(-|d|^2 / (2 sigma^2)). k > 0 turns
+    /// counter-clockwise. Its arrows never point at or away from the centre (they are at right angles to it), so
+    /// lines along them do not meet; lines at right angles to them do.
+    GaussVortex { c: V2, k: f64, sigma: f64 },
     /// Escape hatch for any other function.
     Custom(fn(V2, f64) -> V2),
+}
+
+/// What a hidden source does, in a Survey level. The player must say which kind it is as well as where.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SourceKind {
+    /// Pushes away from itself.
+    Repeller,
+    /// Pulls toward itself.
+    Attractor,
+    /// Pushes sideways, counter-clockwise.
+    SwirlCcw,
+    /// Pushes sideways, clockwise.
+    SwirlCw,
+}
+
+impl SourceKind {
+    pub const ALL: [SourceKind; 4] = [SourceKind::Repeller, SourceKind::Attractor, SourceKind::SwirlCcw, SourceKind::SwirlCw];
+
+    /// The field term for a source of this kind with strength `k` (> 0) and width `sigma`.
+    pub fn term(self, c: V2, k: f64, sigma: f64) -> Term {
+        match self {
+            SourceKind::Repeller => Term::Gauss { c, k, sigma },
+            SourceKind::Attractor => Term::Gauss { c, k: -k, sigma },
+            SourceKind::SwirlCcw => Term::GaussVortex { c, k, sigma },
+            SourceKind::SwirlCw => Term::GaussVortex { c, k: -k, sigma },
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            SourceKind::Repeller => "repeller",
+            SourceKind::Attractor => "attractor",
+            SourceKind::SwirlCcw => "swirl (counter-clockwise)",
+            SourceKind::SwirlCw => "swirl (clockwise)",
+        }
+    }
+    /// Short label for buttons and the map.
+    pub fn short(self) -> &'static str {
+        match self {
+            SourceKind::Repeller => "repeller",
+            SourceKind::Attractor => "attractor",
+            SourceKind::SwirlCcw => "swirl CCW",
+            SourceKind::SwirlCw => "swirl CW",
+        }
+    }
+    /// Which of the three families this is: 0 repeller, 1 attractor, 2 swirl (either way round).
+    pub fn family(self) -> usize {
+        match self {
+            SourceKind::Repeller => 0,
+            SourceKind::Attractor => 1,
+            SourceKind::SwirlCcw | SourceKind::SwirlCw => 2,
+        }
+    }
+    pub const FAMILY_NAMES: [&'static str; 3] = ["repeller", "attractor", "swirl"];
+    pub fn is_swirl(self) -> bool {
+        matches!(self, SourceKind::SwirlCcw | SourceKind::SwirlCw)
+    }
+    /// The next kind in the order the selector cycles through.
+    pub fn next(self) -> SourceKind {
+        let i = Self::ALL.iter().position(|k| *k == self).unwrap();
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
 }
 
 fn swirl(d: V2, k: f64, soft: f64, vortex: bool) -> V2 {
@@ -126,6 +191,10 @@ impl Term {
             Term::Gauss { c, k, sigma } => {
                 let d = p - *c;
                 d * (k * (-d.dot(d) / (2.0 * sigma * sigma)).exp())
+            }
+            Term::GaussVortex { c, k, sigma } => {
+                let d = p - *c;
+                d.perp() * (k * (-d.dot(d) / (2.0 * sigma * sigma)).exp())
             }
             Term::Custom(f) => f(p, t),
         }

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use vfield::modes::steer::Run as SteerRun;
 use vfield::modes::*;
 use vfield::sim::{Outcome, Trajectory};
-use vfield::{levels, Chapter, GustDirs, Level, Reveal, Rules, V2};
+use vfield::{levels, Chapter, GustDirs, Level, Reveal, Rules, SourceKind, V2};
 
 const PX0: f32 = 1014.0; // panel content x
 const PW: f32 = 236.0; // panel content width
@@ -61,6 +61,8 @@ impl Anim {
 
 #[derive(Default)]
 struct St {
+    /// Survey: draw lines at right angles to each arrow (they meet at a swirl's centre).
+    perps: bool,
     anim: Option<Anim>,
     msg: String,
     good: Option<bool>,
@@ -437,7 +439,8 @@ fn play_frame(s: &mut Session, inp: &Input, prefs: &mut Prefs) -> Nav {
     let nh = lvl.hints.len();
     if s.st.hints > 0 {
         let k = s.st.hints.min(nh);
-        let texts: Vec<String> = (0..k).map(|i| format!("Hint {}: {}", i + 1, lvl.hints[i])).collect();
+        let all = hint_texts(&s.game, &lvl);
+        let texts: Vec<String> = (0..k).map(|i| format!("Hint {}: {}", i + 1, all[i])).collect();
         let heights: Vec<f32> = texts.iter().map(|t| ui::wrap_height(t, 520.0, 18.0) + 10.0).collect();
         let h = 16.0 + heights.iter().sum::<f32>();
         let top = r::AY + r::AH - 8.0 - h;
@@ -1372,16 +1375,65 @@ fn survey_place(g: &mut SurveyGame, st: &mut St, p: V2) {
     }
 }
 
+/// The hint texts for a level. Mostly the level's own; the second Survey level chooses by what the free scout
+/// showed (nothing, one arrow, a wedge), which the player can see, so the hint speaks to the attempt in front of them.
+fn hint_texts(game: &Game, lvl: &Level) -> Vec<String> {
+    if let Game::Survey(g) = game {
+        if g.spec.band && !g.spec.rays {
+            let n = g.spec.push_samples(&g.round().scouts[0].traj).len();
+            let reach = g.spec.sense_radius();
+            return match n {
+                0 => vec![
+                    format!("Your free scout felt nothing. A scout only feels the source from about {reach:.1} away, so the source is not near its path."),
+                    "The shaded ground is where a source would already have been felt, so it is not there. Release a scout in the unshaded ground, above or below the free scout's path.".into(),
+                    "Once a scout's arrows appear, extend them backwards: the source is somewhere along that line.".into(),
+                ],
+                1 => vec![
+                    "One arrow tells you which line the source is on, not where along it. Extend it backwards.".into(),
+                    "Release a scout a little above or below that line. Its arrows point away from the source at a different angle, so the two lines cross at the source.".into(),
+                    "A scout released on the same line gives you the same line again.".into(),
+                ],
+                _ => vec![
+                    "Extend each small arrow backwards. They roughly agree: the source is where those lines come close together.".into(),
+                    "Release a scout near that spot, a little above or below the free scout's path, so its arrows cross the first ones.".into(),
+                    "The shaded ground is ruled out: the source is in the unshaded part.".into(),
+                ],
+            };
+        }
+    }
+    lvl.hints.iter().map(|h| h.to_string()).collect()
+}
+
 fn survey_commit(g: &mut SurveyGame, st: &mut St) {
     let tol = g.spec.tol;
     match g.commit() {
         Ok(v) if v.ok => {
-            st.msg = format!("Found it: your marker is {:.2} from the source (within {:.2}).", v.distance, tol);
             st.good = Some(true);
-            st.banner = true;
+            st.banner = g.won;
+            if g.spec.typed() {
+                let (have, need) = (g.found.iter().filter(|f| **f).count(), g.families_needed().len());
+                let what = g.round().revealed_kind().map_or("source", |k| k.short());
+                let next = if g.won { "" } else { " Press R for the next." };
+                st.msg = format!("Found it: {:.2} away (within {:.2}). It was a {}. {} of {} kinds found.{}", v.distance, tol, what, have, need, next);
+            } else {
+                st.msg = format!("Found it: your marker is {:.2} from the source (within {:.2}).", v.distance, tol);
+            }
         }
         Ok(v) => {
-            st.msg = format!("Missed: your marker is {:.2} from the source (needs within {:.2}). Retry (R) hides it somewhere else.", v.distance, tol);
+            let truth = g.round().revealed_kind();
+            let said = g.round().marker_kind;
+            let name = |k: Option<SourceKind>| k.map_or("source", |k| k.short());
+            let swirl_missed = truth.map_or(false, |k| k.is_swirl()) && !said.is_swirl();
+            st.msg = if swirl_missed {
+                // the one thing worth saying: why the lines never crossed
+                "Missed: it was a swirl. A swirl pushes sideways, so lines along its arrows never cross. Press P: lines at right angles cross at its centre.".to_string()
+            } else if !v.kind_ok && v.distance <= tol {
+                format!("Right place, wrong kind: you said {}, it was {}. Retry (R).", said.short(), name(truth))
+            } else if !v.kind_ok {
+                format!("Missed: {:.2} away (needs {:.2}), and it was {}, not {}. Retry (R).", v.distance, tol, name(truth), said.short())
+            } else {
+                format!("Missed: {:.2} away (needs {:.2}). Retry (R) hides it somewhere else.", v.distance, tol)
+            };
             st.good = Some(false);
         }
         Err(CommitError::NoMarker) => {
@@ -1390,6 +1442,22 @@ fn survey_commit(g: &mut SurveyGame, st: &mut St) {
         }
         Err(CommitError::Finished) => {}
     }
+}
+
+/// The cleared band as `(centre, radius)` discs: every finished scout's quiet stretches (see `SurveySpec::cleared`).
+/// Empty if the level has no band.
+fn survey_band(g: &SurveyGame, animating: impl Fn(usize) -> bool) -> Vec<(V2, f64)> {
+    let mut out = vec![];
+    if !g.spec.band {
+        return out;
+    }
+    for (i, sc) in g.round().scouts.iter().enumerate() {
+        if !animating(i) {
+            let (centres, rad) = g.spec.cleared(&sc.traj);
+            out.extend(centres.into_iter().map(|c| (c, rad)));
+        }
+    }
+    out
 }
 
 /// Spend a test on the current marker (or show the same result again for free), and say what happened.
@@ -1410,13 +1478,15 @@ fn survey_scout_ok(g: &SurveyGame, p: V2) -> bool {
 }
 
 /// A faint ghost of what the active tool would place at `p`.
-fn survey_hover(g: &SurveyGame, tool: Tool, p: V2, accent: Color) {
+fn survey_hover(g: &SurveyGame, tool: Tool, p: V2, accent: Color, band: &[(V2, f64)]) {
     let s = r::w2s(p);
     match tool {
         Tool::Scout => {
             if survey_scout_ok(g, p) {
+                // amber when it would start on ground the band already rules out (it may still fly out of it)
+                let inside = band.iter().any(|(c, rad)| c.dist(p) < *rad);
                 draw_poly(s.x, s.y, 4, 13.0, 0.0, alpha(rgb(14, 16, 22), 0.6));
-                draw_poly_lines(s.x, s.y, 4, 13.0, 0.0, 2.0, alpha(WHITE, 0.55));
+                draw_poly_lines(s.x, s.y, 4, 13.0, 0.0, 2.0, if inside { alpha(rgb(240, 190, 70), 0.8) } else { alpha(WHITE, 0.55) });
             } else {
                 let c = alpha(bad_c(), 0.8);
                 draw_line(s.x - 8.0, s.y - 8.0, s.x + 8.0, s.y + 8.0, 2.5, c);
@@ -1442,13 +1512,68 @@ fn dashed_path(points: &[V2], col: Color, th: f32) {
     }
 }
 
+/// A picture key for the three kinds: what the arrows around a hidden source do. One line: three little diagrams
+/// (a centre with arrows going out, in, and around) each with its words.
+fn survey_kind_key(x: f32, y: f32) {
+    let items = [
+        ("repeller: arrows point away from it", 0),
+        ("attractor: arrows point toward it", 1),
+        ("swirl: arrows go around it", 2),
+    ];
+    let mut x = x;
+    for (words, which) in items {
+        let (cx, cy) = (x + 14.0, y - 5.0);
+        draw_circle(cx, cy, 2.5, WHITE);
+        for i in 0..4 {
+            let a = std::f32::consts::FRAC_PI_4 + i as f32 * std::f32::consts::FRAC_PI_2;
+            let (dir, side) = (vec2(a.cos(), a.sin()), vec2(-a.sin(), a.cos()));
+            let (from, to) = match which {
+                0 => (vec2(cx, cy) + dir * 6.0, vec2(cx, cy) + dir * 14.0),
+                1 => (vec2(cx, cy) + dir * 14.0, vec2(cx, cy) + dir * 6.0),
+                _ => (vec2(cx, cy) + dir * 10.0 - side * 4.5, vec2(cx, cy) + dir * 10.0 + side * 5.5),
+            };
+            r::draw_arrow(from, to, alpha(WHITE, 0.85), 1.5, false);
+        }
+        text(words, x + 34.0, y, 16.0, gray());
+        x += 34.0 + measure_text(words, None, 16, 1.0).width + 26.0;
+    }
+}
+
+/// After the commit: a ring of arrows around the revealed source showing what it really does (out, in or around),
+/// at 0.8 and 1.6 sigma, so a miss still shows how that kind looks.
+fn survey_demo_ring(spec: &SurveySpec, src: V2, kind: SourceKind) {
+    let term = kind.term(src, spec.k, spec.sigma);
+    for rad in [0.8 * spec.sigma, 1.6 * spec.sigma] {
+        for i in 0..8 {
+            let a = i as f64 * std::f64::consts::TAU / 8.0 + 0.3;
+            let p = src + vfield::v2(a.cos(), a.sin()) * rad;
+            let v = term.eval(p, 0.0);
+            if v.len() < 0.05 {
+                continue;
+            }
+            let tip = p + v * ((v.len() * 0.6).clamp(0.12, 0.5) / v.len());
+            r::draw_arrow(r::w2s(p), r::w2s(tip), alpha(WHITE, 0.6), 2.0, false);
+        }
+    }
+}
+
 /// Small arrows along a trail: the extra push the scout felt beyond the charted flow. They point away from the
 /// source, so lines drawn back along them meet at it; a longer arrow is a stronger push.
-fn survey_push(spec: &SurveySpec, traj: &Trajectory, col: Color) {
-    // reading aid first, so the arrows sit on top of the rays
-    for (p, dir) in spec.push_rays(traj) {
-        let (a, b) = (r::w2s(p), r::w2s(p + dir * 9.0));
-        draw_line(a.x, a.y, b.x, b.y, 1.5, alpha(col, 0.2));
+fn survey_push(spec: &SurveySpec, traj: &Trajectory, col: Color, perps: bool) {
+    // reading aids first, so the arrows sit on top of them
+    if spec.typed() {
+        // One family of lines at a time (P switches): lines along the arrows, or lines at right angles to them. A line
+        // is as strong as its arrow, so the long arrows near the source speak loudest and weak ones barely show.
+        for (p, push) in spec.push_samples_at(traj, 2.0 * PUSH_EVERY, PUSH_MIN) {
+            let d = if perps { push.perp() } else { push } * (1.0 / push.len());
+            let (a, b) = (r::w2s(p - d * 9.0), r::w2s(p + d * 9.0));
+            draw_line(a.x, a.y, b.x, b.y, 1.5, alpha(col, (push.len() as f32 * 0.4).clamp(0.08, 0.32)));
+        }
+    } else {
+        for (p, dir) in spec.push_rays(traj) {
+            let (a, b) = (r::w2s(p), r::w2s(p + dir * 9.0));
+            draw_line(a.x, a.y, b.x, b.y, 1.5, alpha(col, 0.2));
+        }
     }
     for (p, push) in spec.push_samples(traj) {
         let len = (push.len() * 0.45).clamp(0.12, 0.7);
@@ -1464,6 +1589,17 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
     let replay_all = st.anim.as_ref().is_some_and(|a| a.items.len() > 1);
 
     r::begin_area();
+    // The cleared band goes under everything else, as opaque discs so that overlaps merge into one even tone.
+    // Only finished trails clear anything; a scout still flying has not told us yet.
+    let band_scouts = g.round().scouts.len();
+    let animating = |i: usize| st.anim.is_some() && (replay_all || i + 1 == band_scouts);
+    let band = survey_band(g, animating);
+    let tone = r::bg();
+    let tone = Color::new(tone.r + 0.035, tone.g + 0.045, tone.b + 0.07, 1.0);
+    for (c, rad) in &band {
+        let s = r::w2s(*c);
+        draw_circle(s.x, s.y, *rad as f32 * r::PX, tone);
+    }
     r::draw_field(&lvl.field, 0.0, prefs.grid, prefs.hc);
     r::draw_zone_frame(&g.spec.zone);
     {
@@ -1477,7 +1613,7 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
                 r::draw_path(&sc.traj.points, col, 3.5);
                 r::draw_chevrons(&sc.traj.points, col, 1.4);
                 r::draw_marker_end(sc.traj.end(), col, "");
-                survey_push(&g.spec, &sc.traj, col);
+                survey_push(&g.spec, &sc.traj, col, st.perps);
             }
             r::draw_start(sc.start);
             let sp = r::w2s(sc.start);
@@ -1492,7 +1628,7 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
                     r::draw_probe(t.pos_at(a.time), *c);
                 } else {
                     r::draw_marker_end(t.end(), *c, "");
-                    survey_push(&g.spec, t, *c);
+                    survey_push(&g.spec, t, *c, st.perps);
                 }
             }
         }
@@ -1507,9 +1643,20 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
         }
         if let Some(m) = rd.marker {
             r::draw_estimate(m, g.spec.tol, accent);
+            if g.spec.typed() {
+                let s = r::w2s(m);
+                text(rd.marker_kind.short(), s.x + 14.0, s.y - 12.0, 16.0, alpha(accent, 0.9));
+            }
         }
         if let Some(src) = rd.revealed_source() {
             r::draw_source(src, g.spec.sigma);
+            if let Some(k) = rd.revealed_kind() {
+                survey_demo_ring(&g.spec, src, k);
+                if g.spec.typed() {
+                    let s = r::w2s(src);
+                    text(k.short(), s.x + 14.0, s.y + 24.0, 16.0, WHITE);
+                }
+            }
             if let Some(m) = rd.marker {
                 r::draw_arrow(r::w2s(m), r::w2s(src), alpha(WHITE, 0.7), 2.0, true);
             }
@@ -1519,7 +1666,7 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
     // (and whether the click would be refused) before it is spent. This shows a start point only, never
     // a predicted trail.
     if !flying && !g.finished() && r::in_area(inp.mouse) {
-        survey_hover(g, st.tool, r::s2w(inp.mouse), accent);
+        survey_hover(g, st.tool, r::s2w(inp.mouse), accent, &band);
     }
     if !flying && !g.finished() {
         let c = r::w2s(st.cur);
@@ -1527,16 +1674,28 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
         draw_line(c.x, c.y - 12.0, c.x, c.y + 12.0, 1.5, alpha(WHITE, 0.45));
     }
     r::end_area();
-    text(
-        "Small arrows on a trail: the extra push the scout felt beyond the charted flow. They point away from the source.",
-        r::AX,
-        r::AY + r::AH + 24.0,
-        16.0,
-        gray(),
-    );
+    if g.spec.typed() {
+        survey_kind_key(r::AX, r::AY + r::AH + 24.0);
+    } else {
+        text(
+            "Small arrows on a trail: the extra push the scout felt beyond the charted flow. They point away from the source.",
+            r::AX,
+            r::AY + r::AH + 24.0,
+            16.0,
+            gray(),
+        );
+    }
     let mut ly = r::AY + r::AH + 44.0;
-    if g.spec.rays {
-        text("Faint lines run back along each arrow. Where they cross is the source.", r::AX, ly, 16.0, gray());
+    let aids = match (g.spec.rays, g.spec.band) {
+        _ if g.spec.typed() && st.perps => "Faint lines at right angles to each arrow: they meet at a swirl's centre. P: back to lines along the arrows.",
+        _ if g.spec.typed() => "Faint lines along each arrow: they meet at a repeller or an attractor. P: lines at right angles instead (for a swirl).",
+        (true, true) => "Faint lines run back along each arrow: where they cross is the source. Shaded: a source there would already have been felt.",
+        (true, false) => "Faint lines run back along each arrow. Where they cross is the source.",
+        (false, true) => "Shaded: a source there would already have been felt.",
+        (false, false) => "",
+    };
+    if !aids.is_empty() {
+        text(aids, r::AX, ly, 16.0, gray());
         ly += 20.0;
     }
     if g.round().test.is_some() && !g.finished() {
@@ -1588,13 +1747,43 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
         if is_key_pressed(KeyCode::T) {
             survey_test(g, st);
         }
+        if g.spec.typed() && is_key_pressed(KeyCode::Y) {
+            let _ = g.set_marker_kind(g.round().marker_kind.next());
+        }
+        if g.spec.typed() && is_key_pressed(KeyCode::P) {
+            st.perps = !st.perps;
+        }
     }
 
     // panel
     let mut y = panel_header(&lvl);
     let attempt = format!("Attempt {}", g.attempts());
     text(&attempt, PX0 + PW - measure_text(&attempt, None, 18, 1.0).width, 108.0, 18.0, gray());
-    y = wrap("A hidden source pushes the flow away from itself. The arrows show only the charted background: scouts show what the current really does.", PX0, y + 8.0, PW, 17.0, gray());
+    if g.spec.typed() {
+        // which kinds have been found: the level is complete when all three are
+        let cw = (PW - 12.0) / 3.0;
+        for f in 0..3 {
+            let x = PX0 + f as f32 * (cw + 6.0);
+            let found = g.found[f];
+            if found {
+                draw_rectangle(x, y + 4.0, cw, 24.0, alpha(accent, 0.35));
+            }
+            draw_rectangle_lines(x, y + 4.0, cw, 24.0, 1.5, if found { accent } else { gray() });
+            let name = SourceKind::FAMILY_NAMES[f];
+            let w = measure_text(name, None, 16, 1.0).width;
+            text(name, x + (cw - w) / 2.0, y + 21.0, 16.0, if found { WHITE } else { gray() });
+        }
+        y += 34.0;
+    }
+    let intro = if g.spec.typed() {
+        "A hidden source pushes away, pulls in, or pushes sideways. Find one of each kind. Y sets the marker's kind."
+    } else if g.spec.band && !g.spec.rays {
+        // the second level: say what is new, in about the same space
+        "A hidden source pushes the flow away from itself. Scouts show what it did to them. Shaded ground is ruled out. No guide lines now: extend the arrows yourself."
+    } else {
+        "A hidden source pushes the flow away from itself. The arrows show only the charted background: scouts show what the current really does."
+    };
+    y = wrap(intro, PX0, y + 8.0, PW, 17.0, gray());
     y += 10.0;
     text("Scouts left", PX0, y + 14.0, 19.0, WHITE);
     for i in 0..g.spec.budget {
@@ -1630,12 +1819,24 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
         Some(m) => text(&format!("Marker: ({:.1}, {:.1})", m.x, m.y), PX0, y + 14.0, 19.0, WHITE),
         None => text("Marker: not placed", PX0, y + 14.0, 19.0, gray()),
     }
-    y = wrap(&format!("Counts as found within {:.2} of the source.", g.spec.tol), PX0, y + 40.0, PW, 17.0, gray());
+    y = if g.spec.typed() {
+        // room for the kind button: the tolerance is given in the result instead
+        y + 46.0
+    } else {
+        wrap(&format!("Counts as found within {:.2} of the source.", g.spec.tol), PX0, y + 40.0, PW, 17.0, gray())
+    };
     let ready = live && g.round().marker.is_some();
     if ui::button(inp, Rect::new(PX0, y + 8.0, PW, 42.0), "Commit position (C)", ready, accent) {
         survey_commit(g, st);
     }
     y += 62.0;
+    if live && g.spec.typed() {
+        let label = format!("Marker kind (Y): {}", g.round().marker_kind.short());
+        if ui::button(inp, Rect::new(PX0, y, PW, 34.0), &label, true, accent) {
+            let _ = g.set_marker_kind(g.round().marker_kind.next());
+        }
+        y += 44.0;
+    }
     if live {
         let label = format!("Test estimate (T): {} left", g.tests_left());
         if ui::button(inp, Rect::new(PX0, y, PW, 34.0), &label, g.round().marker.is_some(), rgb(90, 96, 118)) {
@@ -1644,7 +1845,8 @@ fn survey_frame(g: &mut SurveyGame, st: &mut St, inp: &Input, prefs: &Prefs) {
         y += 44.0;
     }
     if let Some(src) = g.round().revealed_source() {
-        wrap(&format!("The source was at ({:.1}, {:.1}). Press R for a new hidden position.", src.x, src.y), PX0, y, PW, 17.0, WHITE);
+        let what = if g.spec.typed() { format!("The source was a {} at", g.round().revealed_kind().map_or("source", |k| k.name())) } else { "The source was at".to_string() };
+        wrap(&format!("{} ({:.1}, {:.1}). Press R for a new hidden position.", what, src.x, src.y), PX0, y, PW, 17.0, WHITE);
     }
 }
 
@@ -1719,6 +1921,77 @@ mod tests {
         let (mut g, mut st) = survey_state();
         survey_commit(&mut g, &mut st);
         assert!(st.msg.contains("marker") && !g.finished() && st.good.is_none() && !st.banner);
+    }
+
+    fn typed_state() -> (SurveyGame, St) {
+        (SurveyGame::new(levels::survey_levels().remove(2)), St::default())
+    }
+
+    /// Answer the current round correctly through the interface's own commit.
+    fn answer(g: &mut SurveyGame, st: &mut St) {
+        let (src, kind) = g.round().truth();
+        g.set_marker(src).unwrap();
+        g.set_marker_kind(kind).unwrap();
+        survey_commit(g, st);
+    }
+
+    #[test]
+    fn a_right_place_with_the_wrong_kind_is_called_that_and_a_missed_swirl_is_explained() {
+        let (mut g, mut st) = typed_state();
+        // round 1 is a repeller: say "attractor" at the right place
+        let (src, _) = g.round().truth();
+        g.set_marker(src).unwrap();
+        g.set_marker_kind(SourceKind::Attractor).unwrap();
+        survey_commit(&mut g, &mut st);
+        assert!(st.msg.contains("wrong kind") && st.msg.contains("repeller") && st.good == Some(false) && !st.banner, "{}", st.msg);
+        assert!(!st.msg.contains("sideways"), "only a swirl gets the swirl explanation");
+        // find the repeller and then the attractor, so that a swirl comes up
+        for _ in 0..2 {
+            g.retry().unwrap();
+            answer(&mut g, &mut st);
+        }
+        g.retry().unwrap();
+        let (src, kind) = g.round().truth();
+        assert!(kind.is_swirl(), "after a repeller and an attractor, a swirl");
+        g.set_marker(vfield::v2(src.x + 2.0, src.y)).unwrap();
+        g.set_marker_kind(SourceKind::Repeller).unwrap();
+        survey_commit(&mut g, &mut st);
+        assert!(st.msg.contains("Missed") && st.msg.contains("swirl") && st.msg.contains("sideways") && st.msg.contains("P"), "{}", st.msg);
+        assert!(st.msg.len() <= 140, "the message must fit above the buttons ({} chars)", st.msg.len());
+        // a swirl found completes the level and says so
+        g.retry().unwrap();
+        answer(&mut g, &mut st);
+        assert!(st.msg.contains("Found it") && st.msg.contains("It was a swirl") && st.msg.contains("3 of 3") && st.banner && g.won, "{}", st.msg);
+    }
+
+    #[test]
+    fn finding_one_kind_is_progress_and_not_a_finished_level() {
+        let (mut g, mut st) = typed_state();
+        answer(&mut g, &mut st);
+        assert!(st.good == Some(true) && !st.banner && !g.won, "{}", st.msg);
+        assert!(st.msg.contains("1 of 3 kinds found") && st.msg.contains("Press R"), "{}", st.msg);
+        assert!(st.msg.len() <= 140, "{} chars", st.msg.len());
+        g.retry().unwrap();
+        answer(&mut g, &mut st);
+        assert!(st.msg.contains("2 of 3") && !st.banner && !g.won, "{}", st.msg);
+    }
+
+    #[test]
+    fn the_second_levels_hints_follow_what_the_free_scout_showed() {
+        let lvl = levels::survey_levels().remove(1);
+        let mut texts = std::collections::HashSet::new();
+        for a in 0..6 {
+            let mut g = SurveyGame::new(lvl.clone());
+            for _ in 0..a {
+                g.set_marker(g.spec.zone.clamp(vfield::v2(0.0, 0.0))).unwrap();
+                g.commit().unwrap();
+                g.retry().unwrap();
+            }
+            let hints = hint_texts(&Game::Survey(g), &lvl);
+            assert_eq!(hints.len(), 3);
+            texts.insert(hints[0].clone());
+        }
+        assert_eq!(texts.len(), 3, "quiet, one arrow and a wedge each get their own first hint");
     }
 
     #[test]

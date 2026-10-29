@@ -467,9 +467,9 @@ World coordinates: x to the right, y up. Every level uses the bounds x in [-6, 6
 ## sur-1 - Something in the Stream (Survey)
 
 - objective: Something hidden pushes the flow away from itself. Fly scouts, then mark where it is.
-- hint 1: The arrows show the flow as charted. Where a scout does something the arrows do not predict, the hidden source is acting on it.
-- hint 2: A scout that passes far from the source learns almost nothing: its trail only speaks for the places it went near.
-- hint 3: Two guesses for the source send a scout in different directions only from certain places. Put the next scout where they disagree.
+- hint 1: The grey arrows show the flow with nothing hidden. Where a scout's path bends away from them, something hidden is pushing it.
+- hint 2: The small arrows on a trail show that push, and they point away from the source. Extend them backwards in your head, or follow the faint lines: where they cross is the source.
+- hint 3: A scout only feels the source from about 2.4 away. If your first scouts felt nothing, release the next one nearer to where you suspect it.
 - bounds: x in [-6, 6], y in [-4, 4]; simulation time limit: 5 s; seed: 310205517
 - field layers (summed; a *tunable* layer is multiplied by the intensity):
   1. fixed - uniform flow (1, 0)
@@ -483,7 +483,55 @@ World coordinates: x to the right, y up. Every level uses the bounds x in [-6, 6
   - one commit per attempt; correct within 0.75 of the source
   - estimate tests per attempt: 3 (each shows what the scouts would have done if the source were at the marker)
   - reading aid: faint rays back along each push arrow on
-  - hidden positions, one per attempt, easy to hard on the first pass, then reshuffled each pass: (-3.25, -2.25), (-2.75, 2.25), (-0.75, -2.25), (-0.25, 2.25), (3.25, -1.75), (2.25, 2.25)
+  - reading aid: shaded band where a source would already have been felt off
+  - hidden positions, one per attempt, easy to hard on the first pass, then reshuffled each pass
+  - hidden positions: (-3.25, -2.25), (-2.75, 2.25), (-0.75, -2.25), (-0.25, 2.25), (3.25, -1.75), (2.25, 2.25)
+
+## sur-2 - One Look Is a Line (Survey)
+
+- objective: Something hidden pushes the flow away from itself. One scout may only tell you which line it is on. No guide lines now.
+- hint 1: Extend the small arrows backwards: the source is somewhere along each of those lines.
+- hint 2: To find where along the line, send a scout from a bit above or below it. Its arrows point away from the source at a different angle, so the lines cross.
+- hint 3: The shaded ground is where a source would already have been felt. It is not there.
+- bounds: x in [-6, 6], y in [-4, 4]; simulation time limit: 5 s; seed: 310205518
+- field layers (summed; a *tunable* layer is multiplied by the intensity):
+  1. fixed - uniform flow (1, 0)
+- regions:
+- rules:
+  - mechanic: **Survey**
+  - the field layers above are the *charted background*; the hidden source is added to them and is not listed
+  - hidden source: local repeller (Gauss term), strength k = 1.65, width sigma = 0.8, position unknown
+  - scouts may be placed anywhere in rectangle x in [-5.5, 5.5], y in [-3.5, 3.5]; each leaves a 5 s trail
+  - free scout flown at the start of every attempt from (-5, 0); 2 further scouts can be placed
+  - one commit per attempt; correct within 0.6 of the source
+  - estimate tests per attempt: 3 (each shows what the scouts would have done if the source were at the marker)
+  - reading aid: faint rays back along each push arrow off
+  - reading aid: shaded band where a source would already have been felt on
+  - hidden positions, one per attempt, easy to hard on the first pass, then reshuffled each pass
+  - hidden positions: (-1.5, 1.6), (1.55, 0.05), (0.5, -1.4), (1.4, -0.05), (3, 3), (2.5, -3)
+
+## sur-3 - Which Way It Pushes (Survey)
+
+- objective: Something hidden pushes the flow. It may push away, pull in, or push sideways. Say which, and where.
+- hint 1: Look at the small arrows around the spot where the trails bend. Pointing away from it: a repeller. Pointing toward it: an attractor. Going around it: a swirl. The key under the field shows all three.
+- hint 2: The faint lines run along each arrow. For a repeller or an attractor they cross at the source. A swirl's arrows point sideways, so those lines never cross: press P to switch to lines at right angles, which cross at a swirl's centre.
+- hint 3: Set the marker's kind with Y, then test it. A marker of the wrong kind never matches the dashes, even in the right place.
+- bounds: x in [-6, 6], y in [-4, 4]; simulation time limit: 5 s; seed: 310205519
+- field layers (summed; a *tunable* layer is multiplied by the intensity):
+  1. fixed - uniform flow (1, 0)
+- regions:
+- rules:
+  - mechanic: **Survey**
+  - the field layers above are the *charted background*; the hidden source is added to them and is not listed
+  - hidden source: a local repeller, attractor or swirl (Gauss terms), kind and position unknown and to be given by the marker; strength k = 1.3, width sigma = 1
+  - scouts may be placed anywhere in rectangle x in [-5.5, 5.5], y in [-3.5, 3.5]; each leaves a 5 s trail
+  - free scout flown at the start of every attempt from (-5, 0); 2 further scouts can be placed
+  - one commit per attempt; correct within 0.75 of the source
+  - estimate tests per attempt: 3 (each shows what the scouts would have done if the source were at the marker)
+  - reading aid: faint rays back along each push arrow on
+  - reading aid: shaded band where a source would already have been felt off
+  - the level is complete when a repeller, an attractor and a swirl have each been found; each attempt hides the first of those not yet found (so a miss gives another of the same kind), using the positions below in order
+  - hidden positions: repeller (-2.5, 1.2), attractor (-1.5, -1.3), swirl CCW (-3, 1.1), repeller (-2.6, -0.9), attractor (-2.2, 1.4), swirl CW (-1, -1.2), swirl CCW (-1.8, 0.4)
 
 ## cmb-1 - Through the Gate (Combinations)
 

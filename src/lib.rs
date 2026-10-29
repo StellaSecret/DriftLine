@@ -10,6 +10,6 @@ pub mod validate;
 pub mod validate_steer;
 pub mod validate_survey;
 
-pub use field::{v2, Field, Layer, Term, V2};
+pub use field::{v2, Field, Layer, SourceKind, Term, V2};
 pub use level::{Chapter, Challenge, GustDirs, Level, Reveal, Rules, Slot, Zone};
 pub use sim::{simulate, Outcome, Rect, Region, RegionKind, SimConfig, Trajectory};

@@ -1,5 +1,5 @@
 //! All content, as data. Field types, constraints and mechanics are combined here and nowhere else.
-use crate::field::{v2, Field, SwirlKind, Term, V2};
+use crate::field::{v2, Field, SourceKind, SwirlKind, Term, V2};
 use crate::level::*;
 use crate::sim::{Rect, Region};
 use std::f64::consts::TAU;
@@ -74,6 +74,32 @@ const SURVEY_SIGMA: f64 = 1.0;
 /// not to 0.5). 1.0 (= sigma) was tried and rejected: the free scout alone then settles (-2.75, 2.25), which the level
 /// must never allow. 0.75 keeps every authored position valid (see SURVEY_VALIDATION.md) and is the middle ground.
 const SURVEY_TOL: f64 = 0.75;
+/// Level 2 of Survey ("One Look Is a Line"): peak push 0.8 (k * sigma * e^-0.5), felt out to 1.87 at `PUSH_MIN`.
+const SURVEY2_K: f64 = 1.65;
+const SURVEY2_SIGMA: f64 = 0.8;
+/// 0.75 sigma, as for level 1.
+const SURVEY2_TOL: f64 = 0.6;
+/// Hidden positions in play order: graze, head-on, graze, head-on, quiet, quiet. The free scout flies y = 0 from
+/// x = -5 and ends at x = 0 (sensing radius 1.87). Graze sources sit about 1.5 from that line or its end, head-on ones on it 1.4-1.6 beyond its end (one weak arrow, and the slowdown is too small to read from the dashes), quiet
+/// ones more than 2.4 off it. Checked by `tests/survey.rs` (`level_two_*`).
+const SURVEY2_POOL: [(f64, f64); 6] = [(-1.5, 1.6), (1.55, 0.05), (0.5, -1.4), (1.4, -0.05), (3.0, 3.0), (2.5, -3.0)];
+/// Level 3 of Survey ("Which Way It Pushes"): peak push 0.79, tolerance 0.75 (sigma 1). The level is complete when a
+/// repeller, an attractor and a swirl have each been found, and the next attempt is always of the first kind still
+/// missing (`pick_index` in modes/survey.rs), so a miss gives another of the same kind. Each kind has two or three
+/// positions, in the order they are used: repeller, repeller; attractor, attractor; swirl CCW, swirl CW, then a hard
+/// swirl close to the free trail.
+const SURVEY3_K: f64 = 1.3;
+const SURVEY3_SIGMA: f64 = 1.0;
+const SURVEY3_TOL: f64 = 0.75;
+const SURVEY3_POOL: [(f64, f64, SourceKind); 7] = [
+    (-2.5, 1.2, SourceKind::Repeller),
+    (-1.5, -1.3, SourceKind::Attractor),
+    (-3.0, 1.1, SourceKind::SwirlCcw),
+    (-2.6, -0.9, SourceKind::Repeller),
+    (-2.2, 1.4, SourceKind::Attractor),
+    (-1.0, -1.2, SourceKind::SwirlCw),
+    (-1.8, 0.4, SourceKind::SwirlCcw),
+];
 /// Seconds of trail a scout leaves.
 const SURVEY_TRAIL: f64 = 5.0;
 /// Authored hidden positions (off the validator's 0.5 candidate grid on purpose), **in the order a player meets them**:
@@ -238,13 +264,49 @@ pub fn survey_levels() -> Vec<Level> {
         "Something hidden pushes the flow away from itself. Fly scouts, then mark where it is.",
         Field::new().fixed(uni(1.0, 0.0)),
         vec![],
-        Rules::Survey { zone: zr(-5.5, -3.5, 5.5, 3.5), free: v2(-5.0, 0.0), scouts: 2, k: SURVEY_K, sigma: SURVEY_SIGMA, tol: SURVEY_TOL, rays: true, pool: SURVEY_POOL.iter().map(|&(x, y)| v2(x, y)).collect() });
+        Rules::Survey { zone: zr(-5.5, -3.5, 5.5, 3.5), free: v2(-5.0, 0.0), scouts: 2, k: SURVEY_K, sigma: SURVEY_SIGMA, tol: SURVEY_TOL, rays: true, band: false, pool: SURVEY_POOL.iter().map(|&(x, y)| v2(x, y)).collect(), kinds: vec![SourceKind::Repeller; SURVEY_POOL.len()] });
     l.max_time = SURVEY_TRAIL;
-    vec![hints(l, &[
-        "The arrows show the flow as charted. Where a scout does something the arrows do not predict, the hidden source is acting on it.",
-        "A scout that passes far from the source learns almost nothing: its trail only speaks for the places it went near.",
-        "Two guesses for the source send a scout in different directions only from certain places. Put the next scout where they disagree.",
-    ])]
+    let one = hints(l, &[
+        "The grey arrows show the flow with nothing hidden. Where a scout's path bends away from them, something hidden is pushing it.",
+        "The small arrows on a trail show that push, and they point away from the source. Extend them backwards in your head, or follow the faint lines: where they cross is the source.",
+        "A scout only feels the source from about 2.4 away. If your first scouts felt nothing, release the next one nearer to where you suspect it.",
+    ]);
+
+    // One Look Is a Line: same repeller, narrower and weaker (peak push 0.8, below the stream speed so nothing
+    // stalls), and the hidden positions are chosen so that the free scout never settles one. Graze: at the edge of
+    // the free scout's reach, so it shows one or two weak arrows (a long thin wedge). Head-on: just beyond the end of
+    // its trail, on its own line, so its arrows are collinear and say "on this line", not where. Quiet: out of reach,
+    // so it shows nothing. The shaded band turns that silence into evidence.
+    let mut two = base("sur-2", Chapter::Survey, "One Look Is a Line",
+        "Something hidden pushes the flow away from itself. One scout may only tell you which line it is on. No guide lines now.",
+        Field::new().fixed(uni(1.0, 0.0)),
+        vec![],
+        Rules::Survey { zone: zr(-5.5, -3.5, 5.5, 3.5), free: v2(-5.0, 0.0), scouts: 2, k: SURVEY2_K, sigma: SURVEY2_SIGMA, tol: SURVEY2_TOL, rays: false, band: true, pool: SURVEY2_POOL.iter().map(|&(x, y)| v2(x, y)).collect(), kinds: vec![SourceKind::Repeller; SURVEY2_POOL.len()] });
+    two.max_time = SURVEY_TRAIL;
+    // The hints for this level are chosen by what the free scout showed (see `survey_hint_texts` in app.rs);
+    // these are the general ones, shown if that cannot be told.
+    let two = hints(two, &[
+        "Extend the small arrows backwards: the source is somewhere along each of those lines.",
+        "To find where along the line, send a scout from a bit above or below it. Its arrows point away from the source at a different angle, so the lines cross.",
+        "The shaded ground is where a source would already have been felt. It is not there.",
+    ]);
+
+    // Which Way It Pushes: the source may push away, pull in, or push sideways, and the marker must say which.
+    // Peak push 0.79 (below the stream speed, so nothing stalls). All six sources are within reach of the free
+    // scout and its type is readable from it alone: this is the level where the player learns the kinds.
+    let mut three = base("sur-3", Chapter::Survey, "Which Way It Pushes",
+        "Something hidden pushes the flow. It may push away, pull in, or push sideways. Say which, and where.",
+        Field::new().fixed(uni(1.0, 0.0)),
+        vec![],
+        Rules::Survey { zone: zr(-5.5, -3.5, 5.5, 3.5), free: v2(-5.0, 0.0), scouts: 2, k: SURVEY3_K, sigma: SURVEY3_SIGMA, tol: SURVEY3_TOL, rays: true, band: false,
+            pool: SURVEY3_POOL.iter().map(|&(x, y, _)| v2(x, y)).collect(), kinds: SURVEY3_POOL.iter().map(|&(_, _, k)| k).collect() });
+    three.max_time = SURVEY_TRAIL;
+    let three = hints(three, &[
+        "Look at the small arrows around the spot where the trails bend. Pointing away from it: a repeller. Pointing toward it: an attractor. Going around it: a swirl. The key under the field shows all three.",
+        "The faint lines run along each arrow. For a repeller or an attractor they cross at the source. A swirl's arrows point sideways, so those lines never cross: press P to switch to lines at right angles, which cross at a swirl's centre.",
+        "Set the marker's kind with Y, then test it. A marker of the wrong kind never matches the dashes, even in the right place.",
+    ]);
+    vec![one, two, three]
 }
 
 pub fn combo_levels() -> Vec<Level> {

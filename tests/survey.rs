@@ -14,8 +14,9 @@ fn game() -> SurveyGame {
 /// Same level with different rules parameters (tests of the validator's ability to say "no").
 fn with(f: impl FnOnce(&mut f64, &mut Vec<V2>)) -> Level {
     let mut l = level();
-    if let Rules::Survey { k, pool, .. } = &mut l.rules {
+    if let Rules::Survey { k, pool, kinds, .. } = &mut l.rules {
         f(k, pool);
+        kinds.resize(pool.len(), SourceKind::Repeller);
     }
     l
 }
@@ -292,14 +293,18 @@ fn different_hidden_positions_give_different_free_trails() {
 
 // ---------------- the level and its validation ----------------
 #[test]
-fn survey_is_registered_as_a_chapter_with_one_level() {
+fn survey_is_registered_as_a_chapter_with_three_levels() {
     assert!(Chapter::ALL.contains(&Chapter::Survey));
     assert_eq!(Chapter::Survey.name(), "Survey");
     let ls = levels::survey_levels();
-    assert_eq!(ls.len(), 1);
-    assert!(levels::all().iter().any(|l| l.id == "sur-1" && l.chapter == Chapter::Survey));
-    assert!(matches!(ls[0].rules, Rules::Survey { .. }));
-    assert_eq!(ls[0].hints.len(), 3);
+    assert_eq!(ls.len(), 3);
+    for id in ["sur-1", "sur-2", "sur-3"] {
+        assert!(levels::all().iter().any(|l| l.id == id && l.chapter == Chapter::Survey));
+    }
+    for l in &ls {
+        assert!(matches!(l.rules, Rules::Survey { .. }));
+        assert_eq!(l.hints.len(), 3);
+    }
 }
 
 #[test]
@@ -566,3 +571,438 @@ fn a_scout_near_the_source_locates_it_and_the_free_scout_alone_never_does() {
         assert!(est.dist(src) < 0.1, "{src:?}: arrows point to {est:?}");
     }
 }
+
+// ---------------- level 2: One Look Is a Line ----------------
+fn spec2() -> SurveySpec {
+    SurveySpec::from_level(&levels::survey_levels().remove(1))
+}
+
+type Arrows = Vec<(V2, V2)>;
+
+fn arrows_of(sp: &SurveySpec, src: V2, start: V2) -> Arrows {
+    sp.push_samples(&sp.fly(src, start))
+}
+
+/// How often the lines back along the given scouts' push arrows, read with a per-trail bias (8 deg) and per-arrow
+/// jitter (6 deg), land within `tol` of `src`. Needs at least 3 arrows. Deterministic (seeded).
+fn read_from(tol: f64, src: V2, scouts: &[&Arrows], seed: u64, trials: usize) -> f64 {
+    read_rough(tol, src, scouts, (8.0, 6.0), seed, trials)
+}
+
+/// `read_from` with an explicit reading error: (bias per trail, jitter per arrow) in degrees.
+fn read_rough(tol: f64, src: V2, scouts: &[&Arrows], (bias_deg, jitter_deg): (f64, f64), seed: u64, trials: usize) -> f64 {
+    let mut rng = vfield::modes::Lcg(seed);
+    let mut gauss = || {
+        let u1 = (rng.below(1_000_000) as f64 + 1.0) / 1_000_001.0;
+        let u2 = rng.below(1_000_000) as f64 / 1e6;
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    };
+    let mut hit = 0;
+    for _ in 0..trials {
+        let (mut lines, mut n) = (vec![], 0);
+        for arrows in scouts {
+            let bias = gauss() * bias_deg.to_radians();
+            for &(p, push) in arrows.iter() {
+                n += 1;
+                let a = (-push.y).atan2(-push.x) + bias + gauss() * jitter_deg.to_radians();
+                lines.push((p, v2(a.cos(), a.sin()), push.len() * push.len()));
+            }
+        }
+        if n >= 3 && nearest_to_lines(&lines).map_or(false, |e| e.dist(src) <= tol) {
+            hit += 1;
+        }
+    }
+    hit as f64 / trials as f64
+}
+
+fn read_success(sp: &SurveySpec, src: V2, starts: &[V2], seed: u64, trials: usize) -> f64 {
+    let cached: Vec<Arrows> = starts.iter().map(|&s| arrows_of(sp, src, s)).collect();
+    read_from(sp.tol, src, &cached.iter().collect::<Vec<_>>(), seed, trials)
+}
+
+#[test]
+fn level_two_is_a_narrower_weaker_source_with_the_band_on_and_the_rays_off() {
+    let sp = spec2();
+    assert_eq!((sp.k, sp.sigma), (1.65, 0.8));
+    assert!((sp.tol - 0.75 * sp.sigma).abs() < 1e-12, "tolerance is 0.75 sigma");
+    assert!(sp.k * sp.sigma * (-0.5f64).exp() < 0.85, "peak push stays well under the stream speed (1.0): nothing stalls");
+    assert!(sp.band && !sp.rays, "the band is the new aid; the rays are gone, so the arrows must be extended by eye");
+    assert!((sp.sense_radius() - 1.87).abs() < 0.02, "sensing radius {}", sp.sense_radius());
+    assert_eq!(sp.pool.len(), 6);
+    assert!(!game().spec.band, "level 1 has no band");
+}
+
+#[test]
+fn level_two_attempts_are_graze_head_on_graze_head_on_quiet_quiet() {
+    let sp = spec2();
+    let arrows = |i: usize| sp.push_samples(&sp.fly(sp.pool[i], sp.free)).len();
+    for i in [0, 2] {
+        assert!((1..=3).contains(&arrows(i)), "graze {i}: {} free arrows", arrows(i));
+    }
+    for i in [1, 3] {
+        let src = sp.pool[i];
+        assert_eq!(arrows(i), 1, "head-on {i}: one weak arrow, along the line");
+        assert!(src.y.abs() < 0.1 && (1.3..=1.7).contains(&src.x), "head-on {i} sits on the free line just beyond its end: {src:?}");
+    }
+    for i in [4, 5] {
+        let closest = sp.fly(sp.pool[i], sp.free).points.iter().map(|p| p.dist(sp.pool[i])).fold(f64::MAX, f64::min);
+        assert_eq!(arrows(i), 0, "quiet {i}");
+        assert!(closest > sp.sense_radius() + 1.0, "quiet {i} is well out of reach ({closest})");
+    }
+}
+
+#[test]
+fn level_two_free_scout_never_settles_and_same_line_scouts_add_nothing_to_head_on_and_quiet() {
+    let sp = spec2();
+    for (i, &src) in sp.pool.iter().enumerate() {
+        assert!(read_success(&sp, src, &[sp.free], 10 + i as u64, 100) <= 0.1, "{src:?}: the free scout alone settles it");
+    }
+    // Two more scouts on the free scout's own line, released where it was: the same look again. Not claimed for the
+    // grazes: a graze sits at the edge of the free scout's reach, so a scout released even a little further along the
+    // line sees a bit farther and can help (62% at (0.5, -1.4) from a start 1 unit downstream). That is a longer
+    // look along the same line, not a second viewpoint.
+    for i in [1, 3, 4, 5] {
+        let src = sp.pool[i];
+        let s = read_success(&sp, src, &[sp.free, v2(-4.8, 0.0), v2(-4.6, 0.0)], 20 + i as u64, 100);
+        assert!(s <= 0.1, "{src:?}: same-line scouts decide it ({s})");
+    }
+}
+
+#[test]
+fn level_two_a_scout_released_off_the_line_decides_graze_and_head_on_and_the_band_says_how_far_to_go_for_quiet() {
+    let sp = spec2();
+    for (i, &src) in sp.pool.iter().enumerate().take(4) {
+        let s = read_success(&sp, src, &[sp.free, v2(-2.0, 1.0), v2(-2.0, -1.0)], 30 + i as u64, 100);
+        assert!(s >= 0.8, "{src:?}: scouts 1 above and below solve it only {s}");
+    }
+    for (i, &src) in sp.pool.iter().enumerate().skip(4) {
+        let near = read_success(&sp, src, &[sp.free, v2(-2.0, 1.0), v2(-2.0, -1.0)], 40 + i as u64, 100);
+        let far = read_success(&sp, src, &[sp.free, v2(-2.0, 2.0), v2(-2.0, -2.0)], 50 + i as u64, 100);
+        assert!(near <= 0.1, "{src:?}: a quiet source cannot be felt from 1 off the line ({near})");
+        assert!(far >= 0.7, "{src:?}: but it can from 2 off ({far})");
+    }
+}
+
+#[test]
+fn level_two_blind_placement_is_not_enough_but_a_good_pair_always_exists() {
+    let sp = spec2();
+    let mut pts = vec![];
+    for x in -5..=5 {
+        for y in -3..=3 {
+            pts.push(v2(x as f64, y as f64));
+        }
+    }
+    for (k, &src) in sp.pool.iter().enumerate() {
+        let free = arrows_of(&sp, src, sp.free);
+        let cached: Vec<Arrows> = pts.iter().map(|&p| arrows_of(&sp, src, p)).collect();
+        let (mut sum, mut best, mut n) = (0.0, 0.0f64, 0);
+        for i in 0..pts.len() {
+            for j in i + 1..pts.len() {
+                let r = read_from(sp.tol, src, &[&free, &cached[i], &cached[j]], (k * 100_000 + i * 97 + j) as u64, 6);
+                sum += r;
+                best = best.max(r);
+                n += 1;
+            }
+        }
+        assert!(sum / (n as f64) < 0.55, "{src:?}: blind pairs average {}", sum / n as f64);
+        assert!(best >= 0.9, "{src:?}: no pair solves it ({best})");
+    }
+}
+
+#[test]
+fn the_cleared_band_never_covers_the_hidden_source() {
+    // The band is evidence that "it is not here"; if it ever covered the source it would be a lie. Every authored
+    // position, every lattice start, both levels.
+    for sp in [game().spec.clone(), spec2()] {
+        let r = sp.sense_radius();
+        assert!(r > 1.5);
+        for &src in &sp.pool {
+            let mut starts = vec![sp.free];
+            for x in -5..=5 {
+                for y in -3..=3 {
+                    starts.push(v2(x as f64, y as f64));
+                }
+            }
+            for s in starts {
+                let (centres, radius) = sp.cleared(&sp.fly(src, s));
+                assert!(radius > 0.0 && radius < r);
+                for c in centres {
+                    assert!(c.dist(src) > radius, "band from start {s:?} covers the source {src:?} (centre {c:?}, radius {radius})");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_cleared_band_is_there_when_a_scout_sees_nothing_and_leaves_a_gap_where_it_felt_something() {
+    let sp = spec2();
+    let quiet = sp.fly(sp.pool[5], sp.free);
+    assert!(sp.push_samples(&quiet).is_empty());
+    assert!(sp.cleared(&quiet).0.len() >= 20, "a silent trail clears the places it passed");
+    // a graze: the spots with an arrow clear nothing
+    let graze = sp.fly(sp.pool[0], sp.free);
+    let arrows = sp.push_samples_at(&graze, vfield::modes::CLEARED_EVERY, vfield::modes::PUSH_MIN);
+    assert!(!arrows.is_empty());
+    let (centres, _) = sp.cleared(&graze);
+    assert!(arrows.iter().all(|(p, _)| !centres.contains(p)));
+}
+
+#[test]
+fn level_two_stays_a_decision_when_read_by_eye_without_rays() {
+    // With no rays the player extends the arrows by eye: model that as 12 degrees of bias per trail and 10 of jitter
+    // per arrow. A scout released well still decides the grazes and head-ons; blind placement still does not.
+    let sp = spec2();
+    let by_eye = (12.0, 10.0);
+    for (i, &src) in sp.pool.iter().enumerate().take(4) {
+        let a: Vec<Arrows> = [sp.free, v2(-2.0, 1.0), v2(-2.0, -1.0)].iter().map(|&s| arrows_of(&sp, src, s)).collect();
+        let good = read_rough(sp.tol, src, &[&a[0], &a[1], &a[2]], by_eye, 60 + i as u64, 150);
+        assert!(good >= 0.85, "{src:?}: well-placed scouts solve it only {good} when read by eye");
+    }
+    for (i, &src) in sp.pool.iter().enumerate().skip(4) {
+        let a: Vec<Arrows> = [sp.free, v2(-2.0, 2.0), v2(-2.0, -2.0)].iter().map(|&s| arrows_of(&sp, src, s)).collect();
+        let good = read_rough(sp.tol, src, &[&a[0], &a[1], &a[2]], by_eye, 70 + i as u64, 150);
+        assert!(good >= 0.4, "{src:?}: even well-placed scouts solve the quiet ones only {good} when read by eye");
+    }
+}
+
+// ---------------- level 3: Which Way It Pushes ----------------
+fn spec3() -> SurveySpec {
+    SurveySpec::from_level(&levels::survey_levels().remove(2))
+}
+
+#[test]
+fn gauss_vortex_pushes_sideways_with_the_same_profile_and_the_kinds_map_to_terms() {
+    let (k, sigma, c) = (1.3, 1.0, v2(0.0, 0.0));
+    let ccw = Field::new().fixed(SourceKind::SwirlCcw.term(c, k, sigma));
+    let cw = Field::new().fixed(SourceKind::SwirlCw.term(c, k, sigma));
+    let rep = Field::new().fixed(SourceKind::Repeller.term(c, k, sigma));
+    let att = Field::new().fixed(SourceKind::Attractor.term(c, k, sigma));
+    for p in [v2(1.0, 0.0), v2(0.0, 1.5), v2(-1.2, -0.7)] {
+        let (a, b, r, t) = (ccw.eval(p, 0.0), cw.eval(p, 0.0), rep.eval(p, 0.0), att.eval(p, 0.0));
+        assert!(a.dot(p).abs() < 1e-12, "a swirl is at right angles to the line from its centre");
+        assert!((a.len() - r.len()).abs() < 1e-12, "same speed profile as the repeller");
+        assert!((a + b).len() < 1e-12 && (r + t).len() < 1e-12, "clockwise is the opposite of counter-clockwise, attract of repel");
+        assert!(a.dot(p.perp()) > 0.0, "k > 0 is counter-clockwise");
+        assert!(r.dot(p) > 0.0 && t.dot(p) < 0.0);
+    }
+}
+
+#[test]
+fn level_three_asks_for_a_kind_and_has_the_designed_attempts() {
+    let sp = spec3();
+    assert!(sp.typed() && sp.rays && !sp.band);
+    assert_eq!((sp.k, sp.sigma, sp.tol), (1.3, 1.0, 0.75));
+    assert!(sp.k * sp.sigma * (-0.5f64).exp() < 0.8, "peak push stays below the stream speed");
+    use SourceKind::*;
+    assert_eq!(sp.kinds, vec![Repeller, Attractor, SwirlCcw, Repeller, Attractor, SwirlCw, SwirlCcw]);
+    // every kind has at least two positions, so a miss can be followed by another of the same kind
+    for f in 0..3 {
+        assert!(sp.kinds.iter().filter(|k| k.family() == f).count() >= 2, "family {f}");
+    }
+    assert!(!game().spec.typed() && !spec2().typed(), "the earlier levels are repeller-only");
+    // a kind always travels with its position, in every pass
+    for a in 0..30 {
+        let (p, k) = (sp.source_for_attempt(a), sp.kind_for_attempt(a));
+        assert!(sp.pool.iter().zip(&sp.kinds).any(|(q, kk)| *q == p && *kk == k), "attempt {a} separated a kind from its position");
+    }
+}
+
+/// Lines through each arrow, weighted by strength squared: (best point, weighted mean squared offset).
+fn fit_lines(lines: &[(V2, V2, f64)]) -> Option<(V2, f64)> {
+    let est = nearest_to_lines(lines)?;
+    let w: f64 = lines.iter().map(|l| l.2).sum();
+    let r: f64 = lines.iter().map(|&(p, d, wt)| { let q = est - p; let off = q.x * d.y - q.y * d.x; wt * off * off }).sum();
+    Some((est, r / w))
+}
+
+/// Decide kind and place from arrows the way a careful reader does: if lines along the arrows meet, it is a
+/// repeller or attractor (which, by whether the arrows point away from the crossing or toward it); if lines at right
+/// angles meet, a swirl (which way round, by the sense of the arrows about the crossing).
+fn read_kind(arrows: &[(V2, V2)]) -> Option<(SourceKind, V2)> {
+    let axial: Vec<_> = arrows.iter().map(|&(p, u)| (p, u * (1.0 / u.len()), u.len().powi(2))).collect();
+    let normal: Vec<_> = arrows.iter().map(|&(p, u)| (p, u.perp() * (1.0 / u.len()), u.len().powi(2))).collect();
+    let (ea, ra) = fit_lines(&axial)?;
+    let (en, rn) = fit_lines(&normal)?;
+    if ra <= rn {
+        let s: f64 = arrows.iter().map(|&(p, u)| u.dot(p - ea) / u.len()).sum();
+        Some((if s > 0.0 { SourceKind::Repeller } else { SourceKind::Attractor }, ea))
+    } else {
+        let s: f64 = arrows.iter().map(|&(p, u)| u.dot((p - en).perp()) / u.len()).sum();
+        Some((if s > 0.0 { SourceKind::SwirlCcw } else { SourceKind::SwirlCw }, en))
+    }
+}
+
+#[test]
+fn level_three_is_complete_only_when_a_repeller_an_attractor_and_a_swirl_have_each_been_found() {
+    let mut g = SurveyGame::new(levels::survey_levels().remove(2));
+    assert_eq!(g.families_needed(), vec![0, 1, 2]);
+    let mut kinds_met = vec![];
+    for round in 0..3 {
+        assert!(!g.complete() && !g.won, "round {round}: done too early");
+        let (src, kind) = g.round().truth();
+        kinds_met.push(kind.family());
+        g.set_marker(src).unwrap();
+        g.set_marker_kind(kind).unwrap();
+        assert!(g.commit().unwrap().ok);
+        assert!(g.found[kind.family()]);
+        if round < 2 {
+            assert!(!g.won, "one kind found is not the level");
+            g.retry().unwrap();
+        }
+    }
+    assert_eq!(kinds_met, vec![0, 1, 2], "the kinds come in the order repeller, attractor, swirl");
+    assert!(g.complete() && g.won, "all three found: the level is complete, in three attempts");
+    // after that it keeps serving attempts (the player chose to keep playing)
+    g.retry().unwrap();
+    assert!(g.round().index < g.spec.pool.len());
+}
+
+#[test]
+fn level_three_a_miss_is_followed_by_another_of_the_same_kind_and_cycles_through_its_positions() {
+    let mut g = SurveyGame::new(levels::survey_levels().remove(2));
+    let mut seen = vec![];
+    // miss four times in a row: the level keeps asking for the first kind not found (a repeller)
+    for _ in 0..4 {
+        let (src, kind) = g.round().truth();
+        seen.push((g.round().index, kind));
+        g.set_marker(v2(src.x + 3.0, src.y)).unwrap();
+        g.set_marker_kind(kind).unwrap();
+        assert!(!g.commit().unwrap().ok);
+        g.retry().unwrap();
+    }
+    assert!(seen.iter().all(|(_, k)| *k == SourceKind::Repeller), "{seen:?}");
+    assert_ne!(seen[0].0, seen[1].0, "a miss gives a different position of the same kind");
+    assert_eq!(seen[0].0, seen[2].0, "with two positions, they alternate");
+    // then find it: the next kind needed is the attractor
+    let (src, kind) = g.round().truth();
+    g.set_marker(src).unwrap();
+    g.set_marker_kind(kind).unwrap();
+    g.commit().unwrap();
+    g.retry().unwrap();
+    assert_eq!(g.round().truth().1, SourceKind::Attractor);
+    assert!(!g.won);
+}
+
+#[test]
+fn level_three_lines_along_the_arrows_meet_for_repellers_and_attractors_and_right_angles_meet_for_swirls() {
+    let sp = spec3();
+    for (i, &src) in sp.pool.iter().enumerate() {
+        let kind = sp.kinds[i];
+        let arrows = sp.push_samples(&sp.fly_kind(src, kind, sp.free));
+        assert!(arrows.len() >= 6, "{kind:?} at {src:?}: the free scout shows only {} arrows", arrows.len());
+        let axial: Vec<_> = arrows.iter().map(|&(p, u)| (p, u * (1.0 / u.len()), 1.0)).collect();
+        let normal: Vec<_> = arrows.iter().map(|&(p, u)| (p, u.perp() * (1.0 / u.len()), 1.0)).collect();
+        let ((ea, ra), (en, rn)) = (fit_lines(&axial).unwrap(), fit_lines(&normal).unwrap());
+        if kind.is_swirl() {
+            assert!(rn < 1e-4 && en.dist(src) < 0.1, "{kind:?}: right-angle lines should meet at the centre ({rn}, {en:?})");
+            assert!(ra > 0.02, "{kind:?}: lines along a swirl's arrows must not meet ({ra})");
+        } else {
+            assert!(ra < 1e-4 && ea.dist(src) < 0.1, "{kind:?}: lines along the arrows should meet at the source ({ra}, {ea:?})");
+            assert!(rn > 0.02, "{kind:?}: right-angle lines must not meet ({rn})");
+        }
+    }
+}
+
+#[test]
+fn level_three_the_free_scout_alone_gives_the_kind_and_the_place_even_read_with_error() {
+    // This is the level where the kinds are learned: it must be readable from the free scout alone (the roadmap's
+    // "must hold"). Arrows read with 8 degrees of bias per trail and 6 of jitter per arrow.
+    let sp = spec3();
+    let mut rng = vfield::modes::Lcg(2024);
+    let mut gauss = || {
+        let u1 = (rng.below(1_000_000) as f64 + 1.0) / 1_000_001.0;
+        let u2 = rng.below(1_000_000) as f64 / 1e6;
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    };
+    for (i, &src) in sp.pool.iter().enumerate() {
+        let kind = sp.kinds[i];
+        let arrows = sp.push_samples(&sp.fly_kind(src, kind, sp.free));
+        let mut hit = 0;
+        for _ in 0..200 {
+            let bias = gauss() * 8f64.to_radians();
+            let read: Vec<_> = arrows.iter().map(|&(p, u)| {
+                let a = u.y.atan2(u.x) + bias + gauss() * 6f64.to_radians();
+                (p, v2(a.cos(), a.sin()) * u.len())
+            }).collect();
+            if let Some((k, e)) = read_kind(&read) {
+                if k == kind && e.dist(src) <= sp.tol {
+                    hit += 1;
+                }
+            }
+        }
+        assert!(hit >= 170, "{kind:?} at {src:?}: read right only {hit}/200 times from the free scout alone");
+    }
+}
+
+#[test]
+fn level_three_a_marker_of_the_wrong_kind_never_matches_the_dashes_however_close() {
+    let mut g = SurveyGame::new(levels::survey_levels().remove(2));
+    let mut kinds = std::collections::HashSet::new();
+    for _ in 0..7 {
+        let (src, kind) = g.round().truth();
+        kinds.insert(kind);
+        for wrong in SourceKind::ALL.into_iter().filter(|k| *k != kind) {
+            g.set_marker(src).unwrap();
+            g.set_marker_kind(wrong).unwrap();
+            g.test_estimate().unwrap();
+            let t = g.round().test.as_ref().unwrap();
+            assert_eq!(t.kind, wrong);
+            let gap = g.round().scouts[0].traj.points.iter().zip(&t.trails[0].points).map(|(a, b)| a.dist(*b)).fold(0.0, f64::max);
+            assert!(gap > 0.15, "a {wrong:?} marker exactly on the {kind:?} at {src:?} matches the free trail (gap {gap})");
+        }
+        // answer correctly, so the next attempt is of the next kind
+        g.set_marker_kind(kind).unwrap();
+        g.set_marker(src).unwrap();
+        g.commit().unwrap();
+        g.retry().unwrap();
+    }
+    assert!(kinds.len() >= 4, "the run covered every kind of source: {kinds:?}");
+}
+
+#[test]
+fn level_three_the_right_kind_in_the_right_place_reproduces_every_trail_exactly() {
+    let mut g = SurveyGame::new(levels::survey_levels().remove(2));
+    for a in 0..7 {
+        let (src, kind) = g.round().truth();
+        g.place_scout(v2(src.x - 1.0, src.y - 0.8)).unwrap();
+        g.set_marker(src).unwrap();
+        g.set_marker_kind(kind).unwrap();
+        g.test_estimate().unwrap();
+        let t = g.round().test.as_ref().unwrap();
+        assert_eq!(t.trails.len(), 2);
+        for (sc, tr) in g.round().scouts.iter().zip(&t.trails) {
+            assert_eq!(sc.traj.points, tr.points, "attempt {a}: {kind:?}");
+        }
+        g.commit().unwrap();
+        g.retry().unwrap();
+    }
+}
+
+#[test]
+fn level_three_a_commit_needs_the_right_kind_as_well_as_the_right_place() {
+    let mut g = SurveyGame::new(levels::survey_levels().remove(2));
+    let (src, kind) = g.round().truth();
+    g.set_marker(src).unwrap();
+    g.set_marker_kind(kind.next()).unwrap();
+    let v = g.commit().unwrap();
+    assert!(v.distance < 1e-9 && !v.kind_ok && !v.ok && !g.found[kind.family()], "right place, wrong kind is a miss");
+    assert_eq!(g.round().revealed_kind(), Some(kind));
+    g.retry().unwrap();
+    let (src, kind) = g.round().truth();
+    g.set_marker(v2(src.x + 0.3, src.y)).unwrap();
+    g.set_marker_kind(kind).unwrap();
+    let v = g.commit().unwrap();
+    assert!(v.kind_ok && v.ok && g.found[kind.family()]);
+    assert!(!g.won, "one kind is not the whole level");
+    // changing the kind is free and does not touch the tests spent
+    let mut h = SurveyGame::new(levels::survey_levels().remove(2));
+    h.set_marker(v2(0.0, 0.0)).unwrap();
+    h.set_marker_kind(SourceKind::SwirlCw).unwrap();
+    assert_eq!(h.tests_left(), TESTS_PER_ROUND);
+    assert_eq!(h.test_estimate(), Ok(true));
+    assert_eq!(h.test_estimate(), Ok(false), "same marker, same kind: free");
+    h.set_marker_kind(SourceKind::Attractor).unwrap();
+    assert_eq!(h.test_estimate(), Ok(true), "a different kind is a different estimate");
+}
+

@@ -1,5 +1,5 @@
 //! Level definitions are plain data. Rendering and UI only read them.
-use crate::field::{v2, Field, V2};
+use crate::field::{v2, Field, SourceKind, V2};
 use crate::sim::{Outcome, Rect, Region, RegionKind, SimConfig, Trajectory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -171,7 +171,13 @@ pub enum Rules {
     /// `rays`: draw each push arrow as a long faint line back toward the source, so where they cross can be read
     /// off directly. On in the teaching level; later levels turn it off and the player must extend the arrows
     /// by eye.
-    Survey { zone: Zone, free: V2, scouts: usize, k: f64, sigma: f64, tol: f64, rays: bool, pool: Vec<V2> },
+    ///
+    /// `band`: shade, around each scout's trail, the places a source would already have been felt (see
+    /// `SurveySpec::cleared`), so a scout that sees nothing still rules something out.
+    ///
+    /// `kinds[i]` is what the source at `pool[i]` does (all `Repeller` unless the level is about telling kinds
+    /// apart): the marker then carries a kind too, and a commit is right only if both agree.
+    Survey { zone: Zone, free: V2, scouts: usize, k: f64, sigma: f64, tol: f64, rays: bool, band: bool, pool: Vec<V2>, kinds: Vec<SourceKind> },
     /// Choose the launch phase of a periodic field.
     Tempo { start: V2, period: f64, goal: usize },
     /// Probe the intensity knob, then report the rule you found.
